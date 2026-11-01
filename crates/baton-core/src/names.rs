@@ -42,6 +42,11 @@ pub fn check_entry(name: &[u8], mode: u32) -> Result<Option<Special>, String> {
     ) {
         return Err(format!("tree entry mode {mode:o} is not one git writes"));
     }
+    if mode == MODE_LINK
+        && let Some(file) = link_checked(name)
+    {
+        return Err(format!("{file} is a symbolic link"));
+    }
     let special = special_of(name);
     if let Some(special) = special {
         return match mode {
@@ -93,6 +98,21 @@ impl Special {
             Special::Gitattributes => ".gitattributes",
         }
     }
+}
+
+/// The dotfile git refuses as a symbolic link (`fsck_tree`: `gitignoreSymlink`, `gitattributesSymlink`,
+/// `mailmapSymlink`), in any spelling HFS or NTFS reads as it.
+fn link_checked(name: &[u8]) -> Option<&'static str> {
+    [
+        (".gitignore", &b"gitignore"[..], b"gi250a"),
+        (".gitattributes", &b"gitattributes"[..], b"gi7d29"),
+        (".mailmap", &b"mailmap"[..], b"maba30"),
+    ]
+    .into_iter()
+    .find(|(_, dotless, short)| {
+        is_hfs_dot(name, dotless) || segments(name).any(|s| is_ntfs_dot_generic(s, dotless, short))
+    })
+    .map(|(file, _, _)| file)
 }
 
 fn special_of(name: &[u8]) -> Option<Special> {

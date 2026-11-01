@@ -86,6 +86,12 @@ fn parse_tree(bytes: &[u8]) -> std::result::Result<Vec<TreeEntry>, String> {
     for entry in &tree.entries {
         let mode = u32::from(entry.mode.value());
         let special = names::check_entry(entry.filename, mode)?;
+        if entry.oid.is_null() {
+            return Err(format!(
+                "tree entry {:?} points to the null id",
+                String::from_utf8_lossy(entry.filename)
+            ));
+        }
         if !names.insert(entry.filename) {
             return Err(format!("tree names {:?} twice", entry.filename));
         }
