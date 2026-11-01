@@ -6,12 +6,15 @@
 
 use crate::error::{Error, IoContext, Result};
 use crate::id::{BlobId, FileKind, Oid, RelPath, ThreadId, TreeId, TurnId, TurnSeq, UnixMillis};
+use crate::names::MAX_TREE_DEPTH;
 use crate::turn::{Turn, TurnDraft};
 use crate::wire::ObjectKind;
 use gix::objs::{Exists as _, Find as _, Write as _};
+use gix::prelude::Header as _;
 use gix::refs::Target;
 use gix::refs::transaction::PreviousValue;
-use std::collections::{BTreeMap, HashSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -77,6 +80,8 @@ pub enum TipMove {
 pub struct SideRepo {
     repo: gix::Repository,
     dir: PathBuf,
+    /// How many trees nest below a stored tree. Stored trees never change, so this is kept as long as the repo is open.
+    heights: RefCell<HashMap<Oid, usize>>,
 }
 
 fn signature(at: UnixMillis) -> gix::actor::Signature {
@@ -115,6 +120,7 @@ impl SideRepo {
         Ok(Self {
             repo,
             dir: dir.to_owned(),
+            heights: RefCell::default(),
         })
     }
 
@@ -389,6 +395,24 @@ impl SideRepo {
         self.repo.objects.exists(&id.oid())
     }
 
+    /// The kind of a stored object, read from its header alone. A stored tag reads as absent.
+    pub fn object_kind(&self, id: Oid) -> Result<Option<ObjectKind>> {
+        let found = self
+            .repo
+            .objects
+            .try_header(&id.oid())
+            .map_err(Error::git)?;
+        Ok(found.and_then(|header| ObjectKind::from_gix(header.kind())))
+    }
+
+    pub(crate) fn stored_height(&self, id: Oid) -> Option<usize> {
+        self.heights.borrow().get(&id).copied()
+    }
+
+    pub(crate) fn remember_height(&self, id: Oid, height: usize) {
+        self.heights.borrow_mut().insert(id, height);
+    }
+
     /// The object's kind and bytes. A stored tag is not a baton object, so it reads as absent.
     pub fn read_raw(&self, id: Oid) -> Result<Option<(ObjectKind, Vec<u8>)>> {
         let mut buf = Vec::new();
@@ -475,6 +499,7 @@ impl SideRepo {
                 before.map(|t| t.oid()),
                 &mut seen,
                 &mut out,
+                0,
             )?;
         }
         out.extend(chain.iter().map(|r| (ObjectKind::Commit, Oid::from(r.id))));
@@ -527,8 +552,10 @@ impl SideRepo {
         before: Option<gix::ObjectId>,
         seen: &mut HashSet<gix::ObjectId>,
         out: &mut Vec<(ObjectKind, Oid)>,
+        depth: usize,
     ) -> Result<()> {
         use gix::objs::tree::EntryKind;
+        check_depth(depth)?;
         if Some(tree) == before || !seen.insert(tree) {
             return Ok(());
         }
@@ -543,7 +570,7 @@ impl SideRepo {
                     let before = previous
                         .filter(|(k, _)| *k == EntryKind::Tree)
                         .map(|(_, id)| *id);
-                    self.new_in_tree(oid, before, seen, out)?;
+                    self.new_in_tree(oid, before, seen, out, depth + 1)?;
                 }
                 EntryKind::Commit => {}
                 _ => {
@@ -567,6 +594,7 @@ impl SideRepo {
         self.walk(
             &mut String::new(),
             Some(tree.oid()),
+            0,
             &mut |path, kind, blob| {
                 if let Ok(path) = RelPath::parse(path) {
                     out.push(FlatEntry { path, kind, blob });
@@ -584,6 +612,7 @@ impl SideRepo {
             from.map(|t| t.oid()),
             Some(to.oid()),
             &mut out,
+            0,
         )?;
         Ok(out)
     }
@@ -612,9 +641,11 @@ impl SideRepo {
         &self,
         prefix: &mut String,
         tree: Option<gix::ObjectId>,
+        depth: usize,
         visit: &mut dyn FnMut(&str, FileKind, BlobId),
     ) -> Result<()> {
         use gix::objs::tree::EntryKind;
+        check_depth(depth)?;
         for (name, (kind, oid)) in self.entries(tree)? {
             let len = prefix.len();
             if !prefix.is_empty() {
@@ -622,7 +653,7 @@ impl SideRepo {
             }
             prefix.push_str(&name);
             match kind {
-                EntryKind::Tree => self.walk(prefix, Some(oid), visit)?,
+                EntryKind::Tree => self.walk(prefix, Some(oid), depth + 1, visit)?,
                 other => {
                     if let Some(kind) = FileKind::from_entry_kind(other) {
                         visit(prefix, kind, BlobId::from_gix(oid));
@@ -640,8 +671,10 @@ impl SideRepo {
         from: Option<gix::ObjectId>,
         to: Option<gix::ObjectId>,
         out: &mut Vec<PathChange>,
+        depth: usize,
     ) -> Result<()> {
         use gix::objs::tree::EntryKind;
+        check_depth(depth)?;
         if from == to {
             return Ok(());
         }
@@ -659,7 +692,7 @@ impl SideRepo {
             }
             let (old_tree, new_tree) = (is_tree(before), is_tree(after));
             if old_tree.is_some() || new_tree.is_some() {
-                self.diff(prefix, old_tree, new_tree, out)?;
+                self.diff(prefix, old_tree, new_tree, out, depth + 1)?;
             }
             fn leaf(e: Option<&(EntryKind, gix::ObjectId)>) -> Option<&(EntryKind, gix::ObjectId)> {
                 e.filter(|(k, _)| *k != EntryKind::Tree && *k != EntryKind::Commit)
@@ -677,6 +710,15 @@ impl SideRepo {
         }
         Ok(())
     }
+}
+
+fn check_depth(depth: usize) -> Result<()> {
+    if depth > MAX_TREE_DEPTH {
+        return Err(Error::Refused(format!(
+            "a tree is nested deeper than {MAX_TREE_DEPTH} directories"
+        )));
+    }
+    Ok(())
 }
 
 /// A crash between taking a ref lock and renaming it leaves `<ref>.lock` behind, which blocks every later

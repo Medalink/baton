@@ -161,16 +161,56 @@ impl Worker {
             }
         };
         for job in jobs {
-            match job {
+            let survived = match job {
                 Job::Advance(request, reply) => {
-                    let _ = reply.send(self.advance(&repo, request));
+                    let thread = request.thread.clone();
+                    let result = self.guarded(|| self.advance(&repo, request));
+                    let survived = result.is_some();
+                    let outcome = result.unwrap_or_else(|| {
+                        Ok(Outcome::Refused {
+                            reason: RefuseReason::Invalid,
+                            current: None,
+                            detail: Some(format!("the server failed while checking {thread}")),
+                        })
+                    });
+                    let _ = reply.send(outcome);
+                    survived
                 }
-                Job::Heads(reply) => {
-                    let _ = reply.send(self.heads(&repo));
-                }
+                Job::Heads(reply) => match self.guarded(|| self.heads(&repo)) {
+                    Some(heads) => reply.send(heads).is_ok() || true,
+                    None => false,
+                },
                 Job::Read(ids, budget, reply) => {
-                    let _ = reply.send(repo.read_batch(&ids, budget).map_err(Into::into));
+                    match self.guarded(|| repo.read_batch(&ids, budget).map_err(Into::into)) {
+                        Some(read) => reply.send(read).is_ok() || true,
+                        None => false,
+                    }
                 }
+            };
+            if !survived {
+                // The repo handle may hold half-updated state, so this writer stops; the next job starts a new one.
+                return;
+            }
+        }
+    }
+
+    /// Runs one job. A panic is logged and reported as `None`, so one project's bad input cannot take the
+    /// process down; a stack overflow cannot be caught, which is why every walk of a received tree is
+    /// iterative and depth-capped.
+    fn guarded<T>(&self, job: impl FnOnce() -> T) -> Option<T> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)) {
+            Ok(value) => Some(value),
+            Err(panic) => {
+                let what = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_owned())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_default();
+                log(&format!(
+                    "project {}: the writer panicked: {what}",
+                    self.key
+                ));
+                None
             }
         }
     }

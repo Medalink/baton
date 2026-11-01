@@ -6,6 +6,7 @@
 
 use crate::error::{Error, Result};
 use crate::id::{Oid, TreeId, TurnId, UnixMillis};
+use crate::names::{self, MAX_TREE_DEPTH, Special};
 use crate::store::{SideRepo, TurnRecord};
 use crate::turn::Turn;
 use crate::wire::{IDS_PER_MESSAGE, Object, ObjectKind};
@@ -64,20 +65,14 @@ pub struct Intake {
 
 struct TreeEntry {
     name: Vec<u8>,
+    mode: u32,
     kind: EntryKind,
     id: Oid,
+    special: Option<Special>,
 }
 
-fn forbidden_name(name: &[u8]) -> bool {
-    name.is_empty()
-        || name.iter().any(|b| matches!(b, b'/' | 0))
-        || name == b"."
-        || name == b".."
-        || name.eq_ignore_ascii_case(b".git")
-}
-
-/// A tree that `git fsck --strict` accepts and whose names are safe: sorted, unique, no forbidden
-/// name, and exactly the bytes git would write for it.
+/// A tree that `git fsck --strict` accepts and whose names are safe: sorted, unique, every name and mode
+/// one git allows, and exactly the bytes git would write for it.
 fn parse_tree(bytes: &[u8]) -> std::result::Result<Vec<TreeEntry>, String> {
     let tree = gix::objs::TreeRef::from_bytes(bytes, gix::hash::Kind::Sha1)
         .map_err(|e| format!("tree does not parse: {e}"))?;
@@ -89,19 +84,17 @@ fn parse_tree(bytes: &[u8]) -> std::result::Result<Vec<TreeEntry>, String> {
     }
     let mut out = Vec::with_capacity(tree.entries.len());
     for entry in &tree.entries {
-        if forbidden_name(entry.filename) {
-            return Err(format!(
-                "tree entry name {:?} is not allowed",
-                entry.filename
-            ));
-        }
+        let mode = u32::from(entry.mode.value());
+        let special = names::check_entry(entry.filename, mode)?;
         if !names.insert(entry.filename) {
             return Err(format!("tree names {:?} twice", entry.filename));
         }
         out.push(TreeEntry {
             name: entry.filename.to_vec(),
+            mode,
             kind: entry.mode.kind(),
             id: Oid::from_gix(entry.oid.to_owned()),
+            special,
         });
     }
     let mut canonical = Vec::with_capacity(bytes.len());
@@ -153,13 +146,27 @@ fn parse_commit(bytes: &[u8]) -> std::result::Result<ParsedCommit, String> {
     })
 }
 
+type Siblings = HashMap<Vec<u8>, (u32, EntryKind, Oid)>;
+
+struct Frame {
+    entries: std::vec::IntoIter<TreeEntry>,
+    id: Oid,
+    before: Siblings,
+}
+
 struct Walk<'a> {
     repo: &'a SideRepo,
     pool: &'a Pool,
     done: HashSet<Oid>,
+    checked: HashSet<(Oid, Special)>,
+    heights: HashMap<Oid, usize>,
     blobs: Vec<Oid>,
     trees: Vec<Oid>,
     missing: Vec<Oid>,
+}
+
+fn store_err(e: Error) -> String {
+    format!("reading the stored objects failed: {e}")
 }
 
 impl Walk<'_> {
@@ -169,59 +176,208 @@ impl Walk<'_> {
         }
     }
 
+    /// Walks the new part of the tree `root` without recursion, so no input can exhaust the stack.
     /// `old` is the same path in the parent turn. An entry equal to the parent's is complete already.
-    fn tree(&mut self, id: Oid, old: Option<Oid>) -> std::result::Result<(), String> {
-        if Some(id) == old || !self.done.insert(id) {
-            return Ok(());
-        }
-        let Some((kind, bytes)) = self.pool.get(&id) else {
-            if !self.repo.has_object(id) {
-                self.want(id);
-            }
-            return Ok(());
-        };
-        if kind != ObjectKind::Tree {
-            return Err(format!("{id} is not a tree"));
-        }
-        let entries = parse_tree(bytes)?;
-        let before: HashMap<Vec<u8>, (EntryKind, Oid)> = match old {
-            Some(old) => self.old_entries(old),
-            None => HashMap::new(),
-        };
-        for entry in entries {
-            let previous = before.get(&entry.name);
-            if previous.map(|(_, id)| *id) == Some(entry.id) {
+    fn tree(&mut self, root: Oid, old: Option<Oid>) -> std::result::Result<(), String> {
+        let mut stack: Vec<Frame> = Vec::new();
+        stack.extend(self.open(root, old, 0)?);
+        while let Some(top) = stack.last_mut() {
+            let Some(entry) = top.entries.next() else {
+                let frame = stack.pop().expect("a frame was just read");
+                self.trees.push(frame.id);
+                continue;
+            };
+            let previous = top.before.get(&entry.name).copied();
+            if previous.is_some_and(|(mode, _, id)| mode == entry.mode && id == entry.id) {
                 continue;
             }
             match entry.kind {
                 EntryKind::Tree => {
                     let old = previous
-                        .filter(|(k, _)| *k == EntryKind::Tree)
-                        .map(|(_, id)| *id);
-                    self.tree(entry.id, old)?;
+                        .filter(|(_, kind, _)| *kind == EntryKind::Tree)
+                        .map(|(_, _, id)| id);
+                    let depth = stack.len();
+                    stack.extend(self.open(entry.id, old, depth)?);
                 }
                 EntryKind::Commit => {}
-                _ => self.blob(entry.id)?,
+                _ => self.blob(entry.id, entry.special)?,
             }
         }
-        self.trees.push(id);
         Ok(())
     }
 
-    fn blob(&mut self, id: Oid) -> std::result::Result<(), String> {
+    /// The frame for a tree that has to be walked, or nothing when the tree needs no walking: it is the
+    /// parent's, it is stored, it was seen, or it is still to come.
+    fn open(
+        &mut self,
+        id: Oid,
+        old: Option<Oid>,
+        depth: usize,
+    ) -> std::result::Result<Option<Frame>, String> {
+        if depth > MAX_TREE_DEPTH {
+            return Err(format!("trees are nested deeper than {MAX_TREE_DEPTH}"));
+        }
+        if Some(id) == old {
+            return Ok(None);
+        }
         if !self.done.insert(id) {
-            return Ok(());
+            self.fits(id, depth)?;
+            return Ok(None);
         }
-        match self.pool.get(&id) {
-            Some((ObjectKind::Blob, _)) => self.blobs.push(id),
-            Some(_) => return Err(format!("{id} is not a blob")),
-            None if self.repo.has_object(id) => {}
-            None => self.want(id),
+        let pool = self.pool;
+        let Some((kind, bytes)) = pool.get(&id) else {
+            match self.repo.object_kind(id).map_err(store_err)? {
+                None => self.want(id),
+                Some(ObjectKind::Tree) => self.fits(id, depth)?,
+                Some(_) => return Err(format!("{id} is not a tree")),
+            }
+            return Ok(None);
+        };
+        if kind != ObjectKind::Tree {
+            return Err(format!("{id} is not a tree"));
+        }
+        let entries = parse_tree(bytes)?;
+        let before = match old {
+            Some(old) => self.old_entries(old),
+            None => HashMap::new(),
+        };
+        Ok(Some(Frame {
+            entries: entries.into_iter(),
+            id,
+            before,
+        }))
+    }
+
+    /// A tree met at `depth` that is not walked here must still fit below it, whatever it holds.
+    fn fits(&mut self, id: Oid, depth: usize) -> std::result::Result<(), String> {
+        if depth + self.height(id)? > MAX_TREE_DEPTH {
+            return Err(format!("trees are nested deeper than {MAX_TREE_DEPTH}"));
         }
         Ok(())
     }
 
-    fn old_entries(&self, old: Oid) -> HashMap<Vec<u8>, (EntryKind, Oid)> {
+    /// How many trees nest below `root`, read from the pool and the repo. A tree not received yet
+    /// counts as empty, since the plan asks for it and checks again when it arrives.
+    fn height(&mut self, root: Oid) -> std::result::Result<usize, String> {
+        struct Level {
+            id: Oid,
+            kids: std::vec::IntoIter<Oid>,
+            height: usize,
+        }
+        if let Some(known) = self.known_height(root) {
+            return Ok(known);
+        }
+        let mut stack = vec![Level {
+            id: root,
+            kids: self.child_trees(root)?.into_iter(),
+            height: 0,
+        }];
+        loop {
+            let top = stack
+                .last_mut()
+                .expect("the root level stays until the end");
+            if let Some(kid) = top.kids.next() {
+                if let Some(known) = self.known_height(kid) {
+                    top.height = top.height.max(known + 1);
+                    continue;
+                }
+                if stack.len() > MAX_TREE_DEPTH {
+                    return Err(format!("trees are nested deeper than {MAX_TREE_DEPTH}"));
+                }
+                let kids = self.child_trees(kid)?.into_iter();
+                stack.push(Level {
+                    id: kid,
+                    kids,
+                    height: 0,
+                });
+                continue;
+            }
+            let level = stack.pop().expect("a level was just read");
+            self.remember_height(level.id, level.height);
+            match stack.last_mut() {
+                Some(parent) => parent.height = parent.height.max(level.height + 1),
+                None => return Ok(level.height),
+            }
+        }
+    }
+
+    fn known_height(&self, id: Oid) -> Option<usize> {
+        self.heights
+            .get(&id)
+            .copied()
+            .or_else(|| self.repo.stored_height(id))
+    }
+
+    fn remember_height(&mut self, id: Oid, height: usize) {
+        self.heights.insert(id, height);
+        if self.pool.get(&id).is_none() {
+            self.repo.remember_height(id, height);
+        }
+    }
+
+    fn child_trees(&self, id: Oid) -> std::result::Result<Vec<Oid>, String> {
+        let stored;
+        let bytes: &[u8] = match self.pool.get(&id) {
+            Some((_, bytes)) => bytes,
+            None => match self.repo.read_raw(id).map_err(store_err)? {
+                Some((ObjectKind::Tree, bytes)) => {
+                    stored = bytes;
+                    &stored
+                }
+                _ => return Ok(Vec::new()),
+            },
+        };
+        Ok(gix::objs::TreeRef::from_bytes(bytes, gix::hash::Kind::Sha1)
+            .map(|tree| {
+                tree.entries
+                    .iter()
+                    .filter(|e| e.mode.is_tree())
+                    .map(|e| Oid::from_gix(e.oid.to_owned()))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    fn blob(&mut self, id: Oid, special: Option<Special>) -> std::result::Result<(), String> {
+        if self.done.insert(id) {
+            match self.pool.get(&id) {
+                Some((ObjectKind::Blob, _)) => self.blobs.push(id),
+                Some(_) => return Err(format!("{id} is not a blob")),
+                None => match self.repo.object_kind(id).map_err(store_err)? {
+                    Some(ObjectKind::Blob) => {}
+                    Some(_) => return Err(format!("{id} is not a blob")),
+                    None => self.want(id),
+                },
+            }
+        }
+        match special {
+            Some(special) if !self.checked.contains(&(id, special)) => {
+                self.check_content(id, special)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// git checks `.gitmodules` and `.gitattributes` by content, so the blob is read here when it is
+    /// stored and awaited when it is not.
+    fn check_content(&mut self, id: Oid, special: Special) -> std::result::Result<(), String> {
+        let stored;
+        let bytes: &[u8] = match self.pool.get(&id) {
+            Some((_, bytes)) => bytes,
+            None => match self.repo.read_raw(id).map_err(store_err)? {
+                Some((_, bytes)) => {
+                    stored = bytes;
+                    &stored
+                }
+                None => return Ok(()),
+            },
+        };
+        names::check_blob(special, bytes)?;
+        self.checked.insert((id, special));
+        Ok(())
+    }
+
+    fn old_entries(&self, old: Oid) -> Siblings {
         let Ok(Some((ObjectKind::Tree, bytes))) = self.repo.read_raw(old) else {
             return HashMap::new();
         };
@@ -232,7 +388,11 @@ impl Walk<'_> {
                     .map(|e| {
                         (
                             e.filename.to_vec(),
-                            (e.mode.kind(), Oid::from_gix(e.oid.to_owned())),
+                            (
+                                u32::from(e.mode.value()),
+                                e.mode.kind(),
+                                Oid::from_gix(e.oid.to_owned()),
+                            ),
                         )
                     })
                     .collect()
@@ -241,13 +401,15 @@ impl Walk<'_> {
     }
 }
 
-/// Plans storing the closure of `tip` from `pool` and the repo, for a thread whose ref is at `stop`.
+// Plans storing the closure of `tip` from `pool` and the repo, for a thread whose ref is at `stop`.
 /// The chain of commits must lead from `tip` to `stop`, or to a first turn when `stop` is `None`.
 pub fn plan(repo: &SideRepo, pool: &Pool, tip: TurnId, stop: Option<TurnId>) -> Result<Verdict> {
     let mut walk = Walk {
         repo,
         pool,
         done: HashSet::new(),
+        checked: HashSet::new(),
+        heights: HashMap::new(),
         blobs: Vec::new(),
         trees: Vec::new(),
         missing: Vec::new(),
@@ -261,7 +423,11 @@ pub fn plan(repo: &SideRepo, pool: &Pool, tip: TurnId, stop: Option<TurnId>) -> 
         let oid = Oid::from(id);
         let found = match pool.get(&oid) {
             Some((kind, bytes)) => Some((kind, bytes.to_vec())),
-            None => repo.read_raw(oid)?,
+            None => match repo.object_kind(oid)? {
+                Some(ObjectKind::Commit) => repo.read_raw(oid)?,
+                Some(_) => return Ok(Verdict::Invalid(format!("{id} is not a commit"))),
+                None => None,
+            },
         };
         let Some((kind, bytes)) = found else {
             walk.want(oid);

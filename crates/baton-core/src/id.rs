@@ -343,15 +343,18 @@ impl RelPath {
                 format!("{s:?} is empty or has an edge '/'"),
             ));
         }
+        if s.split('/').count() > crate::names::MAX_TREE_DEPTH + 1 {
+            return Err(Error::invalid(
+                "path",
+                format!(
+                    "{s:?} is nested deeper than {} directories",
+                    crate::names::MAX_TREE_DEPTH
+                ),
+            ));
+        }
         for part in s.split('/') {
-            if part.is_empty() || part == "." || part == ".." {
-                return Err(Error::invalid(
-                    "path",
-                    format!("{s:?} has an empty, '.' or '..' part"),
-                ));
-            }
-            if part.eq_ignore_ascii_case(".git") {
-                return Err(Error::invalid("path", format!("{s:?} names .git")));
+            if let Err(why) = crate::names::check_name(part.as_bytes()) {
+                return Err(Error::invalid("path", format!("{s:?}: {why}")));
             }
             if part
                 .chars()
