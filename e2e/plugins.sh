@@ -685,14 +685,38 @@ config "[classify]" "command = $(stubcmd verdict quiet "$SEEN/base-b.json")" "ti
 base_repo baseb
 printf 'one\n' >"$REPO/a.txt"
 yes 'a line of text that makes the file larger than the diff cap' | head -c 1572864 >"$REPO/big.txt"
-git -C "$REPO" add -A >/dev/null 2>&1
+yes $'a CRLF line of text that makes the file larger than the diff cap' | head -n 40000 >"$REPO/big-crlf.txt"
+yes $'a short CRLF file' | head -n 3 >"$REPO/small-crlf.txt"
+git -c core.autocrlf=true add -A >/dev/null 2>&1
 git -C "$REPO" commit -q -m initial
 "$BIN" enroll "$(wp "$REPO")" >/dev/null 2>&1
 printf 'two\n' >"$REPO/a.txt"
 printf 'beta\n' >"$REPO/b.txt"
 turn t-base "the first turn" >/dev/null
 wait_verdict t-base
-eq "an unchanged file over 1 MiB is not listed" "a.txt:modified:1:1,b.txt:added:1:0" "$(files_of "$TMP/seen/base-b.json")"
+eq "unchanged files are not listed: over 1 MiB, or checked out with CRLF over a blob with LF"   "a.txt:modified:1:1,b.txt:added:1:0" "$(files_of "$TMP/seen/base-b.json")"
+
+config "[classify]" "command = $(stubcmd verdict quiet "$SEEN/excl.json")" "timeout = \"5s\""
+base_repo excl
+mkdir -p "$REPO/hide"
+printf 'hidden-before-the-rule
+' >"$REPO/hide/notes.txt"
+printf 'one
+' >"$REPO/a.txt"
+git -C "$REPO" add -A >/dev/null 2>&1
+git -C "$REPO" commit -q -m initial
+"$BIN" enroll "$(wp "$REPO")" >/dev/null 2>&1
+printf 'two
+' >"$REPO/a.txt"
+turn t-excl "before the rule" >/dev/null
+wait_verdict t-excl
+config "[snapshot]" "exclude = ['hide/**']" "[classify]" "command = $(stubcmd verdict quiet "$SEEN/excl.json")" "timeout = \"5s\""
+printf 'three
+' >"$REPO/a.txt"
+turn t-excl "after the rule" >/dev/null
+wait_for 8000 'test "$(jget "$TMP/seen/excl.json" "d[\"turn\"]")" = 2'
+eq "a path excluded halfway through a thread is not reported as deleted" "a.txt:modified:1:1" "$(files_of "$TMP/seen/excl.json")"
+lacks "and its text is not in the document" "$(cat "$TMP/seen/excl.json")" "hidden-before-the-rule"
 
 REPO=$MAIN_REPO
 SIDE=$MAIN_SIDE

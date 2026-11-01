@@ -12,7 +12,7 @@ use crate::store::{SideRepo, TurnRecord};
 use gix::bstr::ByteSlice;
 use similar::{ChangeTag, TextDiff};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub const DIFF_MAX_BYTES: usize = 256 * 1024;
 const FILES_MAX: usize = 2000;
@@ -45,7 +45,6 @@ impl Side {
 /// The commit a thread's first turn started from, read straight from the user's object database.
 struct GitBase {
     repo: gix::Repository,
-    root: PathBuf,
     files: BTreeMap<String, gix::ObjectId>,
 }
 
@@ -72,23 +71,19 @@ impl GitBase {
                 }
             }
         }
-        Ok(Self {
-            repo,
-            root: root.to_owned(),
-            files,
-        })
+        Ok(Self { repo, files })
     }
 
     fn prepared(&self, path: &str, id: gix::ObjectId, policy: &StorePolicy) -> Result<Vec<u8>> {
         Ok(prepare(path, self.blob(id)?, policy))
     }
 
-    /// Whether the store would have skipped the file for its size: in the base commit, or on disk now,
-    /// where a file that grew past the limit after the base is skipped too.
-    fn over_limit(&self, path: &str, base_len: usize, policy: &StorePolicy) -> bool {
-        policy.exceeds_size_limit(base_len as u64)
-            || std::fs::symlink_metadata(self.root.join(path))
-                .is_ok_and(|meta| policy.exceeds_size_limit(meta.len()))
+    fn size(&self, id: gix::ObjectId) -> Result<usize> {
+        let header = self
+            .repo
+            .find_header(id)
+            .map_err(|e| Error::Git(e.to_string()))?;
+        Ok(usize::try_from(header.size()).unwrap_or(usize::MAX))
     }
 
     fn blob(&self, id: gix::ObjectId) -> Result<Vec<u8>> {
@@ -115,26 +110,63 @@ fn changes_since_parent(
     side: &SideRepo,
     record: &TurnRecord,
     parent: crate::id::TurnId,
+    policy: &StorePolicy,
+    root: &Path,
 ) -> Result<Vec<Changed>> {
     let before = side.read_turn(parent)?.tree;
     let mut out = Vec::new();
+    let mut removed = Vec::new();
     for change in side.diff_trees(Some(before), record.tree)? {
         let find = |tree| side.entry_at(tree, &change.path);
-        let old = match find(before)? {
-            Some((_, blob)) => blob_side(side, blob)?,
-            None => Side::Absent,
-        };
-        let new = match find(record.tree)? {
-            Some((_, blob)) => blob_side(side, blob)?,
-            None => Side::Absent,
-        };
-        out.push(Changed {
-            path: change.path.as_str().to_owned(),
-            old,
-            new,
-        });
+        let old = find(before)?
+            .map(|(_, blob)| side.read_blob(blob))
+            .transpose()?;
+        let path = change.path.as_str().to_owned();
+        match find(record.tree)? {
+            Some((_, blob)) => out.push(Changed {
+                path,
+                old: old.map_or(Side::Absent, |bytes| Side::from_bytes(&bytes)),
+                new: blob_side(side, blob)?,
+            }),
+            None => removed.push((path, old.unwrap_or_default())),
+        }
     }
+    let lengths: Vec<(&str, usize)> = removed.iter().map(|(p, b)| (p.as_str(), b.len())).collect();
+    let real = deleted_for_real(policy, root, &lengths)?;
+    for ((path, old), real) in removed.into_iter().zip(real) {
+        if real {
+            out.push(Changed {
+                path,
+                old: Side::from_bytes(&old),
+                new: Side::Absent,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
+}
+
+/// Whether each path missing from a turn's tree was deleted, as opposed to dropped by the store: a path
+/// the user excluded since the last turn, or whose file grew past the size limit, is missing for that
+/// reason, and its stored text must not reach a plug-in. Entries are `(path, length of its last bytes)`.
+fn deleted_for_real(
+    policy: &StorePolicy,
+    root: &Path,
+    gone: &[(&str, usize)],
+) -> Result<Vec<bool>> {
+    let asked: Vec<(&str, bool)> = gone.iter().map(|&(path, _)| (path, false)).collect();
+    let admitted = policy.admits(&asked)?;
+    Ok(gone
+        .iter()
+        .zip(admitted)
+        .map(|(&(path, len), admitted)| {
+            admitted
+                && !policy.holds_secret(path)
+                && !policy.exceeds_size_limit(len as u64)
+                && !std::fs::symlink_metadata(root.join(path))
+                    .is_ok_and(|meta| policy.exceeds_size_limit(meta.len()))
+        })
+        .collect())
 }
 
 /// The first turn against the commit the thread started from. Only paths the side repo could hold are
@@ -146,6 +178,7 @@ fn changes_since_base(
     record: &TurnRecord,
     base: &GitBase,
     policy: &StorePolicy,
+    root: &Path,
 ) -> Result<Vec<Changed>> {
     let mut out = Vec::new();
     let mut now: BTreeMap<String, BlobId> = side
@@ -162,30 +195,31 @@ fn changes_since_base(
         if blob.oid() == git_blob {
             continue;
         }
-        let old = Side::from_bytes(&base.prepared(path, git_blob, policy)?);
-        let new = blob_side(side, blob)?;
-        if !matches!((&old, &new), (Side::Text(a), Side::Text(b)) if a == b) {
+        let old = base.prepared(path, git_blob, policy)?;
+        let new = side.read_blob(blob)?;
+        if !same_content(&old, &new) {
             out.push(Changed {
                 path: path.clone(),
-                old,
-                new,
+                old: Side::from_bytes(&old),
+                new: Side::from_bytes(&new),
             });
         }
     }
-    let asked: Vec<(&str, bool)> = missing.iter().map(|&(path, _)| (path, false)).collect();
-    for ((path, git_blob), admitted) in missing.into_iter().zip(policy.admits(&asked)?) {
-        if !admitted || policy.holds_secret(path) {
-            continue;
+    let lengths = missing
+        .iter()
+        .map(|&(path, blob)| Ok((path, base.size(blob)?)))
+        .collect::<Result<Vec<_>>>()?;
+    for ((path, git_blob), real) in missing
+        .into_iter()
+        .zip(deleted_for_real(policy, root, &lengths)?)
+    {
+        if real {
+            out.push(Changed {
+                path: path.to_owned(),
+                old: Side::from_bytes(&base.prepared(path, git_blob, policy)?),
+                new: Side::Absent,
+            });
         }
-        let raw = base.blob(git_blob)?;
-        if base.over_limit(path, raw.len(), policy) {
-            continue;
-        }
-        out.push(Changed {
-            path: path.to_owned(),
-            old: Side::from_bytes(&prepare(path, raw, policy)),
-            new: Side::Absent,
-        });
     }
     for (path, blob) in now {
         out.push(Changed {
@@ -196,6 +230,22 @@ fn changes_since_base(
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
+}
+
+/// Equal bytes, or text that differs only in line endings: a checkout with CRLF and git's LF blob are the
+/// same file, at any size.
+fn same_content(a: &[u8], b: &[u8]) -> bool {
+    let is_text = |bytes: &[u8]| !bytes[..bytes.len().min(BINARY_PROBE)].contains(&0);
+    let lf = |bytes: &[u8]| -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len());
+        for (i, &byte) in bytes.iter().enumerate() {
+            if !(byte == b'\r' && bytes.get(i + 1) == Some(&b'\n')) {
+                out.push(byte);
+            }
+        }
+        out
+    };
+    a == b || (is_text(a) && is_text(b) && lf(a) == lf(b))
 }
 
 fn prepare(path: &str, bytes: Vec<u8>, policy: &StorePolicy) -> Vec<u8> {
@@ -291,10 +341,12 @@ impl TurnDocSource<'_> {
     pub fn build(&self, lens: Option<String>) -> Result<TurnDoc> {
         let record = self.record;
         let changed = match record.parent {
-            Some(parent) => changes_since_parent(self.side, record, parent)?,
+            Some(parent) => {
+                changes_since_parent(self.side, record, parent, self.policy, self.root)?
+            }
             None => {
                 let base = GitBase::open(self.root, record.turn.draft.base)?;
-                changes_since_base(self.side, record, &base, self.policy)?
+                changes_since_base(self.side, record, &base, self.policy, self.root)?
             }
         };
         let mut files = Vec::new();
