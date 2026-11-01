@@ -3,7 +3,8 @@
 #
 #   e2e/local.sh                    uses target/release/baton, building it when missing
 #   BATON_BIN=/path/baton e2e/local.sh
-#   BATON_E2E_BIG_REPO=/path/to/a/large/repo   the tree copied for the latency run (git archive HEAD)
+#   BATON_E2E_BIG_REPO=/path/to/a/large/repo   the tree copied for the latency run (git archive HEAD); without it
+#                                   the latency run is skipped, except on the owner's Windows box
 #   BATON_E2E_TURNS=100             turns timed in the latency run
 #   BATON_E2E_QUIESCENCE_TRIES=50
 #
@@ -17,7 +18,8 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 exe=""
 [[ ${OSTYPE:-} == msys* || ${OSTYPE:-} == cygwin* ]] && exe=".exe"
 BIN=${BATON_BIN:-$root/target/release/baton$exe}
-BIG_REPO=${BATON_E2E_BIG_REPO:-E:/Dev/Laravel/iris}
+BIG_REPO=${BATON_E2E_BIG_REPO:-}
+[[ -z $BIG_REPO && -n $exe ]] && BIG_REPO=E:/Dev/Laravel/iris # the owner's Windows default; elsewhere the latency run is skipped unless set
 TURNS=${BATON_E2E_TURNS:-100}
 TRIES=${BATON_E2E_QUIESCENCE_TRIES:-50}
 

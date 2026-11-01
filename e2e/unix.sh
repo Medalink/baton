@@ -148,14 +148,20 @@ printf '{"session_id":"x1","cwd":"%s","hook_event_name":"Stop"}' "$REPO" >"$TMP/
 "$BIN" hook claude <"$TMP/payload.json"
 eq "the hook exits 0" 0 $?
 await "the hook's turn is recorded through the socket" 5000 test -f "$SIDE/refs/baton/x1"
+first=$(<"$SIDE/refs/baton/x1")
+printf 'three
+' >>"$REPO/a.txt"
+"$BIN" hook claude <"$TMP/payload.json"
+await "a write made after the first turn moves the ref again" 5000 bash -c '[[ $(<"$1") != "$2" ]]' _ "$SIDE/refs/baton/x1" "$first"
 log=$(cd "$REPO" && "$BIN" log x1 2>&1)
-contains "the turn lists the changed path" "$log" "a.txt"
+contains "the second turn lists the changed path" "$log" "M a.txt"
 section_end
 
 section "SIGTERM stops the daemon and removes its socket"
 kill -TERM "$PID"
 await "the daemon exits within 3 s" 3000 bash -c "! kill -0 $PID 2>/dev/null"
 check "the socket file is gone" test ! -e "$SOCK"
+rm -f "$SOCK"
 out=$("$BIN" status 2>&1)
 contains "the next command starts a new daemon" "$out" "daemon pid"
 PID2=$(daemon_pid)
@@ -173,8 +179,9 @@ eq "and the socket is mode 0600 again" 600 "$(mode_of "$SOCK")"
 section_end
 
 section "a permissive umask does not widen the socket"
-kill -TERM "$(daemon_pid)"
-await "the daemon is gone" 3000 test ! -e "$SOCK"
+PID3=$(daemon_pid)
+kill -TERM "$PID3"
+await "the daemon is gone" 3000 bash -c "! kill -0 $PID3 2>/dev/null"
 rm -rf "$XDG_RUNTIME_DIR/baton"
 (umask 000; "$BIN" status >/dev/null 2>&1)
 eq "the socket is mode 0600 under umask 000" 600 "$(mode_of "$SOCK")"
@@ -182,8 +189,9 @@ eq "the directory is mode 0700 under umask 000" 700 "$(mode_of "$XDG_RUNTIME_DIR
 section_end
 
 section "without XDG_RUNTIME_DIR the socket is in the temp dir"
-kill -TERM "$(daemon_pid)"
-await "the daemon is gone" 3000 test ! -e "$SOCK"
+PID4=$(daemon_pid)
+kill -TERM "$PID4"
+await "the daemon is gone" 3000 bash -c "! kill -0 $PID4 2>/dev/null"
 FALLBACK="$TMPDIR/baton-$UID_NOW"
 (
   unset XDG_RUNTIME_DIR
@@ -195,8 +203,9 @@ contains "a daemon starts" "$(cat "$TMP/status.out")" "daemon pid"
 check "the socket is at \$TMPDIR/baton-<uid>/daemon.sock" test -S "$FALLBACK/daemon.sock"
 eq "it is mode 0600" 600 "$(mode_of "$FALLBACK/daemon.sock")"
 eq "its directory is mode 0700" 700 "$(mode_of "$FALLBACK")"
-kill -TERM "$(cat "$TMP/fallback.pid")" 2>/dev/null
-await "that daemon is gone" 3000 test ! -e "$FALLBACK/daemon.sock"
+PID5=$(cat "$TMP/fallback.pid")
+kill -TERM "$PID5" 2>/dev/null
+await "that daemon is gone" 3000 bash -c "! kill -0 $PID5 2>/dev/null"
 section_end
 
 section "a BATON_HOME too deep for sun_path gets a short socket"
@@ -209,7 +218,7 @@ if ((${#DEEP} + 17 > 108)); then ok "the plain path ($((${#DEEP} + 17)) bytes) w
 out=$(BATON_HOME="$DEEP" "$BIN" enroll "$REPO" 2>&1)
 contains "the daemon starts and enroll succeeds" "$out" "enrolled"
 check "no socket file sits in the deep BATON_HOME" test ! -e "$DEEP/data/daemon.sock"
-shortsock=$(find "$XDG_RUNTIME_DIR/baton" -name '*.sock' | head -1)
+shortsock=$(find "$XDG_RUNTIME_DIR/baton" -name '????????.sock' | head -1)
 check "a short socket is in the runtime dir" test -S "${shortsock:-/nonexistent}"
 eq "it is mode 0600" 600 "$(mode_of "${shortsock:-/nonexistent}")"
 DEEP_PID=$(BATON_HOME="$DEEP" daemon_pid)

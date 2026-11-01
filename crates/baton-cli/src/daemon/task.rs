@@ -154,6 +154,18 @@ pub fn spawn(
     Ok((handle, ready))
 }
 
+/// inotify spends one watch per directory, and a distribution's default limit is easily met by a tree with
+/// a `node_modules`. Say which setting to raise instead of leaving the user with "limit reached".
+fn watch_failure(e: &notify::Error) -> String {
+    #[cfg(target_os = "linux")]
+    if matches!(e.kind, notify::ErrorKind::MaxFilesWatch) {
+        return format!(
+            "{e}; every directory costs one inotify watch, so raise the sysctl fs.inotify.max_user_watches"
+        );
+    }
+    e.to_string()
+}
+
 fn start(
     root: &Path,
     dirs: &Dirs,
@@ -183,10 +195,12 @@ fn start(
     let mut watcher = notify::recommended_watcher(move |event| {
         let _ = event_tx.send(Cmd::Event(event));
     })
-    .map_err(|e| Error::Refused(format!("starting the watcher: {e}")))?;
+    .map_err(|e| Error::Refused(format!("starting the watcher: {}", watch_failure(&e))))?;
     watcher
         .watch(root, RecursiveMode::Recursive)
-        .map_err(|e| Error::Refused(format!("watching {}: {e}", root.display())))?;
+        .map_err(|e| {
+            Error::Refused(format!("watching {}: {}", root.display(), watch_failure(&e)))
+        })?;
 
     let began = Instant::now();
     task.dirty.overflow();

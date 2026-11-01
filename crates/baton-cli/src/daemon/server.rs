@@ -134,13 +134,18 @@ pub async fn serve(daemon: Arc<Daemon>) -> Result<()> {
     let listener = tokio::net::UnixListener::bind(&path)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     daemon.log.line(&format!("listening on {}", path.display()));
+    // SIGTERM is how `kill`, systemd and a logout ask a process to stop; Ctrl-C is SIGINT.
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
                 tokio::spawn(handle(Arc::clone(&daemon), stream));
             }
-            _ = tokio::signal::ctrl_c() => return Ok(()),
+            _ = tokio::signal::ctrl_c() => break,
+            _ = terminate.recv() => break,
         }
     }
+    let _ = std::fs::remove_file(&path);
+    Ok(())
 }

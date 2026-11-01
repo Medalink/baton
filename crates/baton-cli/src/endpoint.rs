@@ -38,13 +38,16 @@ pub fn pipe_name() -> String {
     }
 }
 
+/// What `sockaddr_un.sun_path` holds, with its NUL, is 108 bytes on Linux and 104 on macOS. A longer path
+/// makes `bind` and `connect` fail, so a `BATON_HOME` that deep gets a short name in the runtime directory.
+#[cfg(unix)]
+const SOCKET_PATH_MAX: usize = 100;
+
 #[cfg(unix)]
 pub fn socket_path() -> std::path::PathBuf {
+    use std::os::unix::ffi::OsStrExt;
     use std::path::PathBuf;
-    if let Some(home) = std::env::var_os(HOME_ENV).filter(|h| !h.is_empty()) {
-        return PathBuf::from(home).join("data").join("daemon.sock");
-    }
-    let dir = match std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty()) {
+    let runtime_dir = || match std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty()) {
         Some(runtime) => PathBuf::from(runtime).join("baton"),
         None => {
             // SAFETY: getuid has no preconditions and cannot fail.
@@ -52,7 +55,15 @@ pub fn socket_path() -> std::path::PathBuf {
             std::env::temp_dir().join(format!("baton-{uid}"))
         }
     };
-    dir.join("daemon.sock")
+    if let Some(home) = std::env::var_os(HOME_ENV).filter(|h| !h.is_empty()) {
+        let path = PathBuf::from(&home).join("data").join("daemon.sock");
+        if path.as_os_str().len() <= SOCKET_PATH_MAX {
+            return path;
+        }
+        let tag = baton_core::fnv1a(home.as_bytes()) as u32;
+        return runtime_dir().join(format!("{tag:08x}.sock"));
+    }
+    runtime_dir().join("daemon.sock")
 }
 
 /// Opens the endpoint once. Used by the hook (which must never wait) and by `ensure_daemon`.
