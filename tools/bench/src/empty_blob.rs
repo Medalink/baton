@@ -25,12 +25,23 @@ pub fn run() -> Res<()> {
 
     println!("empty objects: does the call put the object on disk?");
     println!(
-        "{:<32} {:<10} {:<14} {:<14} {:<10}",
-        "call", "has_object", "loose file", "git cat-file -e", "oid"
+        "{:<32} {:<18} {:<16} {:<10} {:<14} {:<16} {:<10}",
+        "call",
+        "has_object before",
+        "git -e before",
+        "has_object",
+        "loose file",
+        "git -e after",
+        "oid"
     );
     for (i, (name, kind, write)) in cases.iter().enumerate() {
         let dir = fresh_dir(&bench_root(), &format!("empty-{i}.git"))?;
         let repo = gix::init_bare(&dir)?;
+        let known = gix::objs::compute_hash(gix::hash::Kind::Sha1, *kind, b"")?;
+        let before_has = repo.has_object(known);
+        let before_git = git(&dir)
+            .args(["cat-file", "-e", &known.to_string()])
+            .output()?;
         let id = write(&repo)?;
         let hex = id.to_string();
         let loose = dir.join("objects").join(&hex[..2]).join(&hex[2..]);
@@ -38,8 +49,10 @@ pub fn run() -> Res<()> {
         let known = gix::objs::compute_hash(gix::hash::Kind::Sha1, *kind, b"")?;
         assert_eq!(id, known, "write returned an unexpected id");
         println!(
-            "{:<32} {:<10} {:<14} {:<14} {}",
+            "{:<32} {:<18} {:<16} {:<10} {:<14} {:<16} {}",
             name,
+            before_has,
+            format!("exit {}", before_git.status.code().unwrap_or(-1)),
             repo.has_object(id),
             if loose.exists() { "on disk" } else { "absent" },
             format!("exit {}", probe.status.code().unwrap_or(-1)),

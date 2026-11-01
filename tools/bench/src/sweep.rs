@@ -23,8 +23,12 @@ pub fn run(args: &[String]) -> Res<()> {
             Box::new(|| walk::ignore_parallel(&root)),
         ),
         (
+            "gix dirwalk, paths only",
+            Box::new(|| walk::gix_dirwalk(&repo, &root, false)),
+        ),
+        (
             "gix dirwalk + lstat per file",
-            Box::new(|| walk::gix_dirwalk(&repo, &root)),
+            Box::new(|| walk::gix_dirwalk(&repo, &root, true)),
         ),
     ];
 

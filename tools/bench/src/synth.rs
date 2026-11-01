@@ -16,6 +16,7 @@ pub fn run(args: &[String]) -> Res<()> {
     let root = fresh_dir(&arg_path(args, "dir")?, "synthetic")?;
     git_ok(&root, &["init", "-q"])?;
     git_ok(&root, &["config", "user.name", "bench"])?;
+    git_ok(&root, &["config", "commit.gpgsign", "false"])?;
     git_ok(&root, &["config", "user.email", "bench@localhost"])?;
     let excludes_file = root
         .parent()

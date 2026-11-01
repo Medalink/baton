@@ -104,7 +104,8 @@ impl Delegate for Collect {
 }
 
 /// `repo` is opened once by the caller; the empty index means every non-ignored path is untracked.
-pub fn gix_dirwalk(repo: &gix::Repository, root: &Path) -> Res<Sweep> {
+/// `stat` adds the lstat per file that size and mtime need; without it the walk alone is timed.
+pub fn gix_dirwalk(repo: &gix::Repository, root: &Path, stat: bool) -> Res<Sweep> {
     let index = gix::index::State::new(repo.object_hash());
     let options = repo
         .dirwalk_options()?
@@ -126,6 +127,14 @@ pub fn gix_dirwalk(repo: &gix::Repository, root: &Path) -> Res<Sweep> {
         skipped: delegate.skipped,
     };
     for path in delegate.files {
+        if !stat {
+            out.files.push(Stat {
+                size: 0,
+                mtime: SystemTime::UNIX_EPOCH,
+                path,
+            });
+            continue;
+        }
         let md = std::fs::symlink_metadata(root.join(&path))?;
         out.files.push(Stat {
             size: md.len(),

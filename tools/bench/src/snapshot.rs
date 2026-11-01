@@ -221,7 +221,7 @@ fn turns(
 pub fn run(args: &[String]) -> Res<()> {
     let root = arg_path(args, "worktree")?;
     let user_repo = gix::open(&root)?;
-    let sweep = walk::gix_dirwalk(&user_repo, &root)?;
+    let sweep = walk::gix_dirwalk(&user_repo, &root, true)?;
     let name = root
         .file_name()
         .map_or_else(|| "worktree".into(), |n| n.to_string_lossy().into_owned());

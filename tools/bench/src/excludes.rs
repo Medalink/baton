@@ -90,22 +90,32 @@ fn files_below(root: &Path, skipped_dirs: &[&Probe]) -> Vec<Probe> {
 }
 
 fn report(label: &str, probes: &[Probe], gix: &[GixVerdict], git: &[Verdict]) {
-    let (mut both_ignored, mut both_kept) = (0, 0);
+    let (mut both_ignored, mut both_kept) = (0, Vec::new());
     let (mut gix_only, mut git_only) = (Vec::new(), Vec::new());
     for ((p, g), v) in probes.iter().zip(gix).zip(git) {
         match (g.ignored, v.ignored) {
             (true, true) => both_ignored += 1,
-            (false, false) => both_kept += 1,
+            (false, false) => both_kept.push(p),
             (true, false) => gix_only.push((p, g, v)),
             (false, true) => git_only.push((p, g, v)),
         }
     }
     println!(
-        "{label}: {} paths, {both_ignored} ignored by both, {both_kept} kept by both, {} ignored only by gix, {} ignored only by git",
+        "{label}: {} paths, {both_ignored} ignored by both, {} kept by both, {} ignored only by gix, {} ignored only by git",
         probes.len(),
+        both_kept.len(),
         gix_only.len(),
         git_only.len()
     );
+    if label.starts_with("ignored entries") {
+        for p in both_kept.iter().take(5) {
+            println!(
+                "    emitted as ignored but kept by both (a collapsed directory?): {}{}",
+                p.path,
+                if p.is_dir { "/" } else { "" }
+            );
+        }
+    }
     for (title, list) in [
         ("gix ignores, git does not", &gix_only),
         ("git ignores, gix does not", &git_only),
@@ -125,7 +135,7 @@ fn report(label: &str, probes: &[Probe], gix: &[GixVerdict], git: &[Verdict]) {
 pub fn run(args: &[String]) -> Res<()> {
     let root = arg_path(args, "worktree")?;
     let repo = gix::open(&root)?;
-    let gix_sweep = walk::gix_dirwalk(&repo, &root)?;
+    let gix_sweep = walk::gix_dirwalk(&repo, &root, true)?;
     let ignore_sweep = walk::ignore_serial(&root)?;
 
     let visited: BTreeSet<&str> = gix_sweep
