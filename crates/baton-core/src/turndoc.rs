@@ -5,7 +5,7 @@
 //! through the same `StorePolicy::prepare` a snapshot does before it can appear in a diff line.
 
 use crate::error::{Error, Result};
-use crate::id::{BlobId, GitSha, ProjectKey, RelPath};
+use crate::id::{BlobId, GitSha, ProjectKey, RelPath, TreeId};
 use crate::policy::StorePolicy;
 use crate::schema::{CheckResult, FileChange, FileStatus, TURN_SCHEMA, TurnDoc};
 use crate::store::{SideRepo, TurnRecord};
@@ -43,7 +43,7 @@ impl Side {
 }
 
 /// The commit a thread's first turn started from, read straight from the user's object database.
-struct GitBase {
+pub(crate) struct GitBase {
     repo: gix::Repository,
     files: BTreeMap<String, gix::ObjectId>,
 }
@@ -52,6 +52,11 @@ impl GitBase {
     fn open(root: &Path, sha: Option<GitSha>) -> Result<Self> {
         let repo = gix::open_opts(root, gix::open::Options::isolated())
             .map_err(|e| Error::Git(e.to_string()))?;
+        Self::from_repo(repo, sha)
+    }
+
+    /// The files of `sha` in an already opened repository; none when the repository has no commit yet.
+    pub(crate) fn from_repo(repo: gix::Repository, sha: Option<GitSha>) -> Result<Self> {
         let mut files = BTreeMap::new();
         if let Some(sha) = sha {
             let git = |e: &dyn std::fmt::Display| Error::Git(e.to_string());
@@ -169,20 +174,29 @@ fn deleted_for_real(
         .collect())
 }
 
-/// The first turn against the commit the thread started from. Only paths the side repo could hold are
-/// compared: a base file that is missing from the turn's tree is a deletion only if the store policy
-/// would have stored it, and an unchanged file never appears. The git side goes through the same
-/// `StorePolicy::prepare` a snapshot does.
-fn changes_since_base(
+/// A file the user's base commit and a turn's tree disagree on, as the store would see it: `old` is the
+/// base's bytes after `StorePolicy::prepare`, `new` the turn's stored bytes; none means the file is absent
+/// on that side.
+pub(crate) struct BaseChange {
+    pub path: String,
+    pub old: Option<Vec<u8>>,
+    pub new: Option<Vec<u8>>,
+}
+
+/// A turn's tree against the commit its thread started from. Only paths the side repo could hold are
+/// compared: a base file that is missing from the tree is a deletion only if the store policy would have
+/// stored it, and an unchanged file never appears. The git side goes through the same
+/// `StorePolicy::prepare` a snapshot does. The turn document and `baton report` both read it this way.
+pub(crate) fn changes_against_base(
     side: &SideRepo,
-    record: &TurnRecord,
+    tree: TreeId,
     base: &GitBase,
     policy: &StorePolicy,
     root: &Path,
-) -> Result<Vec<Changed>> {
+) -> Result<Vec<BaseChange>> {
     let mut out = Vec::new();
     let mut now: BTreeMap<String, BlobId> = side
-        .flatten(record.tree)?
+        .flatten(tree)?
         .into_iter()
         .map(|e| (e.path.as_str().to_owned(), e.blob))
         .collect();
@@ -198,10 +212,10 @@ fn changes_since_base(
         let old = base.prepared(path, git_blob, policy)?;
         let new = side.read_blob(blob)?;
         if !same_content(&old, &new) {
-            out.push(Changed {
+            out.push(BaseChange {
                 path: path.clone(),
-                old: Side::from_bytes(&old),
-                new: Side::from_bytes(&new),
+                old: Some(old),
+                new: Some(new),
             });
         }
     }
@@ -214,22 +228,40 @@ fn changes_since_base(
         .zip(deleted_for_real(policy, root, &lengths)?)
     {
         if real {
-            out.push(Changed {
+            out.push(BaseChange {
                 path: path.to_owned(),
-                old: Side::from_bytes(&base.prepared(path, git_blob, policy)?),
-                new: Side::Absent,
+                old: Some(base.prepared(path, git_blob, policy)?),
+                new: None,
             });
         }
     }
     for (path, blob) in now {
-        out.push(Changed {
+        out.push(BaseChange {
             path,
-            old: Side::Absent,
-            new: blob_side(side, blob)?,
+            old: None,
+            new: Some(side.read_blob(blob)?),
         });
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
+}
+
+fn changes_since_base(
+    side: &SideRepo,
+    record: &TurnRecord,
+    base: &GitBase,
+    policy: &StorePolicy,
+    root: &Path,
+) -> Result<Vec<Changed>> {
+    let side_of = |bytes: Option<Vec<u8>>| bytes.map_or(Side::Absent, |b| Side::from_bytes(&b));
+    Ok(changes_against_base(side, record.tree, base, policy, root)?
+        .into_iter()
+        .map(|c| Changed {
+            path: c.path,
+            old: side_of(c.old),
+            new: side_of(c.new),
+        })
+        .collect())
 }
 
 /// Equal bytes, or text that differs only in line endings: a checkout with CRLF and git's LF blob are the

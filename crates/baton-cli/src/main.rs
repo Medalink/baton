@@ -7,6 +7,7 @@ mod daemon;
 mod endpoint;
 mod hook;
 mod pull;
+mod report;
 mod serve;
 mod timefmt;
 
@@ -138,6 +139,18 @@ enum Command {
         /// A worktree made by `baton pull`. Paths with local edits are kept as they are.
         #[arg(long)]
         into: Option<PathBuf>,
+    },
+    /// Flag thrashing, rework and abandoned threads in the recorded turns. Reads only.
+    Report {
+        /// How far back to look: `7d`, `48h`, `90m`, `2w`.
+        #[arg(long, default_value = "7d")]
+        since: String,
+        /// A project key, to report outside a worktree.
+        #[arg(long)]
+        project: Option<String>,
+        /// Print the `baton.report.v1` document.
+        #[arg(long)]
+        json: bool,
     },
     /// Run the sync server.
     Serve {
@@ -272,6 +285,15 @@ fn main() {
         Command::Status => commands::status(),
         Command::Pull { thread, into } => pull::pull(&thread, into.as_deref()),
         Command::Follow { thread, into } => pull::follow(&thread, into.as_deref()),
+        Command::Report {
+            since,
+            project,
+            json,
+        } => report::report(report::ReportArgs {
+            since,
+            project,
+            json,
+        }),
         Command::Serve {
             data,
             listen,

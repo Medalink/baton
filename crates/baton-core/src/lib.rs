@@ -11,6 +11,7 @@ mod plugin;
 mod plugin_config;
 mod policy;
 mod redact;
+mod report;
 mod rewind;
 mod rules;
 mod schema;
@@ -44,6 +45,10 @@ pub use plugin::{
 pub use plugin_config::{Classifier, Lens, Mode, Notify, Plugins, parse_duration};
 pub use policy::StorePolicy;
 pub use redact::{Redactor, RuleSpec, load_literals};
+pub use report::{
+    Abandoned, AbandonedFile, CheckRun, Counts, Group, Hotspot, REPORT_SCHEMA, RepoInfo, Report,
+    ReportOptions, Rework, ReworkedBy, Skipped, Thrash, build_report,
+};
 pub use rewind::{
     Refusal, RewindAction, RewindPlan, RewindWrite, apply as apply_rewind, plan as plan_rewind,
 };
