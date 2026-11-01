@@ -988,7 +988,7 @@ else
 
   wire names
   check "the server repo passes fsck --strict after the hostile names" gitd "$(wire_repo names)" fsck --strict --no-dangling
-  eq "and holds only the two clean turns" "2" "$(gitd "$(wire_repo names)" for-each-ref --format=x refs/baton | wc -l | tr -d ' ')"
+  eq "and holds only the three clean turns" "3" "$(gitd "$(wire_repo names)" for-each-ref --format=x refs/baton | wc -l | tr -d ' ')"
   wire kinds
   check "the server repo passes fsck --strict after the kind mismatches" gitd "$(wire_repo kinds)" fsck --strict --no-dangling
   wire depth

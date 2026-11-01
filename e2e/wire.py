@@ -245,6 +245,17 @@ def case_names(c):
         check(f"{label} is refused", verdict(c.one_turn(p, one_file(m, b"a.txt", b"x\n", mode))) == "refused/invalid")
     check(".gitmodules as a symbolic link is refused",
           verdict(c.one_turn(p, one_file(m, b".gitmodules", b"x", "120000"))) == "refused/invalid")
+    for label, name in [(".gitignore", b".gitignore"), (".gitattributes", b".gitattributes"), (".mailmap", b".mailmap"),
+                        (".GitIgnore", b".GitIgnore"), ("GI250A~1", b"GI250A~1"), (".mailmap with a trailing space", b".mailmap ")]:
+        check(f"{label} as a symbolic link is refused",
+              verdict(c.one_turn(p, one_file(m, name, b"x", "120000"))) == "refused/invalid")
+    check("a regular .gitignore is accepted", verdict(c.one_turn(p, one_file(m, b".gitignore", b"*.log\n"))) == "advanced")
+
+    def null_gitlink(thread):
+        t = tree([("160000", b"sub", "0" * 40)])
+        cm = commit(t[2], None, thread, 1, m)
+        return [t, cm], cm[2]
+    check("a tree entry that points to the null id is refused", verdict(c.one_turn(p, null_gitlink)) == "refused/invalid")
     modules = {
         "a url that starts with a dash": '[submodule "a"]\n\tpath = a\n\turl = -oevil\n',
         "a path that starts with a dash": '[submodule "a"]\n\tpath = -x\n\turl = https://example.com/a\n',
