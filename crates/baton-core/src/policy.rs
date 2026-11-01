@@ -44,18 +44,32 @@ pub struct StorePolicy {
     whole: GlobSet,
     max_file_bytes: u64,
     redactor: Redactor,
+    notices: Vec<String>,
 }
 
 impl StorePolicy {
     pub(crate) fn open(worktree: &Path, settings: &Settings) -> Result<Self> {
         let literals = load_literals(&settings.value_files)?;
+        let redactor = Redactor::new(&settings.rules, &literals)?;
+        let notices = settings
+            .notices
+            .iter()
+            .chain(redactor.notices())
+            .cloned()
+            .collect();
         Ok(Self {
             ignore: IgnoreRules::discover(worktree)?,
             exclude: globs(&settings.exclude, "exclude glob", true)?,
             whole: globs(&settings.store_whole, "store_whole glob", false)?,
             max_file_bytes: settings.max_file_bytes,
-            redactor: Redactor::new(&settings.rules, &literals)?,
+            redactor,
+            notices,
         })
+    }
+
+    /// What loading the settings ignored or dropped.
+    pub(crate) fn notices(&self) -> &[String] {
+        &self.notices
     }
 
     pub(crate) fn rules(&self) -> &IgnoreRules {
@@ -91,14 +105,20 @@ impl StorePolicy {
         size > self.max_file_bytes
     }
 
-    /// The bytes to store for a file: untouched for lockfiles, `store_whole` matches and anything with a
-    /// NUL in its first 8 KiB, redacted otherwise. The blob id is computed from the result, so it is final.
+    /// The bytes to store for a file. A file with a NUL in its first 8 KiB is binary and stays as it is. A
+    /// `store_whole` match (lockfiles, whose hashes look like secrets) loses only the literal secrets the
+    /// user listed; every other text file gets every rule. The blob id is computed from the result.
     pub fn prepare(&self, path: &RelPath, bytes: Vec<u8>) -> Vec<u8> {
         let probe = &bytes[..bytes.len().min(BINARY_PROBE_BYTES)];
-        if self.whole.is_match(path.as_str()) || probe.contains(&0) {
+        if probe.contains(&0) {
             return bytes;
         }
-        match self.redactor.redact(&bytes) {
+        let redacted = if self.whole.is_match(path.as_str()) {
+            self.redactor.redact_values(&bytes)
+        } else {
+            self.redactor.redact(&bytes)
+        };
+        match redacted {
             std::borrow::Cow::Borrowed(_) => bytes,
             std::borrow::Cow::Owned(redacted) => redacted,
         }
@@ -106,5 +126,10 @@ impl StorePolicy {
 
     pub fn redact_text(&self, text: &str) -> String {
         self.redactor.redact_text(text)
+    }
+
+    /// True when `text` would change under redaction. Anything that enters an object as a name must not.
+    pub fn holds_secret(&self, text: &str) -> bool {
+        self.redactor.holds_secret(text)
     }
 }

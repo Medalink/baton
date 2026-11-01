@@ -5,8 +5,8 @@ use super::log::Log;
 use super::writer::Writer;
 use crate::control::TurnArgs;
 use baton_core::{
-    AgentName, Check, ChunkLimits, Dirs, DirtySet, Error, ModelName, ProjectKey, Result, Subject,
-    ThreadId, TurnDraft, UnixMillis, Worktree,
+    AgentName, Check, ChunkLimits, Dirs, DirtySet, Error, MachineId, ModelName, ProjectKey, Result,
+    Subject, ThreadId, TurnDraft, UnixMillis, Worktree,
 };
 use notify::{EventKind, RecursiveMode, Watcher};
 use std::collections::{BTreeSet, VecDeque};
@@ -380,6 +380,9 @@ impl Task {
         let mut changed = 0;
         loop {
             let mut plan = self.wt.prepare(&mut self.dirty, ChunkLimits::default())?;
+            for notice in self.wt.take_notices() {
+                self.log.line(&format!("{} {notice}", self.label));
+            }
             if plan.paths() == 0 {
                 return Ok((tree, changed));
             }
@@ -421,8 +424,8 @@ impl Task {
 
     fn take_turn(&mut self, input: &TurnInput) -> Result<Done> {
         let began = Instant::now();
-        let draft = self.draft(input)?;
         let (tree, changed) = self.sync()?;
+        let draft = self.draft(input)?;
         let synced = began.elapsed();
         let (record, stage) = self.writer.commit(tree, draft, UnixMillis::now())?;
         let done = began.elapsed();
@@ -448,33 +451,57 @@ impl Task {
         })
     }
 
-    /// Everything that is not a file is redacted too: the subject and the model text. An id (thread, agent)
-    /// that would change under redaction is refused, because a marker is not a valid id.
+    /// Built after the sync, so the policy is today's and `Baton-Skipped` lists what this sync skipped.
+    /// Every string that enters the commit message is redacted, replaced or refused. The subject and the
+    /// model text are redacted. A marker is not a valid id, so an id that would change under redaction is
+    /// handled by what it names: a thread or agent id is refused, because the ref is derived from it; a
+    /// machine id gives way to the host name and a check name is dropped, since a turn is not worth losing
+    /// over either. Both are logged.
     fn draft(&self, input: &TurnInput) -> Result<TurnDraft> {
         let policy = self.wt.policy();
-        for id in [input.thread.as_str(), input.agent.as_str()] {
-            if policy.redact_text(id) != id {
-                return Err(Error::Refused("a thread or agent id holds a secret".into()));
+        let mut machine = self.wt.settings().machine.clone();
+        if policy.holds_secret(machine.as_str()) {
+            self.log.line(&format!(
+                "{} the configured machine id holds a secret; using the host name",
+                self.label
+            ));
+            machine = MachineId::from_host();
+            if policy.holds_secret(machine.as_str()) {
+                machine = MachineId::parse("unknown")?;
             }
+        }
+        for (what, id) in [
+            ("thread id", input.thread.as_str()),
+            ("agent name", input.agent.as_str()),
+        ] {
+            if policy.holds_secret(id) {
+                return Err(Error::Refused(format!("a {what} holds a secret")));
+            }
+        }
+        let (checks, dropped): (Vec<_>, Vec<_>) = input
+            .checks
+            .iter()
+            .cloned()
+            .partition(|c| !policy.holds_secret(c.name.as_str()));
+        if !dropped.is_empty() {
+            self.log.line(&format!(
+                "{} dropped {} check(s) whose name holds a secret",
+                self.label,
+                dropped.len()
+            ));
         }
         let model = match input.model.as_deref().map(|m| policy.redact_text(m)) {
             Some(text) => Some(ModelName::parse(&text)?),
             None => None,
         };
-        let skipped = self
-            .wt
-            .skipped()
-            .into_iter()
-            .filter(|p| policy.redact_text(p.as_str()) == p.as_str())
-            .collect();
         Ok(TurnDraft {
             thread: input.thread.clone(),
             agent: input.agent.clone(),
             model,
-            machine: self.wt.settings().machine.clone(),
+            machine,
             base: self.wt.head(),
-            checks: input.checks.clone(),
-            skipped,
+            checks,
+            skipped: self.wt.skipped(),
             subject: Subject::new(&policy.redact_text(&input.message)),
         })
     }

@@ -55,6 +55,38 @@ impl Check {
     }
 }
 
+/// A path baton did not store, as a turn records it. A name that held a secret appears with the secret
+/// cut out, which need not be a path git or a filesystem could hold, so this is a label to show and
+/// never a path to open.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SkippedPath(Box<str>);
+
+impl SkippedPath {
+    pub fn parse(s: &str) -> Result<Self> {
+        if s.is_empty() || s.chars().any(char::is_control) {
+            return Err(Error::invalid(
+                "Baton-Skipped",
+                format!("{s:?} is empty or has a control character"),
+            ));
+        }
+        Ok(Self(s.into()))
+    }
+
+    pub fn of(path: &RelPath) -> Self {
+        Self(path.as_str().into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for SkippedPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Everything about a turn except the position in its thread, which the side repo assigns.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TurnDraft {
@@ -64,7 +96,7 @@ pub struct TurnDraft {
     pub machine: MachineId,
     pub base: Option<GitSha>,
     pub checks: Vec<Check>,
-    pub skipped: Vec<RelPath>,
+    pub skipped: Vec<SkippedPath>,
     pub subject: Subject,
 }
 
@@ -187,7 +219,7 @@ impl Turn {
                 "Baton-Machine" => once(&mut machine, "Machine", MachineId::parse(value)?)?,
                 "Baton-Base" => once(&mut base, "Base", GitSha::parse(value)?)?,
                 "Baton-Check" => checks.push(Check::parse(value)?),
-                "Baton-Skipped" => skipped.push(RelPath::parse(&unescape_path(value)?)?),
+                "Baton-Skipped" => skipped.push(SkippedPath::parse(&unescape_path(value)?)?),
                 _ => {}
             }
         }

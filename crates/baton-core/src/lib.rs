@@ -25,5 +25,5 @@ pub use rewind::{
 pub use store::{
     BlobPayload, ChangeKind, FlatEntry, PathChange, SideRepo, StageTimes, TreeEdit, TurnRecord,
 };
-pub use turn::{Check, Subject, Turn, TurnDraft};
+pub use turn::{Check, SkippedPath, Subject, Turn, TurnDraft};
 pub use worktree::{ChunkLimits, DirtySet, Plan, Worktree, find_root, project_key};

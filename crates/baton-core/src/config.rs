@@ -165,7 +165,9 @@ impl RepoConfig {
     }
 }
 
-/// The user and repo configs merged: exclusions and whole-file globs add up, the size limit is the smaller.
+/// The user and repo configs merged: exclusions add up, the size limit is the smaller, and only the user's
+/// `store_whole` counts. A repo config arrives with `git clone`, so it may add redaction and take files
+/// out of the store, never put a file in unredacted.
 #[derive(Clone, Debug)]
 pub struct Settings {
     pub machine: MachineId,
@@ -174,6 +176,8 @@ pub struct Settings {
     pub max_file_bytes: u64,
     pub rules: Vec<RuleSpec>,
     pub value_files: Vec<PathBuf>,
+    /// What the merge ignored; the daemon logs these.
+    pub notices: Vec<String>,
 }
 
 impl Settings {
@@ -185,9 +189,16 @@ impl Settings {
             .map(|s| (*s).to_owned())
             .collect();
         store_whole.extend(user.snapshot.store_whole.iter().cloned());
-        store_whole.extend(repo.snapshot.store_whole.iter().cloned());
+        let mut notices = Vec::new();
+        if !repo.snapshot.store_whole.is_empty() {
+            notices.push(
+                ".baton/config.toml sets store_whole, which only the user config may; ignored"
+                    .into(),
+            );
+        }
         let limits = [user.snapshot.max_file_bytes, repo.snapshot.max_file_bytes];
         Self {
+            notices,
             machine: user.machine.clone().unwrap_or_else(MachineId::from_host),
             exclude,
             store_whole,

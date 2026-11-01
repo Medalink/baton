@@ -19,7 +19,7 @@ pub(crate) const BUILTIN: &[(&str, &str)] = &[
     ),
     (
         "aws-secret-key",
-        r#"(?i)aws_?secret_?access_?key["']?\s*[=:]\s*["']?(?P<secret>[A-Za-z0-9/+=]{40})\b"#,
+        r#"(?i)aws_?secret_?access_?key["']?\s*[=:]\s*["']?(?P<secret>[A-Za-z0-9/+=]{40,})"#,
     ),
     (
         "github-token",
@@ -34,10 +34,17 @@ pub(crate) const BUILTIN: &[(&str, &str)] = &[
         "jwt",
         r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}",
     ),
-    ("url-password", r"://[^/\s:@]+:(?P<secret>[^/\s@]{3,})@"),
+    (
+        "url-password",
+        r#"://[^/\s:@]+:(?P<secret>[^\s@"'<>]{3,})@"#,
+    ),
     (
         "assigned-secret",
-        r#"(?i)\b(?:password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token)["']?\s*[=:]\s*["'](?P<secret>[^"'\s]{16,})["']"#,
+        r#"(?i)(?:password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?key)\w*["']?\s*[=:]\s*["'](?P<secret>[^"'\s]{8,})["']"#,
+    ),
+    (
+        "assigned-secret",
+        r#"(?i)(?:password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?key)\w*["']?[ \t]*[=:][ \t]*(?P<secret>[^\s"'`;,(){}<>$\[\]\\]{12,})"#,
     ),
 ];
 
@@ -59,13 +66,28 @@ fn marker(rule: &str) -> Vec<u8> {
     format!("[baton:redacted:{rule}]").into_bytes()
 }
 
+/// True for exactly one marker, so a later rule keeps the earlier rule's name instead of relabelling it.
+fn is_marker(bytes: &[u8]) -> bool {
+    bytes
+        .strip_prefix(REDACTION_PREFIX)
+        .and_then(|rest| rest.strip_suffix(b"]"))
+        .is_some_and(|name| {
+            !name.is_empty()
+                && name
+                    .iter()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+        })
+}
+
 pub struct Redactor {
     rules: Vec<Rule>,
     values: Option<AhoCorasick>,
+    notices: Vec<String>,
 }
 
 impl Redactor {
     pub fn new(project_rules: &[RuleSpec], literals: &[String]) -> Result<Self> {
+        let mut notices = Vec::new();
         let mut rules = Vec::with_capacity(BUILTIN.len() + project_rules.len());
         for (name, pattern) in BUILTIN {
             rules.push(Rule {
@@ -90,11 +112,19 @@ impl Redactor {
                     ),
                 ));
             }
+            let regex = Regex::new(&spec.regex).map_err(|e| {
+                Error::invalid("redaction rule regex", format!("{}: {e}", spec.name))
+            })?;
+            if regex.is_match(b"") {
+                notices.push(format!(
+                    "redaction rule {} matches the empty string and was dropped",
+                    spec.name
+                ));
+                continue;
+            }
             rules.push(Rule {
                 marker: marker(&spec.name),
-                regex: Regex::new(&spec.regex).map_err(|e| {
-                    Error::invalid("redaction rule regex", format!("{}: {e}", spec.name))
-                })?,
+                regex,
             });
         }
         let values = if literals.is_empty() {
@@ -107,24 +137,39 @@ impl Redactor {
                     .map_err(|e| Error::invalid("redaction values", e))?,
             )
         };
-        Ok(Self { rules, values })
+        Ok(Self {
+            rules,
+            values,
+            notices,
+        })
+    }
+
+    /// What the loader dropped or ignored while building this redactor.
+    pub fn notices(&self) -> &[String] {
+        &self.notices
+    }
+
+    /// Only the literal secrets, for files that must otherwise be stored byte for byte.
+    pub fn redact_values<'a>(&self, input: &'a [u8]) -> Cow<'a, [u8]> {
+        let Some(values) = &self.values else {
+            return Cow::Borrowed(input);
+        };
+        if !values.is_match(input) {
+            return Cow::Borrowed(input);
+        }
+        let mut out = Vec::with_capacity(input.len());
+        let mut last = 0;
+        for m in values.find_iter(input) {
+            out.extend_from_slice(&input[last..m.start()]);
+            out.extend_from_slice(&marker("value"));
+            last = m.end();
+        }
+        out.extend_from_slice(&input[last..]);
+        Cow::Owned(out)
     }
 
     pub fn redact<'a>(&self, input: &'a [u8]) -> Cow<'a, [u8]> {
-        let mut current = Cow::Borrowed(input);
-        if let Some(values) = &self.values
-            && values.is_match(&*current)
-        {
-            let mut out = Vec::with_capacity(current.len());
-            let mut last = 0;
-            for m in values.find_iter(&*current) {
-                out.extend_from_slice(&current[last..m.start()]);
-                out.extend_from_slice(&marker("value"));
-                last = m.end();
-            }
-            out.extend_from_slice(&current[last..]);
-            current = Cow::Owned(out);
-        }
+        let mut current = self.redact_values(input);
         for rule in &self.rules {
             if !rule.regex.is_match(&current) {
                 continue;
@@ -134,6 +179,9 @@ impl Redactor {
             for caps in rule.regex.captures_iter(&current) {
                 let whole = caps.get(0).expect("group 0 always matches");
                 let target = caps.name("secret").unwrap_or(whole);
+                if target.is_empty() || is_marker(target.as_bytes()) {
+                    continue;
+                }
                 out.extend_from_slice(&current[last..target.start()]);
                 out.extend_from_slice(&rule.marker);
                 last = target.end();
@@ -142,6 +190,10 @@ impl Redactor {
             current = Cow::Owned(out);
         }
         current
+    }
+
+    pub fn holds_secret(&self, text: &str) -> bool {
+        matches!(self.redact(text.as_bytes()), Cow::Owned(_))
     }
 
     pub fn redact_text(&self, text: &str) -> String {

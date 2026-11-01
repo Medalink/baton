@@ -11,6 +11,7 @@ use crate::id::{BlobId, FileKind, GitSha, ProjectKey, RelPath, TreeId};
 use crate::paths::Dirs;
 use crate::policy::StorePolicy;
 use crate::store::{BlobPayload, TreeEdit};
+use crate::turn::SkippedPath;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
@@ -126,10 +127,19 @@ struct SavedState {
     policy: String,
 }
 
+/// Why a path is not in the tree.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SkipKind {
+    /// Over the size limit.
+    Size,
+    /// The path itself holds a secret, so it cannot be named in a tree or a trailer. Never saved to disk.
+    Name,
+}
+
 enum Update {
     Set(String, Tracked),
     Clear(String),
-    Skip(String),
+    Skip(String, SkipKind),
     Unskip(String),
 }
 
@@ -174,7 +184,9 @@ pub struct Worktree {
     /// The files in HEAD as of the last `prepare`, to notice which ones HEAD started or stopped tracking.
     head_files: Arc<BTreeSet<String>>,
     tracked: BTreeMap<String, Tracked>,
-    skipped: BTreeSet<String>,
+    skipped: BTreeMap<String, SkipKind>,
+    /// What loading the policy ignored, until `take_notices` hands it to the log.
+    notices: Vec<String>,
     tree: TreeId,
     state_file: PathBuf,
 }
@@ -292,10 +304,12 @@ impl Worktree {
             policy,
             policy_fingerprint,
             tracked: BTreeMap::new(),
-            skipped: BTreeSet::new(),
+            skipped: BTreeMap::new(),
+            notices: Vec::new(),
             tree: TreeId::empty(),
             state_file,
         };
+        worktree.notices = worktree.policy.notices().to_vec();
         worktree.load_state(tree_known);
         Ok(worktree)
     }
@@ -320,11 +334,28 @@ impl Worktree {
         self.tree
     }
 
-    pub fn skipped(&self) -> Vec<RelPath> {
-        self.skipped
+    /// The paths the last `prepare` left out, as a turn names them: a path with a secret in it by its
+    /// redacted name.
+    pub fn skipped(&self) -> Vec<SkippedPath> {
+        let labels: BTreeSet<SkippedPath> = self
+            .skipped
             .iter()
-            .filter_map(|p| RelPath::parse(p).ok())
-            .collect()
+            .filter_map(|(path, why)| match why {
+                SkipKind::Size => RelPath::parse(path).ok().map(|p| SkippedPath::of(&p)),
+                SkipKind::Name => {
+                    let label = self.policy.redact_text(path);
+                    (label != *path)
+                        .then(|| SkippedPath::parse(&label).ok())
+                        .flatten()
+                }
+            })
+            .collect();
+        labels.into_iter().collect()
+    }
+
+    /// What loading the settings ignored or dropped since the last call.
+    pub fn take_notices(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notices)
     }
 
     pub fn head(&self) -> Option<GitSha> {
@@ -364,7 +395,11 @@ impl Worktree {
                 (e.path, tracked)
             })
             .collect();
-        self.skipped = saved.skipped.into_iter().collect();
+        self.skipped = saved
+            .skipped
+            .into_iter()
+            .map(|p| (p, SkipKind::Size))
+            .collect();
         if saved.policy != self.policy_fingerprint {
             self.invalidate();
         }
@@ -396,7 +431,12 @@ impl Worktree {
                     racy: t.racy,
                 })
                 .collect(),
-            skipped: self.skipped.iter().cloned().collect(),
+            skipped: self
+                .skipped
+                .iter()
+                .filter(|(_, why)| **why == SkipKind::Size)
+                .map(|(path, _)| path.clone())
+                .collect(),
             policy: self.policy_fingerprint.clone(),
         };
         let bytes = serde_json::to_vec(&saved).map_err(|e| Error::Git(e.to_string()))?;
@@ -418,6 +458,7 @@ impl Worktree {
         let settings = load_settings(&self.root, &self.dirs)?;
         let policy = StorePolicy::open(&self.root, &settings)?;
         self.policy_fingerprint = fingerprint(&self.root, &self.dirs, &settings, &policy);
+        self.notices.extend(policy.notices().iter().cloned());
         self.settings = settings;
         self.policy = policy;
         self.invalidate();
@@ -510,7 +551,7 @@ impl Worktree {
             }
             found.insert(path);
         }
-        for path in self.tracked.keys().chain(self.skipped.iter()) {
+        for path in self.tracked.keys().chain(self.skipped.keys()) {
             if !found.contains(path) {
                 dirty.push(path.clone());
             }
@@ -623,7 +664,7 @@ impl Worktree {
             .map(|(p, _)| p.clone())
             .chain(
                 self.skipped
-                    .iter()
+                    .keys()
                     .filter(|p| p.starts_with(&format!("{dir}/")))
                     .cloned(),
             )
@@ -710,9 +751,16 @@ impl Worktree {
             self.forget(path, &rel, plan);
             return Ok(0);
         }
+        if self.policy.holds_secret(path) {
+            self.forget(path, &rel, plan);
+            plan.updates
+                .push(Update::Skip(path.to_owned(), SkipKind::Name));
+            return Ok(0);
+        }
         if self.policy.exceeds_size_limit(meta.len()) {
             self.forget(path, &rel, plan);
-            plan.updates.push(Update::Skip(path.to_owned()));
+            plan.updates
+                .push(Update::Skip(path.to_owned(), SkipKind::Size));
             return Ok(0);
         }
         let (size, mtime) = (meta.len(), mtime_ns(&meta));
@@ -766,7 +814,7 @@ impl Worktree {
             });
             plan.updates.push(Update::Clear(path.to_owned()));
         }
-        if self.skipped.contains(path) {
+        if self.skipped.contains_key(path) {
             plan.updates.push(Update::Unskip(path.to_owned()));
         }
     }
@@ -781,8 +829,8 @@ impl Worktree {
                 Update::Clear(path) => {
                     self.tracked.remove(&path);
                 }
-                Update::Skip(path) => {
-                    self.skipped.insert(path);
+                Update::Skip(path, why) => {
+                    self.skipped.insert(path, why);
                 }
                 Update::Unskip(path) => {
                     self.skipped.remove(&path);
