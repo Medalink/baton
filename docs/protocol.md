@@ -138,7 +138,7 @@ The hook writes one frame to `\\.\pipe\baton-<user>` on Windows or `$XDG_RUNTIME
 
 Each plug-in is a command in user config. baton writes one JSON document to its stdin, closes stdin, and reads one JSON document from stdout within the configured timeout. A timeout, a non-zero exit, or unparseable output is a failure: classify, decide and notify fail open, auth fails closed.
 
-### `baton.turn.v1`, the input to classify and notify
+### `baton.turn.v1`, the input to classify
 
 ```json
 {
@@ -158,9 +158,26 @@ Each plug-in is a command in user config. baton writes one JSON document to its 
   "files": [{"path": "src/trap.rs", "status": "modified", "added": 12, "removed": 4}],
   "diff": "<unified diff against the parent turn, or against base for the first turn, redacted, at most 256 KiB>",
   "diff_truncated": false,
-  "lens": "<contents of the lens file, or null>"
+  "files_truncated": false,
+  "lens": "<contents of the lens file or the lens command's answer, or null>"
 }
 ```
+
+`files` lists at most 2000 paths; `files_truncated` says there were more. The lens is cut to 64 KiB and redacted like the diff. A command verdict is redacted before it is stored, so a classifier that echoes a secret from the diff does not write it to the side repo.
+
+### `baton.lens.v1`, the optional lens command
+
+When `[lens]` names a command instead of a file, baton runs it once per turn and uses its answer as `lens`:
+
+```json
+{"schema": "baton.lens.v1", "project": "github.com/acme/app", "thread": "3f2a9c", "cwd": "/home/me/app"}
+```
+
+```json
+{"lens": "Migrations are one-way here. Treat anything under billing/ as high stakes."}
+```
+
+A failure means `lens: null`; the turn is still classified.
 
 ### `baton.verdict.v1`, the output of classify
 
@@ -174,7 +191,11 @@ Each plug-in is a command in user config. baton writes one JSON document to its 
 }
 ```
 
-`class` is one of `react`, `check`, `log`, `quiet`. `score` is between 0 and 1. `kind` is free text. baton stores the verdict on `refs/baton-verdict/<commit>` and never rewrites the turn.
+`class` is one of `react`, `check`, `log`, `quiet`. `score` is between 0 and 1. `kind` is free text. `lines` in an evidence entry is optional: `[first, last]`, 1-based, `first <= last`. baton stores the verdict on `refs/baton-verdict/<commit>` and never rewrites the turn.
+
+### The notify input
+
+A notifier reads `{"verdict": <baton.verdict.v1>, "turn": <baton.turn.v1>}`. Its output is ignored. Notifiers run only in `live` mode, for the verdicts whose class is in the notifier's `on`.
 
 ### `baton.ask.v1` and `baton.answer.v1`, for decide
 
@@ -208,4 +229,15 @@ Each plug-in is a command in user config. baton writes one JSON document to its 
 {"schema": "baton.turnreq.v1", "cwd": "/home/me/app", "thread": "3f2a9c", "subject": "Rename the trap receiver", "agent": "my-agent", "model": null, "checks": []}
 ```
 
-A command adapter receives the raw hook payload on stdin. Built-in adapters exist for `claude-code`, `codex`, `opencode` and `pi`.
+A command adapter receives the raw hook payload on stdin. It prints `null` when the payload is not the end of a turn. Built-in adapters exist for `claude-code`, `codex`, `opencode` and `pi`; `[agents.<name>] command` takes the place of a built-in adapter of the same name.
+
+Payloads the built-in adapters read (the hook argument names the adapter; `claude` is the same as `claude-code`):
+
+| Adapter | Payload | Notes |
+|---|---|---|
+| `claude` | the Stop hook JSON: `session_id`, `cwd`, `transcript_path` | unchanged from the first slice |
+| `codex` | the `Stop` hook JSON on stdin: `session_id`, `cwd`, `hook_event_name`, `model`, `last_assistant_message` | Stop carries no user prompt, so the subject is the first line of the last assistant message, at most 200 characters |
+| `opencode` | `{"type": "session.idle", "properties": {"sessionID": "..."}, "directory": "...", "model"?, "message"?}` | opencode's event has no directory, so the plug-in glue adds `directory` |
+| `pi` | `{"type": "agent_settled"?, "session_id": "...", "cwd": "...", "model"?, "message"?}` | the glue fills the fields from the extension context |
+
+Any other event name in these payloads is `null`.
