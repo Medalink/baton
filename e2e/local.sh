@@ -587,8 +587,58 @@ check "a hook from the nested repo is not recorded on the outer project" test ! 
 contains "the daemon says why" "$(cat "$BATON_HOME/data/daemon.log")" "inside the nested repo"
 out=$(cd "$G/inner" && "$BIN" turn --thread nested2 --message x 2>&1)
 contains "baton turn from there says to enroll it" "$out" "run \`baton enroll\` there"
-SIDE=$(side_of widgets)
 section_end
+
+section "H. a write below a directory the policy now admits is not dropped"
+H="$TMP/cachh"
+mkmin "$H" cachh
+mkdir -p "$H/vendor"
+printf 'v1\n' >"$H/vendor/lib.js"
+user_config '[snapshot]' 'exclude = ["vendor"]'
+"$BIN" enroll "$(wp "$H")" >/dev/null 2>&1
+SIDE=$(side_of cachh)
+turn_in "$H" h1 "vendor excluded" >/dev/null
+lacks "a directory the user config excludes is not stored" "$(tree_of h1)" "vendor/"
+printf 'junk\n' >"$H/vendor/junk.js"
+sleep 0.4
+turn_in "$H" h1 "a write below it" >/dev/null
+user_config
+turn_in "$H" h1 "exclude removed" >/dev/null
+contains "dropping the exclude stores the directory" "$(tree_of h1)" "vendor/lib.js"
+printf 'v2\n' >"$H/vendor/lib.js"
+sleep 0.4
+turn_in "$H" h1 "edit it" >/dev/null
+eq "a later edit below it is stored" "v2" "$(blob_of h1 vendor/lib.js)"
+LM="$TMP/linkm"
+mkmin "$LM" linkm
+printf 'dist/\n' >"$LM/.gitignore"
+git -C "$LM" add .gitignore >/dev/null 2>&1
+git -C "$LM" commit -q -m "ignore dist"
+git -C "$LM" worktree add -q "$TMP/linkwt" -b feature
+"$BIN" enroll "$(wp "$TMP/linkwt")" >/dev/null 2>&1
+SIDE=$(side_of linkm)
+mkdir -p "$TMP/linkwt/dist"
+printf 'app-v1\n' >"$TMP/linkwt/dist/app.js"
+sleep 0.4
+turn_in "$TMP/linkwt" h2 "ignored and untracked" >/dev/null
+lacks "an ignored, untracked file in a linked worktree is not stored" "$(tree_of h2)" "dist/app.js"
+git -C "$TMP/linkwt" add -f dist/app.js >/dev/null 2>&1
+git -C "$TMP/linkwt" commit -q -m "track dist/app.js"
+turn_in "$TMP/linkwt" h2 "now tracked" >/dev/null
+contains "a commit made in a linked worktree starts the file's storage" "$(tree_of h2)" "dist/app.js"
+printf 'app-v2\n' >"$TMP/linkwt/dist/app.js"
+sleep 0.4
+turn_in "$TMP/linkwt" h2 "edit it" >/dev/null
+eq "the first edit after that commit is stored" "app-v2" "$(blob_of h2 dist/app.js)"
+printf 'app-v3\n' >"$TMP/linkwt/dist/app.js"
+sleep 0.4
+turn_in "$TMP/linkwt" h2 "edit it again" >/dev/null
+eq "and so is the next" "app-v3" "$(blob_of h2 dist/app.js)"
+"$BIN" unenroll "$(wp "$TMP/linkwt")" >/dev/null 2>&1
+"$BIN" unenroll "$(wp "$H")" >/dev/null 2>&1
+section_end
+
+SIDE=$(side_of widgets)
 
 section "the user's repo is untouched"
 DIGEST_AFTER=$(git_digest "$REPO")

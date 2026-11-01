@@ -486,35 +486,6 @@ impl Worktree {
         Ok(out)
     }
 
-    /// The topmost ancestor directory of `path` that is ignored, if any. The caller remembers it so events
-    /// under it are dropped without asking gix again.
-    pub fn ignored_ancestor(&self, path: &str) -> Result<Option<String>> {
-        let mut prefix = String::new();
-        let mut parts = path.split('/').peekable();
-        while let Some(part) = parts.next() {
-            if parts.peek().is_none() {
-                break;
-            }
-            if !prefix.is_empty() {
-                prefix.push('/');
-            }
-            prefix.push_str(part);
-            if self.policy.ignored(&[(prefix.as_str(), true)])?[0] {
-                // Events under a directory that holds files git tracks must not be dropped unseen.
-                let below = format!("{prefix}/");
-                let holds_tracked = self
-                    .policy
-                    .rules()
-                    .tracked()
-                    .range(below.clone()..)
-                    .next()
-                    .is_some_and(|p| p.starts_with(&below));
-                return Ok((!holds_tracked).then_some(prefix));
-            }
-        }
-        Ok(None)
-    }
-
     /// The files that belong in the tree under `prefix` (or everywhere), spelled as they are on disk: the
     /// directory walk, plus the files HEAD tracks that the walk skipped because an ignore rule matched.
     fn scan(&self, prefix: Option<&str>) -> Result<Vec<String>> {

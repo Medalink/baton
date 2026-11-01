@@ -9,7 +9,7 @@ use baton_core::{
     Subject, ThreadId, TurnDraft, UnixMillis, Worktree,
 };
 use notify::{EventKind, RecursiveMode, Watcher};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel, sync_channel};
@@ -19,6 +19,10 @@ use std::time::{Duration, Instant};
 /// that is being written constantly still gets its turn.
 const QUIET: Duration = Duration::from_millis(5);
 const MAX_WAIT: Duration = Duration::from_millis(30);
+/// Events that arrive within `GAP` of each other, for at most `GATHER`, are classified together: every
+/// batch builds its own ignore-rule stack, so a burst in small batches costs several times more.
+const GAP: Duration = Duration::from_millis(2);
+const GATHER: Duration = Duration::from_millis(25);
 
 pub enum Cmd {
     Event(notify::Result<notify::Event>),
@@ -89,7 +93,6 @@ struct Task {
     log: Arc<Log>,
     label: String,
     dirty: DirtySet,
-    ignored_dirs: BTreeSet<String>,
     rx: Receiver<Cmd>,
     backlog: VecDeque<Cmd>,
     status: Arc<std::sync::Mutex<Snapshot>>,
@@ -155,7 +158,6 @@ fn start(
         writer,
         log,
         dirty: DirtySet::default(),
-        ignored_dirs: BTreeSet::new(),
         rx,
         backlog: VecDeque::new(),
         status,
@@ -199,16 +201,7 @@ impl Task {
             };
             match cmd {
                 Cmd::Event(first) => {
-                    let mut batch = vec![first];
-                    while let Ok(next) = self.rx.try_recv() {
-                        match next {
-                            Cmd::Event(event) => batch.push(event),
-                            other => {
-                                self.backlog.push_back(other);
-                                break;
-                            }
-                        }
-                    }
+                    let batch = self.gather(first);
                     self.ingest(batch);
                 }
                 Cmd::Turn(job) => {
@@ -224,6 +217,27 @@ impl Task {
                 Cmd::Stop => return,
             }
         }
+    }
+
+    /// `first` and the events that follow it closely. A command other than an event ends the wait at once,
+    /// so a turn never waits for the burst to end.
+    fn gather(
+        &mut self,
+        first: notify::Result<notify::Event>,
+    ) -> Vec<notify::Result<notify::Event>> {
+        let mut batch = vec![first];
+        let deadline = Instant::now() + GATHER;
+        while Instant::now() < deadline {
+            match self.rx.recv_timeout(GAP) {
+                Ok(Cmd::Event(event)) => batch.push(event),
+                Ok(other) => {
+                    self.backlog.push_back(other);
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        batch
     }
 
     /// Waits until no tracked path has changed for `QUIET`, or `MAX_WAIT` has passed.
@@ -260,7 +274,7 @@ impl Task {
 
     /// Records which tracked paths a batch of watcher events touched. Returns how many it recorded.
     fn ingest(&mut self, batch: Vec<notify::Result<notify::Event>>) -> usize {
-        let mut seen: Vec<(String, bool)> = Vec::new();
+        let mut seen: BTreeMap<String, bool> = BTreeMap::new();
         for event in batch {
             let event = match event {
                 Ok(event) if event.need_rescan() => {
@@ -286,7 +300,7 @@ impl Task {
             }
             for path in &event.paths {
                 if let Some(rel) = self.relative(path) {
-                    seen.push((rel, structural));
+                    *seen.entry(rel).or_default() |= structural;
                 }
             }
         }
@@ -297,10 +311,8 @@ impl Task {
         let mut candidates: Vec<(String, bool)> = Vec::new();
         for (rel, structural) in seen {
             if rel == ".git/info/exclude" || rel == ".baton/config.toml" {
-                self.ignored_dirs.clear();
                 self.dirty.overflow();
             } else if rel.ends_with(".gitignore") {
-                self.ignored_dirs.clear();
                 let dir = rel.rsplit_once('/').map_or("", |(dir, _)| dir).to_owned();
                 if dir.is_empty() {
                     self.dirty.overflow();
@@ -308,18 +320,12 @@ impl Task {
                     self.dirty.mark(dir, true);
                 }
             }
-            let first = rel.split('/').next().unwrap_or("");
-            if first.eq_ignore_ascii_case(".git") {
-                // HEAD or the ref may have moved, which changes which ignored directories hold tracked files.
-                self.ignored_dirs.clear();
-                continue;
-            }
-            let below_ignored = self.ignored_dirs.iter().any(|d| {
-                rel.len() > d.len()
-                    && rel.starts_with(d.as_str())
-                    && rel.as_bytes()[d.len()] == b'/'
-            });
-            if below_ignored {
+            if rel
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .eq_ignore_ascii_case(".git")
+            {
                 continue;
             }
             candidates.push((rel, structural));
@@ -347,8 +353,6 @@ impl Task {
             if keep {
                 self.dirty.mark(rel, structural);
                 recorded += 1;
-            } else if let Ok(Some(dir)) = self.wt.ignored_ancestor(&rel) {
-                self.ignored_dirs.insert(dir);
             }
         }
         recorded

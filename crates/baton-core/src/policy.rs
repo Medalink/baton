@@ -76,15 +76,6 @@ impl StorePolicy {
         &self.ignore
     }
 
-    /// True for paths git ignores and paths the config excludes. `entries` are `(path, is a directory)`.
-    pub(crate) fn ignored(&self, entries: &[(&str, bool)]) -> Result<Vec<bool>> {
-        let mut verdicts = self.ignore.verdicts(entries)?;
-        for ((path, _), verdict) in entries.iter().zip(&mut verdicts) {
-            *verdict = *verdict || self.exclude.is_match(*path);
-        }
-        Ok(verdicts)
-    }
-
     /// True for the paths baton stores: not ignored by git unless git tracks them, and not excluded by the
     /// config. `entries` are `(path, is a directory)`.
     pub(crate) fn admits(&self, entries: &[(&str, bool)]) -> Result<Vec<bool>> {
