@@ -264,3 +264,48 @@ Payloads the built-in adapters read (the hook argument names the adapter; `claud
 | `pi` | `{"type": "agent_settled"?, "session_id": "...", "cwd": "...", "model"?, "message"?}` | the glue fills the fields from the extension context |
 
 Any other event name in these payloads is `null`.
+
+## Report document
+
+### `baton.report.v1`, the output of `baton report --json`
+
+Not a plug-in document: `baton report` prints it, as one line. Every array is present, possibly empty, and holds every entry (the plain-text report shows the top 10). Times are Unix milliseconds. The rules are in `docs/design.md`, History, Report.
+
+```json
+{
+  "schema": "baton.report.v1",
+  "project": "github.com/acme/app",
+  "generated_at": 1793508000000,
+  "since": 1792903200000,
+  "repo": {"available": true, "head": "<git commit id or null>"},
+  "counts": {"threads": 12, "turns": 22, "thrash": 2, "rework": 2, "abandoned": 1, "hotspots": 2},
+  "thrash": [
+    {"kind": "file", "thread": "3f2a9c", "turn": 3, "file": "src/hot.rs", "turns": [1, 2, 3, 4], "lines": 2},
+    {"kind": "check", "thread": "b81e07", "turn": 3, "check": "tests", "runs": [{"turn": 1, "exit": 1}, {"turn": 2, "exit": 0}, {"turn": 3, "exit": 1}]}
+  ],
+  "rework": [
+    {"thread": "3f2a9c", "turn": 1, "file": "src/ship.rs", "lines": 1, "shipped_at": 1793507000000,
+     "by": {"thread": "c40d11", "turn": 1, "at": 1793507300000}}
+  ],
+  "abandoned": [
+    {"thread": "9d2c40", "turn": 2, "last_at": 1793200000000, "changed_lines": 4, "reached_lines": 0,
+     "files": [{"path": "src/lost1.rs", "changed_lines": 3, "reached_lines": 0}], "files_total": 2}
+  ],
+  "hotspots": [{"file": "src/hot.rs", "thrash": 1, "rework": 1}],
+  "models": [
+    {"name": "claude-sonnet-5-5", "turns": 9, "threads": 5, "shipped_lines": 4, "reworked_lines": 2,
+     "rework_rate": 0.5, "thrash_threads": 1, "thrash_rate": 0.2}
+  ],
+  "agents": [],
+  "skipped": {"threads_without_base": 0, "unreadable": 0, "commits_truncated": false}
+}
+```
+
+- `since` is the start of the window. `repo.available` is false when this machine holds no repository of the project; `rework` and `abandoned` are then empty. `repo.head` is `null` for a repository with no commit.
+- `thrash` holds entries of two `kind`s. A `file` entry names the first `turn` at which the thread had changed `file` in 3 or more turns and removed lines it had added (`turns` lists the turns that changed it, `lines` the removals). A `check` entry names the `turn` of the second failure, and `runs` lists every turn of the thread that reported the check, with its exit code. Ordered by `lines` descending for file entries (file entries first), then thread, turn, name.
+- `rework` entries are ordered by `lines` descending, then thread, turn, file. `turn` is the turn that added the lines, `shipped_at` the earliest commit time that shipped them, and `by` the earliest turn of another thread that changed them within 48 hours of the ship.
+- `abandoned` is ordered by unreached lines descending, then thread. `turn` is the thread's last turn and `last_at` its time. `files` holds at most 20 files, most unreached lines first, and `files_total` says how many there were.
+- `hotspots` is ordered by `thrash + rework` descending, then `rework`, then path.
+- `models` and `agents` are ordered by `turns` descending, then name. `name` is `null` for turns that recorded no model. `rework_rate` is `reworked_lines / shipped_lines` and `thrash_rate` is `thrash_threads / threads`, each rounded to 4 decimals; a rate is `null` when its denominator is 0.
+- `skipped.threads_without_base` counts threads whose `Baton-Base` commit is not in this machine's repository, `unreadable` the objects that could not be read, and `commits_truncated` says the walk over the user's recent commits stopped at 20,000.
+- Fields may be added in a later version of the schema; a reader ignores the ones it does not know.

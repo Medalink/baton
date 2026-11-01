@@ -25,6 +25,7 @@ baton status                      # worktrees, enrolled repositories and their w
 baton log [thread] [--verdicts]
 baton verdict <turn> [--thread T] [--json]   # the verdict stored for a turn
 baton rewind <turn> [--thread T] [--apply]
+baton report [--since 7d] [--project key] [--json]   # thrashing, rework, abandoned threads, hotspots
 baton pull <thread> [--into dir]  # a new worktree at the thread's latest turn
 baton follow <thread> [--into dir]  # print each new turn; with --into, apply it there too
 baton ask <question> --option a --option b [--context text] [--thread id]   # exit 0 chose, 2 ask a human
@@ -297,9 +298,40 @@ These read added lines and file names only. They do not parse SQL, so a drop wri
 
 The daemon is a detached process with no console. A plug-in child started with the default flags, or with `CREATE_NO_WINDOW`, was given a console of its own, and about one launch in five died with a Ctrl+C status (`0xc000013a`). Children are started with `DETACHED_PROCESS`, which gave no failure in 80 launches of a repro. A plug-in that itself starts a console program may see a window flash.
 
+## History
+
+### Report
+
+`baton report [--since 7d] [--project key] [--json]`, run inside an enrolled worktree (or with `--project`, which finds a worktree of that project the daemon knows), reads the project's side repo and, read-only, the user's repository, and lists patterns in how agents worked. It never starts the daemon and writes nothing to either repository; the only thing it writes is a statistics cache under baton's data dir. `--since` takes `90m`, `48h`, `7d` or `2w`; the default is 7 days. Without a repository on this machine, rework and abandonment are skipped and `repo.available` is false.
+
+Every rule works on **significant lines**. A line is compared by its trimmed text (a re-indent or a CRLF checkout is no change), and a line under three bytes or without a letter or digit (`}`, `);`, a blank) is dropped, since it appears everywhere. A line a change both adds and removes (a move, a re-indent) counts for neither. A turn's changes are measured against the previous turn of its thread, and a thread's first turn against its `Baton-Base` commit in the user's repository. A binary file, a file over 1 MiB, or one with over 100,000 significant lines is counted as changed but has no lines, so no rule that needs lines counts it. A diff that takes over 250 ms stops there and keeps the coarser edit script it has, which may list more lines as changed than the minimum.
+
+**Thrashing** has two forms, both within one thread inside the window.
+- *File:* a file changed in 3 or more turns of the thread, where some turn removed a line that an earlier turn of the same thread had added. `lines` counts those removals (each removal cancels one earlier addition of the same text, so a line is counted once per add and remove). The entry names the first turn at which both conditions held.
+- *Check:* one check name that failed (non-zero), passed, then failed again across the thread's turns that report it. Turns without the check are skipped, and consecutive runs with the same result merge, so red, red, green, red counts and red, green, green does not. The entry names the turn of the second failure.
+
+**Rework** counts a line a thread added in a turn that was later shipped, then changed by a different thread soon after. A line is *shipped* when a non-merge commit in the user's repository's history (first reached from `HEAD`, back to the start of the window, at most 20,000 commits) added the same line text to the same path, with a committer time no earlier than the turn's. It is *reworked* when a turn of a different thread removed that line from that path no earlier than the ship, and within 48 hours of it. An entry is one (thread, turn, file) with the count of such lines, the earliest ship time, and the earliest reworking turn.
+
+**Abandonment** applies to a thread whose last turn is more than 24 hours old. Its final tree is compared with its `Baton-Base` commit, giving the lines the thread added and removed. A line the thread added *reached* `HEAD` when `HEAD`'s copy of that file still holds it, and a line it removed reached `HEAD` when `HEAD`'s copy no longer holds it. A file without lines counts as one unit, reached when `HEAD` has the same blob (or, for a removal, no file). The thread is abandoned when fewer than half of its changed lines reached `HEAD`. The entry lists up to 20 files, most unreached lines first, where less than half of the file's changed lines reached `HEAD`.
+
+**Hotspots** rank files by their file-thrash entries plus their rework entries, then by rework, then by path.
+
+**By model and by agent** group every turn in the window by its `Baton-Model` or `Baton-Agent` (turns with no model form one group with a null name). `rework_rate` is reworked lines over shipped lines among the lines that group's turns added. `thrash_rate` is the share of the group's threads with a file or check thrash entry, counting a thread under the group of the turn the entry names.
+
+Limits, stated so the numbers are not read as more than they are:
+- Text is matched by line, not by position, so a line copied to another place is still the same line, and two different lines that are textually equal are the same.
+- A thread is judged by the files it left in its tree, so a file it created and deleted again shows only as turns.
+- Shipping is judged on the history reachable from `HEAD` only. Work merged on another branch, squashed (the lines usually survive, the path may not), or rewritten after a rebase reads as not shipped, and so as abandoned. A force-pushed `HEAD` loses what it dropped.
+- A thread whose `Baton-Base` commit is not in this machine's repository is left out of the base-relative parts (its first turn and abandonment) and counted in `skipped.threads_without_base`. A `git fetch` fixes it, and the result is not cached.
+- A window that cuts a thread in the middle starts it at its first turn inside the window, compared with the turn before it.
+- Times are commit times in seconds, so two events in the same second are not ordered.
+- The text report shows the 10 strongest entries of each section; `--json` holds all of them.
+
+The per-turn statistics are cached in `report-cache/<project>.bin` under baton's data dir, keyed by the commit id of the turn (and by the id of a user commit or of a thread's last turn), so an entry never goes stale. The file is append-only, a torn tail loses entries and nothing else, and a version byte changes whenever a statistic's definition does. Deleting the file only costs time. On a project of 1,000 threads of 20 turns (20,000 turns) over 5,000 files and 400 user commits (`e2e/report.sh` with `BATON_E2E_THREADS=1000 BATON_E2E_TURNS=20 BATON_E2E_FILES=5000`), a cold run takes 1.2 s and a cached run 0.40 s; on 300 threads of 10 turns over 2,000 files, the default, 0.22 s and 0.15 s. Most of a cached run is reading every turn commit (about 0.1 s for 20,000) and looking up each abandoned thread's files in `HEAD`, which is done once per path.
+
 ## Verification
 
-`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, real runs of the binaries, measurement tools under `tools/`, and end-to-end scenarios under `e2e/` that drive the real binaries: `e2e/local.sh` for capture (including enrolling a repository, linked worktrees created afterwards, a removed worktree, the watch cap, and the user's `.git` and every worktree's admin dir staying byte-identical) and `e2e/sync.sh` for the server, the daemon link, `pull`, `follow` and the latency measurement. No unit tests and no CI workflows.
+`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, real runs of the binaries, measurement tools under `tools/`, and end-to-end scenarios under `e2e/` that drive the real binaries: `e2e/local.sh` for capture (including enrolling a repository, linked worktrees created afterwards, a removed worktree, the watch cap, and the user's `.git` and every worktree's admin dir staying byte-identical) and `e2e/sync.sh` for the server, the daemon link, `pull`, `follow` and the latency measurement, and `e2e/report.sh` for `report` (one planted case of each pattern next to clean threads, then a cold and a cached run over thousands of turns). No unit tests and no CI workflows.
 
 `e2e/sync.sh` starts real `baton serve` and `baton daemon` processes under a temp dir, each machine with its own `BATON_HOME` and its own clone, on loopback ports from `BATON_E2E_PORT` (default 47880). It never reads or writes the user's real baton dirs, and a final scenario checks that they are untouched.
 
