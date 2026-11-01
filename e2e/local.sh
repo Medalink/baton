@@ -674,6 +674,34 @@ eq "all of it without a daemon restart" "$DPID" "$(daemon_pid)"
 "$BIN" unenroll "$(wp "$GX")" >/dev/null 2>&1
 section_end
 
+section "J. quoted secrets with spaces and URL passwords with odd characters"
+J="$TMP/redj"
+mkmin "$J" redj
+"$BIN" enroll "$(wp "$J")" >/dev/null 2>&1
+SIDE=$(side_of redj)
+cat >"$J/.env" <<'EOT'
+DB_PASSWORD="my secret passphrase here"
+API_KEY='abc def ghi jkl mno'
+DATABASE_URL2=postgres://user:sec'ret+pass/word@db.example.com/app
+DATABASE_URL3=postgres://user:sec<ret+pass/word@db.example.com/app
+DATABASE_URL4=postgres://:empty-user-pass/word+x@db.example.com/app
+EOT
+sleep 0.4
+turn_in "$J" j1 "quoted and odd URL secrets" >/dev/null
+env_blob=$(blob_of j1 .env)
+contains "a double-quoted value with spaces is cut out whole" "$env_blob" 'DB_PASSWORD="[baton:redacted:assigned-secret]"'
+contains "a single-quoted value with spaces is cut out whole" "$env_blob" "API_KEY='[baton:redacted:assigned-secret]'"
+contains "a URL password holding a quote" "$env_blob" 'DATABASE_URL2=postgres://user:[baton:redacted:url-password]@db.example.com/app'
+contains "a URL password holding a <" "$env_blob" 'DATABASE_URL3=postgres://user:[baton:redacted:url-password]@db.example.com/app'
+contains "a URL with an empty user name" "$env_blob" 'DATABASE_URL4=postgres://:[baton:redacted:url-password]@db.example.com/app'
+sgit cat-file --batch-all-objects --batch >"$TMP/objects.dump"
+for secret in "my secret passphrase" "abc def ghi" "sec'ret" "sec<ret" "empty-user-pass"; do
+  check "no object in the side repo holds $secret" bash -c '! grep -aq -e "$0" "$1"' "$secret" "$TMP/objects.dump"
+done
+rm -f "$TMP/objects.dump"
+"$BIN" unenroll "$(wp "$J")" >/dev/null 2>&1
+section_end
+
 SIDE=$(side_of widgets)
 
 section "the user's repo is untouched"

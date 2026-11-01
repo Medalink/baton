@@ -34,13 +34,14 @@ pub(crate) const BUILTIN: &[(&str, &str)] = &[
         "jwt",
         r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}",
     ),
+    ("url-password", r#"://[^/\s:@]*:(?P<secret>[^\s@"]{3,})@"#),
     (
-        "url-password",
-        r#"://[^/\s:@]+:(?P<secret>[^\s@"'<>]{3,})@"#,
+        "assigned-secret",
+        r#"(?i)(?:password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?key)\w*["']?\s*[=:]\s*"(?P<secret>[^"\r\n]{8,})""#,
     ),
     (
         "assigned-secret",
-        r#"(?i)(?:password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?key)\w*["']?\s*[=:]\s*["'](?P<secret>[^"'\s]{8,})["']"#,
+        r#"(?i)(?:password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?key)\w*["']?\s*[=:]\s*'(?P<secret>[^'\r\n]{8,})'"#,
     ),
     (
         "assigned-secret",
