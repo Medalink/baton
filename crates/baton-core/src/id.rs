@@ -201,7 +201,8 @@ impl fmt::Display for TurnSeq {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct UnixMillis(i64);
 
 impl UnixMillis {
@@ -278,6 +279,23 @@ macro_rules! object_id {
 }
 
 object_id!(
+    /// Any object in a side repo. Wire frames and `want` name objects by this.
+    Oid, "object id"
+);
+
+impl Oid {
+    pub fn from_raw(raw: &[u8]) -> Result<Self> {
+        gix::ObjectId::try_from(raw)
+            .map(Self)
+            .map_err(|_| Error::invalid("object id", format!("{} bytes, not 20", raw.len())))
+    }
+
+    pub fn raw(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+object_id!(
     /// A turn is a commit, so its id is the commit id.
     TurnId, "turn id"
 );
@@ -294,6 +312,24 @@ object_id!(
     /// A commit of the user's own history, taken from `HEAD`.
     GitSha, "git sha"
 );
+
+macro_rules! as_oid {
+    ($($name:ident),*) => {$(
+        impl From<$name> for Oid {
+            fn from(id: $name) -> Self {
+                Self(id.0)
+            }
+        }
+
+        impl $name {
+            pub fn from_oid(oid: Oid) -> Self {
+                Self(oid.0)
+            }
+        }
+    )*};
+}
+
+as_oid!(TurnId, TreeId, BlobId);
 
 /// A `/`-separated path inside a worktree that baton can store and later write back safely.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
