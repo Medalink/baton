@@ -116,6 +116,7 @@ dependencies = [
  "dirs",
  "gix",
  "globset",
+ "libc",
  "regex",
  "serde",
  "serde_json",
