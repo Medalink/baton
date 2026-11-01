@@ -42,6 +42,14 @@ pub struct Daemon {
     started: Instant,
 }
 
+enum Route {
+    Task(std::sync::mpsc::Sender<Cmd>),
+    /// The cwd sits in a git repo nested inside an enrolled worktree. That repo is not the project's, and
+    /// the outer worktree does not track it.
+    NestedRepo(std::path::PathBuf),
+    Unenrolled,
+}
+
 /// A path as a map key: case-folded and `/`-separated on Windows, where both spellings name one directory.
 pub fn path_key(path: &Path) -> String {
     let text = path.to_string_lossy();
@@ -156,20 +164,39 @@ impl Daemon {
     }
 
     /// The task of the enrolled worktree that contains `cwd`; the innermost one when they nest.
-    fn route(&self, cwd: &Path) -> Option<std::sync::mpsc::Sender<Cmd>> {
-        let cwd = path_key(&simplified(cwd));
-        let registry = self.registry();
-        registry
-            .worktrees
-            .iter()
-            .filter(|(root, _)| {
-                cwd == **root
-                    || cwd
-                        .strip_prefix(root.as_str())
-                        .is_some_and(|rest| rest.starts_with('/'))
-            })
-            .max_by_key(|(root, _)| root.len())
-            .map(|(_, handle)| handle.tx.clone())
+    fn route(&self, cwd: &Path) -> Route {
+        // A cwd spelled through a junction or symlink names the same directory as the enrolled root.
+        let cwd = cwd
+            .canonicalize()
+            .map_or_else(|_| simplified(cwd), |real| simplified(&real));
+        let key = path_key(&cwd);
+        let (root, tx) = {
+            let registry = self.registry();
+            let Some((_, handle)) = registry
+                .worktrees
+                .iter()
+                .filter(|(root, _)| {
+                    key == **root
+                        || key
+                            .strip_prefix(root.as_str())
+                            .is_some_and(|rest| rest.starts_with('/'))
+                })
+                .max_by_key(|(root, _)| root.len())
+            else {
+                return Route::Unenrolled;
+            };
+            (handle.root.clone(), handle.tx.clone())
+        };
+        let root_key = path_key(&root);
+        for dir in cwd.ancestors() {
+            if path_key(dir) == root_key {
+                break;
+            }
+            if dir.join(".git").exists() {
+                return Route::NestedRepo(dir.to_owned());
+            }
+        }
+        Route::Task(tx)
     }
 
     /// A hook frame: fire and forget. A turn from a directory that is not enrolled is dropped, which is
@@ -187,12 +214,23 @@ impl Daemon {
             model,
             message,
         } = request;
-        let Some(tx) = self.route(&cwd) else {
-            self.log.line(&format!(
-                "ignored a turn from {}: not an enrolled worktree",
-                cwd.display()
-            ));
-            return;
+        let tx = match self.route(&cwd) {
+            Route::Task(tx) => tx,
+            Route::NestedRepo(repo) => {
+                self.log.line(&format!(
+                    "ignored a turn from {}: it is inside the nested repo {}, which is not enrolled",
+                    cwd.display(),
+                    repo.display()
+                ));
+                return;
+            }
+            Route::Unenrolled => {
+                self.log.line(&format!(
+                    "ignored a turn from {}: not an enrolled worktree",
+                    cwd.display()
+                ));
+                return;
+            }
         };
         let job = TurnJob {
             args: TurnInput {
@@ -247,12 +285,22 @@ impl Daemon {
 
     async fn turn(&self, args: crate::control::TurnArgs) -> Result<Reply> {
         let input = TurnInput::from_args(&args).map_err(|e| anyhow!("{e}"))?;
-        let tx = self.route(Path::new(&args.cwd)).ok_or_else(|| {
-            anyhow!(
-                "{} is not inside an enrolled worktree; run `baton enroll` there",
-                args.cwd
-            )
-        })?;
+        let tx = match self.route(Path::new(&args.cwd)) {
+            Route::Task(tx) => tx,
+            Route::NestedRepo(repo) => {
+                return Err(anyhow!(
+                    "{} is inside the nested repo {}, which is not enrolled; run `baton enroll` there",
+                    args.cwd,
+                    repo.display()
+                ));
+            }
+            Route::Unenrolled => {
+                return Err(anyhow!(
+                    "{} is not inside an enrolled worktree; run `baton enroll` there",
+                    args.cwd
+                ));
+            }
+        };
         let (reply, answer) = tokio::sync::oneshot::channel();
         tx.send(Cmd::Turn(TurnJob {
             args: input,
