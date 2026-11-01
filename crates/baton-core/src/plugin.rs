@@ -6,7 +6,9 @@ use crate::error::{Error, IoContext, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -218,4 +220,49 @@ fn run_raw(spec: &CommandSpec, payload: Vec<u8>) -> Result<Vec<u8>> {
         return Err(Error::Refused(format!("{program} exited with {status}")));
     }
     Ok(out)
+}
+
+/// How `run_check` ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckEnd {
+    /// The command exited. `None` when a signal ended it.
+    Exited(Option<i32>),
+    TimedOut,
+    /// `stop` was set while the command ran.
+    Interrupted,
+}
+
+/// Runs a user's check command in `cwd` with the terminal's output, in its own process tree, and waits at
+/// most `timeout`. Whether it exits, times out or is interrupted, everything it started is killed before
+/// this returns, so a build that forked helpers leaves nothing behind. Unlike a plug-in, the command gets
+/// no stdin and its output is not captured.
+pub fn run_check(
+    command: &[String],
+    cwd: &Path,
+    timeout: Duration,
+    stop: &AtomicBool,
+) -> Result<CheckEnd> {
+    let spec = CommandSpec::new(command.to_vec(), timeout)?;
+    let program = &spec.command[0];
+    let deadline = Instant::now() + timeout;
+    let mut run = Command::new(program);
+    run.args(&spec.command[1..])
+        .current_dir(cwd)
+        .stdin(Stdio::null());
+    let (mut child, tree) = Tree::spawn(&mut run).ctx(|| format!("starting {program}"))?;
+    let ended = loop {
+        if let Some(status) = child.try_wait().ctx(|| format!("waiting for {program}"))? {
+            break CheckEnd::Exited(status.code());
+        }
+        if stop.load(Ordering::Relaxed) {
+            break CheckEnd::Interrupted;
+        }
+        if Instant::now() >= deadline {
+            break CheckEnd::TimedOut;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    tree.kill(&mut child);
+    let _ = child.wait();
+    Ok(ended)
 }

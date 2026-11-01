@@ -300,9 +300,10 @@ pub fn open_here() -> Result<Opened> {
     Ok(Opened { root, side })
 }
 
-pub fn describe(side: &SideRepo, turn: &TurnRecord) -> Result<()> {
+/// `thread@seq  id  time  agent  model  subject`, the first line of `baton log` for a turn.
+pub fn log_line(turn: &TurnRecord) -> String {
     let d = &turn.turn.draft;
-    println!(
+    format!(
         "{}@{}  {}  {}  {}  {}  {}",
         d.thread,
         turn.turn.seq,
@@ -311,7 +312,11 @@ pub fn describe(side: &SideRepo, turn: &TurnRecord) -> Result<()> {
         d.agent,
         d.model.as_ref().map_or("-", |m| m.as_str()),
         d.subject.as_str()
-    );
+    )
+}
+
+pub fn describe(side: &SideRepo, turn: &TurnRecord) -> Result<()> {
+    println!("{}", log_line(turn));
     let parent_tree = match turn.parent {
         Some(parent) => Some(side.read_turn(parent).map_err(|e| anyhow!("{e}"))?.tree),
         None => None,

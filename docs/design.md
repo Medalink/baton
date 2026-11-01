@@ -5,7 +5,7 @@ baton records every coding-agent turn as a git commit and syncs it live between 
 ## Goals and limits
 
 - An agent is never blocked by baton. The hook always exits 0, prints nothing, and never waits on the network or the daemon.
-- baton never writes a user's index, `HEAD`, refs, object store, or working tree, except when the user runs `rewind --apply`, `pull`, or `follow --into`. `pull` registers one worktree with `git worktree add --detach` and writes only inside it. `follow --into` writes only inside a worktree `pull` made.
+- baton never writes a user's index, `HEAD`, refs, object store, or working tree, except when the user runs `rewind --apply`, `pull`, `follow --into` or `bisect`. `pull` registers one worktree with `git worktree add --detach` and writes only inside it. `follow --into` writes only inside a worktree `pull` made. `bisect` registers a scratch worktree the same way, in the system temp dir, writes only inside it, and removes it with `git worktree remove` on every way out.
 - Git is the record. Every server repo is a plain bare repo that `git fetch` reads completely.
 - Secrets are redacted before an object is written anywhere.
 - Every outside dependency (auth, classifier, decider, notifier, agent adapter) is a command named in config. A repo's own config can never name a command.
@@ -28,6 +28,8 @@ baton rewind <turn> [--thread T] [--apply]
 baton report [--since 7d] [--project key] [--json]   # thrashing, rework, abandoned threads, hotspots
 baton pull <thread> [--into dir]  # a new worktree at the thread's latest turn
 baton follow <thread> [--into dir]  # print each new turn; with --into, apply it there too
+baton blame <file>:<line> [--json]   # the recorded turn that wrote a line (also: <file> -L a,b)
+baton bisect <thread> [--good N] [--bad N] [--timeout 300] -- <command>...   # the first turn where the command fails
 baton ask <question> --option a --option b [--context text] [--thread id]   # exit 0 chose, 2 ask a human
 baton serve [--data dir] [--listen addr] [--tls-cert pem --tls-key pem] [--trace]
 baton admin [--data dir] device add <name>     # prints a token once
@@ -300,6 +302,41 @@ The daemon is a detached process with no console. A plug-in child started with t
 
 ## History
 
+`baton blame`, `baton bisect` and `baton report` answer "which turn wrote this", "which turn broke this" and "where is work going wrong" from the side repo. All three read it directly and work with the daemon stopped.
+
+### Blame
+
+`baton blame <file>:<line>` (or `<file> -L a,b`), run inside an enrolled worktree, first asks `git blame --porcelain` for each line: the commit, the file name that commit held the line under, and the line's text. It then searches the project's side repo for the turn that first added that text to that file:
+
+1. Every thread is walked oldest turn first. A turn *adds* a line when its copy of the file holds that line more often than the previous turn of the thread does (a multiset difference, so a moved line is not added, and a second identical line is). A thread's first turn is compared with the file at its `Baton-Base` commit, read from the user's repository; a file the base lacks counts as empty, and a thread that began in a repository with no commit starts empty.
+2. A thread contributes at most one match per line: its first adding turn.
+3. Matches rank in three steps. A match loses one point for a turn recorded after the git commit's committer time (second resolution, so the same second is not later), and one for a `Baton-Base` that is not an ancestor of the commit (`git merge-base --is-ancestor`; a turn with no base is not penalised). The lowest score wins, then the earliest time, then the thread id, then the turn number. The best match is printed and the others are counted ("N other turns also added this line").
+4. With no match the line is reported as not written in a recorded turn: written by hand, written before enrollment, or out of baton's sight (below).
+
+A line that is not committed yet has no commit, so no time or ancestry preference applies and the earliest adding turn wins. A blank line is never attributed.
+
+Limits. Blame sees only what baton stored, and attributes by text, not by position:
+
+- A line with a secret cut out by redaction no longer matches git's text. A file that baton did not store (ignored, over `max_file_bytes`, an untracked secret-named file) has no turns to match.
+- A rename between the base and a turn is not followed: the file is looked up under the name `git blame` reports for the commit, in the base and in every turn.
+- Identical lines are not told apart. `}` or an import that two turns both added matches both, and the earliest wins; a thread that adds a line, deletes it and adds it again is credited with the first time. Turns are whole-tree snapshots, so a hand edit saved between two turns is credited to the next turn.
+- A thread whose first turn has a `Baton-Base` this repository does not hold cannot be compared with its base, so its first turn adds nothing. The command says how many threads were skipped and to run `git fetch`.
+- A line the agent wrote and a person then rewrote by hand is attributed to the agent's turn only if the person's final text equals the agent's.
+
+`--json` prints the `baton.blame.v1` document (`docs/protocol.md`).
+
+### Bisect
+
+`baton bisect <thread> -- <command>...` finds the first turn of a thread at which the command fails, as `git bisect run` does for commits. The exit code of one run is 0 for good, 125 for "cannot test this turn", anything else for bad. A run that outlives `--timeout` (default 300 s; a bare number is seconds, `500ms`, `5m` and `2h` also work, up to 24 h) is bad, and the command's whole process tree is killed, with the `Tree` that kills a plug-in's.
+
+The turns are applied into a scratch worktree made the way `pull` makes one: `git worktree add --detach` at the thread's first `Baton-Base`, then `apply_tree`. It lives in a directory baton makes new under the system temp dir, `baton-bisect-<pid>-<random>/`, with `create_dir` (it fails if the name exists, so a directory that was there before is never reused), holding `owner.lock` and the worktree in `tree/`. Baton removes only that directory, never anything it did not make in this run: `git worktree remove --force` on `tree/`, then the directory. It does this when the command ends, whether it found a turn, failed, or was stopped by Ctrl+C (or SIGTERM). If removal fails, baton says which path is left and the `git worktree remove --force` command to run. Moving between turns applies only the difference. A path the check changed is not safe to move forward, so the worktree is then made again from the base.
+
+A run holds an exclusive lock on `owner.lock` while it lives; the operating system drops it when the process dies, however it dies. A baton killed hard (SIGKILL, `Stop-Process -Force`, power loss) cannot clean up, so the start of every `baton bisect` looks at this repository's registered worktrees. One at `<temp>/baton-bisect-*/tree` whose `owner.lock` nobody holds any more is removed with `git worktree remove --force`, and baton says so. A lock still held means a running bisect, whose worktree is left alone. Worktrees of other repositories wait for a bisect run in those.
+
+The search runs the first turn first, unless `--good <turn>` names a turn assumed good. If the first turn fails, it is the first bad turn and nothing else runs. A first turn that cannot be tested (exit 125) is assumed good and stays a candidate if no later turn passes. Then the latest turn runs, unless `--bad <turn>` names one; a latest turn that passes is an error, since no turn failed. With `--bad 1` and no `--good`, only turn 1 runs: bad (or skipped) reports it, and a pass is an error. A one-turn thread works the same way. With `--good` the named turn is trusted and not run, as `git bisect` trusts its good commit. Turns are named by number. The middle of the untested turns is run next. A skipped turn is not run again, and the next middle is taken from the rest. When skips leave several turns that could be the first bad one, all are listed. The first bad turn is printed in `baton log` form with the paths it changed. Interrupted, the command exits 130.
+
+Limits. The check sees only what baton stored: files left out of a turn (size, ignore rules, secret names) are missing or at their git version in the scratch worktree, so a check that needs an untracked `.env` or `node_modules` fails on every turn. A turn is applied whole, so a failure caused by two threads' work cannot be told apart from one caused by this thread alone. `--timeout` bounds a run, not the search. The stale-worktree sweep is per repository: a killed run's leftovers in another repository stay until a bisect runs there. A check process that outlives a hard-killed baton can hold the scratch directory on Windows; the sweep then reports the path and the command to run.
+
 ### Report
 
 `baton report [--since 7d] [--project key] [--json]`, run inside an enrolled worktree (or with `--project`, which finds a worktree of that project the daemon knows), reads the project's side repo and, read-only, the user's repository, and lists patterns in how agents worked. It never starts the daemon and writes nothing to either repository; the only thing it writes is a statistics cache under baton's data dir. `--since` takes `90m`, `48h`, `7d` or `2w`; the default is 7 days. Without a repository on this machine, rework and abandonment are skipped and `repo.available` is false.
@@ -331,7 +368,7 @@ The per-turn statistics are cached in `report-cache/<project>.bin` under baton's
 
 ## Verification
 
-`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, real runs of the binaries, measurement tools under `tools/`, and end-to-end scenarios under `e2e/` that drive the real binaries: `e2e/local.sh` for capture (including enrolling a repository, linked worktrees created afterwards, a removed worktree, the watch cap, and the user's `.git` and every worktree's admin dir staying byte-identical) and `e2e/sync.sh` for the server, the daemon link, `pull`, `follow` and the latency measurement, and `e2e/report.sh` for `report` (one planted case of each pattern next to clean threads, then a cold and a cached run over thousands of turns). No unit tests and no CI workflows.
+`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, real runs of the binaries, measurement tools under `tools/`, and end-to-end scenarios under `e2e/` that drive the real binaries: `e2e/local.sh` for capture (including enrolling a repository, linked worktrees created afterwards, a removed worktree, the watch cap, and the user's `.git` and every worktree's admin dir staying byte-identical) and `e2e/sync.sh` for the server, the daemon link, `pull`, `follow` and the latency measurement, `e2e/history.sh` for `blame` (three threads, a commit that ships some lines, a hand-written line) and `bisect` (a planted failing turn, a skip, a timeout, a failing first turn, a one-turn thread, a planted directory that survives, a hard-killed run cleaned by the next bisect, Ctrl+C on Unix, no worktree left behind)., and `e2e/report.sh` for `report` (one planted case of each pattern next to clean threads, then a cold and a cached run over thousands of turns). No unit tests and no CI workflows.
 
 `e2e/sync.sh` starts real `baton serve` and `baton daemon` processes under a temp dir, each machine with its own `BATON_HOME` and its own clone, on loopback ports from `BATON_E2E_PORT` (default 47880). It never reads or writes the user's real baton dirs, and a final scenario checks that they are untouched.
 
