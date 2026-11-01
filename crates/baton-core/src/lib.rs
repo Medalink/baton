@@ -1,3 +1,4 @@
+mod apply;
 mod config;
 mod error;
 mod id;
@@ -13,6 +14,7 @@ mod turn;
 mod wire;
 mod worktree;
 
+pub use apply::{Applied, Guard, apply_tree};
 pub use config::{RepoConfig, ServerConfig, ServerUrl, Settings, Token, UserConfig};
 pub use error::{Error, Result};
 pub use id::{

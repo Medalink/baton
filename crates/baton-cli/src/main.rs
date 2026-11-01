@@ -4,6 +4,7 @@ mod control;
 mod daemon;
 mod endpoint;
 mod hook;
+mod pull;
 mod serve;
 mod timefmt;
 
@@ -59,6 +60,20 @@ enum Command {
     },
     /// Show the daemon and the enrolled worktrees.
     Status,
+    /// Make a worktree here holding a thread's latest turn, for example one another machine recorded.
+    Pull {
+        thread: String,
+        /// Where to create it. Default: next to this repository, named after it and the thread.
+        #[arg(long)]
+        into: Option<PathBuf>,
+    },
+    /// Print each new turn of a thread as it arrives. With --into, apply it to that worktree too.
+    Follow {
+        thread: String,
+        /// A worktree made by `baton pull`. Paths with local edits are kept as they are.
+        #[arg(long)]
+        into: Option<PathBuf>,
+    },
     /// Run the sync server.
     Serve {
         /// Where projects and the device list live. Default: `server` under baton's data dir.
@@ -143,6 +158,8 @@ fn main() {
             apply,
         } => commands::rewind(&turn, thread.as_deref(), apply),
         Command::Status => commands::status(),
+        Command::Pull { thread, into } => pull::pull(&thread, into.as_deref()),
+        Command::Follow { thread, into } => pull::follow(&thread, into.as_deref()),
         Command::Serve {
             data,
             listen,
