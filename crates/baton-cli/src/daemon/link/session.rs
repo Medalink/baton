@@ -614,6 +614,11 @@ impl Session<'_> {
                     .follows
                     .get(&key)
                     .is_some_and(|f| f.new == new && f.asked == ids);
+                if repeated && self.waiting.contains(&key) {
+                    // The same tip reached us twice (in `welcome`'s heads and as `moved`) while the
+                    // `want` for it is still unanswered. Only the answer can say the server lacks them.
+                    return Ok(());
+                }
                 if repeated {
                     self.follows.remove(&key);
                     self.log.line(&format!(
