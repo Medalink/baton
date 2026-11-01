@@ -1,6 +1,7 @@
 //! `baton bisect <thread> -- <command>`: the first turn of a thread at which a command starts failing.
 //! Turns are applied into a scratch worktree made the way `baton pull` makes one, never into the user's
-//! worktree, and the worktree is removed on every way out, Ctrl+C included.
+//! worktree, and the worktree is removed on every way out, Ctrl+C included. A baton that was killed
+//! hard cannot clean up; the next `baton bisect` in the repository removes what it left.
 
 use crate::commands::{describe, open_here};
 use crate::pull::git;
@@ -9,6 +10,7 @@ use baton_core::{
     Applied, CheckEnd, Guard, SideRepo, ThreadId, TreeId, TurnRecord, apply_tree, run_check,
 };
 use std::collections::{BTreeSet, HashSet};
+use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -94,23 +96,65 @@ fn skipped_of(turn: &TurnRecord) -> HashSet<String> {
         .collect()
 }
 
+/// Every scratch directory is `<temp>/baton-bisect-<pid>-<random>`, made by this run with `create_dir`
+/// (it fails if the name exists), holding `owner.lock` and the worktree in `tree/`.
+const HOME_PREFIX: &str = "baton-bisect-";
+const LOCK_NAME: &str = "owner.lock";
+const TREE_NAME: &str = "tree";
+
+/// Makes a new, empty directory in the temp dir. Never reuses or touches one that already exists.
+fn new_home() -> Result<PathBuf> {
+    let temp = std::env::temp_dir();
+    for _ in 0..16 {
+        let mut bytes = [0u8; 6];
+        getrandom::fill(&mut bytes).map_err(|e| anyhow!("no randomness: {e}"))?;
+        let suffix: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let home = temp.join(format!("{HOME_PREFIX}{}-{suffix}", std::process::id()));
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        match builder.create(&home) {
+            Ok(()) => return Ok(home),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e).with_context(|| format!("creating {}", home.display())),
+        }
+    }
+    bail!(
+        "could not find an unused scratch directory name in {}",
+        temp.display()
+    )
+}
+
 /// A worktree made by `git worktree add --detach` at the thread's base, holding one turn at a time.
-/// Dropping it removes the worktree.
+/// The run holds an exclusive lock on `owner.lock` for as long as it lives; the operating system drops
+/// the lock when the process dies however it dies, so another baton can tell a dead owner from a live one.
+/// Dropping it removes the worktree and the directory, which this run made.
 struct Scratch<'a> {
     root: &'a Path,
+    home: PathBuf,
     dir: PathBuf,
+    lock: Option<File>,
     base: String,
     held: Option<TreeId>,
 }
 
 impl<'a> Scratch<'a> {
-    fn create(root: &'a Path, dir: PathBuf, base: String) -> Result<Self> {
-        let scratch = Self {
+    fn create(root: &'a Path, base: String) -> Result<Self> {
+        let home = new_home()?;
+        let mut scratch = Self {
             root,
-            dir,
+            dir: home.join(TREE_NAME),
+            home,
+            lock: None,
             base,
             held: None,
         };
+        let lock =
+            File::create_new(scratch.home.join(LOCK_NAME)).context("creating the scratch lock")?;
+        lock.try_lock()
+            .map_err(|e| anyhow!("locking the scratch directory: {e}"))?;
+        scratch.lock = Some(lock);
         scratch.register()?;
         Ok(scratch)
     }
@@ -129,6 +173,7 @@ impl<'a> Scratch<'a> {
         .map(drop)
     }
 
+    /// Removes the worktree directory `tree/`, which this run made.
     fn unregister(&self) {
         let dir = self.dir.to_string_lossy();
         if git(self.root, &["worktree", "remove", "--force", &dir]).is_err() {
@@ -140,12 +185,6 @@ impl<'a> Scratch<'a> {
                 std::thread::sleep(Duration::from_millis(100));
             }
             let _ = git(self.root, &["worktree", "prune"]);
-        }
-        if self.dir.exists() {
-            eprintln!(
-                "baton: could not remove the scratch worktree {}; delete it, then run `git worktree prune`",
-                self.dir.display()
-            );
         }
     }
 
@@ -208,9 +247,83 @@ impl<'a> Scratch<'a> {
 impl Drop for Scratch<'_> {
     fn drop(&mut self) {
         self.unregister();
+        self.lock = None;
+        // The directory is this run's own: it was made by `new_home` and holds only the lock and `tree/`.
+        for _ in 0..20 {
+            if std::fs::remove_dir_all(&self.home).is_ok() || !self.home.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if self.home.exists() {
+            eprintln!(
+                "baton: could not remove the scratch worktree {}; run `git -C {} worktree remove --force {}`,                  then delete {} (the next `baton bisect` in this repository also tries)",
+                self.dir.display(),
+                self.root.display(),
+                self.dir.display(),
+                self.home.display()
+            );
+        }
     }
 }
 
+/// Removes the scratch worktrees that earlier runs in this repository left behind because they were
+/// killed hard. Only a worktree registered with git at `<temp>/baton-bisect-*/tree`, in a directory
+/// whose `owner.lock` nobody holds any more, is touched, and only through `git worktree remove --force`;
+/// the directory itself goes only if it is then empty apart from its lock.
+fn clear_stale(root: &Path) {
+    let Ok(listed) = git(root, &["worktree", "list", "--porcelain"]) else {
+        return;
+    };
+    let Ok(temp) = std::fs::canonicalize(std::env::temp_dir()) else {
+        return;
+    };
+    for line in String::from_utf8_lossy(&listed).lines() {
+        let Some(path) = line.strip_prefix("worktree ") else {
+            continue;
+        };
+        let tree = PathBuf::from(path);
+        let Some(home) = tree.parent() else { continue };
+        let named = tree.file_name().is_some_and(|n| n == TREE_NAME)
+            && home
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with(HOME_PREFIX));
+        if !named
+            || std::fs::canonicalize(home.parent().unwrap_or(home))
+                .ok()
+                .as_ref()
+                != Some(&temp)
+        {
+            continue;
+        }
+        let lock_path = home.join(LOCK_NAME);
+        let Ok(lock) = File::open(&lock_path) else {
+            continue;
+        };
+        if lock.try_lock().is_err() {
+            continue; // a baton that is still running owns it
+        }
+        let dir = tree.to_string_lossy();
+        if git(root, &["worktree", "remove", "--force", &dir]).is_err() {
+            eprintln!(
+                "baton: the scratch worktree {} was left by a killed baton and could not be removed; run `git -C {} worktree remove --force {}`",
+                tree.display(),
+                root.display(),
+                tree.display()
+            );
+            continue;
+        }
+        drop(lock);
+        let _ = std::fs::remove_file(&lock_path);
+        let _ = std::fs::remove_dir(home);
+        eprintln!(
+            "baton: removed the scratch worktree {}, left by a killed baton",
+            tree.display()
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
 enum Verdict {
     Good,
     Bad,
@@ -276,6 +389,7 @@ fn index_of(turns: &[TurnRecord], seq: u32, flag: &str) -> Result<usize> {
 pub fn run(options: Options) -> Result<i32> {
     let timeout = parse_timeout(&options.timeout)?;
     let here = open_here()?;
+    clear_stale(&here.root);
     let thread = ThreadId::parse(&options.thread).map_err(|e| anyhow!("{e}"))?;
     let mut turns = here
         .side
@@ -298,15 +412,18 @@ pub fn run(options: Options) -> Result<i32> {
             "the base commit {base} of {thread} is not in this repository; run `git fetch` and try again"
         );
     }
-    let good = options
+    let good_given = options
         .good
-        .map_or(Ok(0), |n| index_of(&turns, n, "good"))?;
+        .map(|n| index_of(&turns, n, "good"))
+        .transpose()?;
     let bad_given = options
         .bad
         .map(|n| index_of(&turns, n, "bad"))
         .transpose()?;
     let tip = turns.len() - 1;
-    if good >= bad_given.unwrap_or(tip) {
+    if let Some(good) = good_given
+        && good >= bad_given.unwrap_or(tip)
+    {
         bail!(
             "{thread} needs a good turn before a bad one; it has {} turn(s)",
             turns.len()
@@ -314,10 +431,8 @@ pub fn run(options: Options) -> Result<i32> {
     }
 
     watch_interrupts();
-    let short: String = thread.as_str().chars().take(8).collect();
-    let dir = std::env::temp_dir().join(format!("baton-bisect-{}-{short}", std::process::id()));
-    let scratch = Scratch::create(&here.root, dir, base.to_string())
-        .context("making the scratch worktree")?;
+    let scratch =
+        Scratch::create(&here.root, base.to_string()).context("making the scratch worktree")?;
     let mut probe = Probe {
         side: &here.side,
         scratch,
@@ -325,7 +440,45 @@ pub fn run(options: Options) -> Result<i32> {
         timeout,
     };
 
-    let mut lo = good;
+    let first_bad = |index: usize| -> Result<i32> {
+        println!("first bad turn:");
+        describe(&here.side, &turns[index])?;
+        Ok(0)
+    };
+
+    // Without `--good` the first turn is run before anything else: if it fails it is the first bad turn.
+    // One that cannot be tested (exit 125) is assumed good, but stays a candidate if nothing later passes.
+    let mut lo = good_given.unwrap_or(0);
+    let mut lo_tested_good = good_given.is_some();
+    let mut skipped: BTreeSet<usize> = BTreeSet::new();
+    if good_given.is_none() {
+        let first = match probe.run(&turns[0])? {
+            None => return interrupted(),
+            Some(Verdict::Bad) => return first_bad(0),
+            Some(verdict) => verdict,
+        };
+        match first {
+            Verdict::Skip => {
+                skipped.insert(0);
+            }
+            _ => lo_tested_good = true,
+        }
+        if bad_given.unwrap_or(tip) == 0 {
+            // A one-turn thread, or `--bad` naming turn 1, which has just been run.
+            return match (first, bad_given) {
+                (Verdict::Skip, Some(_)) => first_bad(0),
+                (Verdict::Skip, None) => {
+                    bail!(
+                        "the command skipped the only turn of {thread}; there is nothing to search"
+                    )
+                }
+                (_, Some(_)) => bail!("the command passes at turn 1, which --bad names as failing"),
+                (_, None) => {
+                    bail!("the command passes at the latest turn, so no turn of {thread} fails it")
+                }
+            };
+        }
+    }
     let mut hi = match bad_given {
         Some(bad) => bad,
         None => match probe.run(&turns[tip])? {
@@ -339,7 +492,6 @@ pub fn run(options: Options) -> Result<i32> {
             }
         },
     };
-    let mut skipped: BTreeSet<usize> = BTreeSet::new();
     loop {
         let candidates: Vec<usize> = (lo + 1..hi).filter(|i| !skipped.contains(i)).collect();
         let Some(&mid) = candidates.get(candidates.len() / 2) else {
@@ -347,28 +499,29 @@ pub fn run(options: Options) -> Result<i32> {
         };
         match probe.run(&turns[mid])? {
             None => return interrupted(),
-            Some(Verdict::Good) => lo = mid,
+            Some(Verdict::Good) => {
+                lo = mid;
+                lo_tested_good = true;
+            }
             Some(Verdict::Bad) => hi = mid,
             Some(Verdict::Skip) => {
                 skipped.insert(mid);
             }
         }
     }
-    let unsure: Vec<usize> = (lo + 1..hi)
+    let unsure: Vec<usize> = (lo + usize::from(lo_tested_good)..hi)
         .filter(|i| skipped.contains(i))
         .chain(std::iter::once(hi))
         .collect();
     if let [only] = unsure[..] {
-        println!("first bad turn:");
-        describe(&here.side, &turns[only])?;
-    } else {
-        println!(
-            "the first bad turn is one of these {}; the command skipped all but the last:",
-            unsure.len()
-        );
-        for i in unsure {
-            describe(&here.side, &turns[i])?;
-        }
+        return first_bad(only);
+    }
+    println!(
+        "the first bad turn is one of these {}; the command skipped all but the last:",
+        unsure.len()
+    );
+    for i in unsure {
+        describe(&here.side, &turns[i])?;
     }
     Ok(0)
 }

@@ -108,6 +108,7 @@ dependencies = [
  "baton-server",
  "clap",
  "futures-util",
+ "getrandom 0.4.3",
  "libc",
  "notify",
  "rustls-native-certs",

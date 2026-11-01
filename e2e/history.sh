@@ -218,7 +218,7 @@ contains "it finds the planted turn" "$out" "plant@4  "
 contains "and lists the paths that turn changed" "$out" "A extra/4.txt"
 contains "and M for the state file" "$out" "M state.txt"
 lacks "it did not name the turn after it" "$out" "plant@5  "
-eq "it ran the check on 3 turns (the latest, then two more)" 3 "$(runs)"
+eq "it ran the check on 4 turns (the first, the latest, then two more)" 4 "$(runs)"
 eq "no worktree is left registered" "$before" "$(worktrees)"
 eq "git has nothing to prune" "" "$(git -C "$B" worktree prune --dry-run 2>&1)"
 eq "the scratch directory is empty" "" "$(ls -A "$W/scratch")"
@@ -286,6 +286,101 @@ EOF
 else
   echo "  skipped: Ctrl+C on Windows is not driven from bash"
 fi
+
+# --------------------------------------------------------------------------------------------------
+section "bisect: a failing first turn, a one-turn thread, a planted directory, a killed run"
+thread_of allbad BAD1 BAD2 BAD3
+: >"$W/runs.log"
+before=$(worktrees)
+out=$(bisect allbad -- "${CHECK[@]}")
+rc=$?
+eq "a thread whose turns all fail exits 0" 0 "$rc"
+contains "and reports turn 1" "$out" "allbad@1  "
+eq "after running only the first turn" 1 "$(runs)"
+out=$(bisect allbad --bad 1 -- "${CHECK[@]}")
+rc=$?
+eq "--bad 1 exits 0" 0 "$rc"
+contains "and reports turn 1 after running it" "$out" "allbad@1  "
+eq "no worktree is left after a first-turn find" "$before" "$(worktrees)"
+
+thread_of single BAD1
+out=$(bisect single -- "${CHECK[@]}")
+rc=$?
+eq "a one-turn thread that fails exits 0" 0 "$rc"
+contains "and reports its turn" "$out" "single@1  "
+thread_of singleok ok1
+out=$(bisect singleok -- "${CHECK[@]}")
+rc=$?
+eq "a one-turn thread that passes is the passes-at-the-latest-turn error" 1 "$rc"
+contains "and says so" "$out" "passes at the latest turn"
+out=$(bisect singleok --bad 1 -- "${CHECK[@]}")
+contains "--bad 1 naming a passing turn is refused" "$out" "passes at turn 1"
+thread_of firstskip SKIP1 ok2 BAD3
+out=$(bisect firstskip -- "${CHECK[@]}")
+contains "a skipped first turn is assumed good and the search goes on" "$out" "firstskip@3  "
+thread_of allskip SKIP1 SKIP2 BAD3
+out=$(bisect allskip -- "${CHECK[@]}")
+contains "turns skipped before the failing one are listed with it" "$out" "one of these 3"
+out=$(bisect plant --good 2 --bad 1 -- "${CHECK[@]}")
+contains "--good at or after --bad is still refused" "$out" "needs a good turn before a bad one"
+
+# A directory that was there before the run is never removed, even when `git worktree add` fails (here the
+# admin directory cannot be made, because a file stands where git wants `worktrees/`).
+mkdir -p "$W/scratch/baton-bisect-planted"
+printf 'mine\n' >"$W/scratch/baton-bisect-planted/KEEP.txt"
+mkdir -p "$W/scratch/baton-bisect-$$-plant"
+printf 'mine\n' >"$W/scratch/baton-bisect-$$-plant/KEEP.txt"
+mv "$B/.git/worktrees" "$W/worktrees.aside"
+printf 'in the way\n' >"$B/.git/worktrees"
+out=$(bisect plant -- "${CHECK[@]}")
+rc=$?
+rm -f "$B/.git/worktrees"
+mv "$W/worktrees.aside" "$B/.git/worktrees"
+eq "a failing worktree add fails the command" 1 "$rc"
+contains "and the error names it" "$out" "making the scratch worktree"
+check "a planted directory survived" test -f "$W/scratch/baton-bisect-planted/KEEP.txt"
+check "and one named the way the old scheme would" test -f "$W/scratch/baton-bisect-$$-plant/KEEP.txt"
+eq "baton removed its own scratch directory and nothing else" "baton-bisect-$$-plant
+baton-bisect-planted" "$(ls -A "$W/scratch")"
+rm -rf "$W/scratch/baton-bisect-planted" "$W/scratch/baton-bisect-$$-plant"
+
+# A baton killed hard cannot clean up. The next bisect in the repository does.
+kill_tree() {
+  case ${OSTYPE:-} in
+    msys* | cygwin*) taskkill //F //T //PID "$1" >/dev/null 2>&1 ;;
+    *)
+      pkill -9 -P "$1" >/dev/null 2>&1
+      kill -9 "$1" >/dev/null 2>&1
+      ;;
+  esac
+}
+cat >"$W/slow-forever.sh" <<'EOF'
+#!/usr/bin/env bash
+touch "$MARK.started"
+sleep 30
+EOF
+thread_of stale ok1 ok2 BAD3 BAD4
+before=$(worktrees)
+rm -f "$MARK.started"
+(cd "$B" && TMP="$(wp "$W/scratch")" TEMP="$(wp "$W/scratch")" TMPDIR="$W/scratch" exec "$BIN" bisect stale --good 1 --bad 4 -- "$BASH_ABS" "$(wp "$W")/slow-forever.sh" >"$W/stale.out" 2>&1) &
+bg=$!
+for _ in $(seq 1 100); do [[ -e $MARK.started ]] && break; sleep 0.1; done
+home=$(ls -A "$W/scratch")
+pid=$(printf '%s' "$home" | sed -n 's/^baton-bisect-\([0-9]*\)-.*/\1/p')
+check "the run's scratch directory is named for its pid and a random suffix" test -n "$pid"
+out=$(bisect plant -- "${CHECK[@]}")
+lacks "a second bisect leaves a running one's worktree alone" "$out" "removed the scratch worktree"
+eq "and it is still registered" "$((before + 1))" "$(worktrees)"
+kill_tree "$pid"
+wait "$bg" 2>/dev/null
+eq "a hard-killed baton leaves its worktree registered" "$((before + 1))" "$(worktrees)"
+eq "and git has nothing to prune" "" "$(git -C "$B" worktree prune --dry-run 2>&1)"
+check "and its directory" test -d "$W/scratch/$home/tree"
+out=$(bisect plant -- "${CHECK[@]}")
+contains "the next bisect says it removed it" "$out" "removed the scratch worktree"
+contains "and still finds its turn" "$out" "plant@4  "
+eq "the stale worktree is no longer registered" "$before" "$(worktrees)"
+eq "and its directory is gone" "" "$(ls -A "$W/scratch")"
 
 # --------------------------------------------------------------------------------------------------
 echo
