@@ -205,9 +205,10 @@ where
             Frame::Object(chunk) => {
                 if let Some(object) = self.assembler.push(chunk)? {
                     self.pool.insert(object);
-                    if self.pool.bytes() > POOL_MAX {
-                        return Err(violation("too_large", "too many unfinished objects"));
-                    }
+                }
+                let held = self.pool.bytes() as u64 + self.assembler.announced();
+                if held > POOL_MAX as u64 {
+                    return Err(violation("too_large", "too many unfinished objects"));
                 }
                 Ok(())
             }
