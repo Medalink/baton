@@ -147,7 +147,7 @@ A thread's first turn has no parent. Each later turn's parent is the thread's pr
 
 ## Local hook frame
 
-The hook writes one frame to `\\.\pipe\baton-<user>` on Windows or `$XDG_RUNTIME_DIR/baton/daemon.sock` (falling back to `$TMPDIR/baton-<uid>/daemon.sock`) elsewhere:
+The hook writes one frame to `\\.\pipe\baton-<user>` on Windows or `daemon.sock` in baton's data dir elsewhere (a data dir too deep for `sun_path` uses `/tmp/baton-<uid>/<hash>.sock`, see `docs/design.md`):
 
 ```text
 "BTN1"  u32 LE length  <agent name> "\n" <raw hook payload>
