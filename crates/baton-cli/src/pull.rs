@@ -17,7 +17,7 @@ use std::time::Duration;
 const POLL: Duration = Duration::from_millis(50);
 const SHOWN_REFUSALS: usize = 20;
 
-fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
+pub fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let output = Command::new("git")
         .arg("-C")
         .arg(root)

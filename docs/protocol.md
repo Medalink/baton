@@ -214,6 +214,39 @@ A failure means `lens: null`; the turn is still classified.
 
 `class` is one of `react`, `check`, `log`, `quiet`. `score` is between 0 and 1. `kind` is free text. `lines` in an evidence entry is optional: `[first, last]`, 1-based, `first <= last`. baton stores the verdict on `refs/baton-verdict/<commit>` and never rewrites the turn.
 
+### `baton.blame.v1`, the output of `baton blame --json`
+
+Not a plug-in document: `baton blame` prints it. One entry per blamed line, in file order.
+
+```json
+{
+  "schema": "baton.blame.v1",
+  "unchecked_threads": 0,
+  "lines": [
+    {
+      "path": "src/trap.rs",
+      "line": 12,
+      "text": "let trap = Receiver::new();",
+      "commit": {"id": "<git commit id>", "author": "Alice", "at": 1793508000000, "subject": "Ship the receiver"},
+      "turn": {
+        "commit": "<turn commit id>",
+        "thread": "3f2a9c",
+        "turn": 2,
+        "base": "<worktree HEAD sha>",
+        "agent": "claude-code",
+        "model": "claude-sonnet-5-5",
+        "machine": "laptop",
+        "at": 1793507000000,
+        "subject": "Rename the trap receiver"
+      },
+      "others": 1
+    }
+  ]
+}
+```
+
+`path` is the file as the git commit named it, relative to the repository root. `commit` is the git commit `git blame` names (`at` is its author time), or `null` for a line that is not committed yet. `turn` holds the best matching turn, with the names of `baton.turn.v1` (`commit` is the turn's commit id, `turn` its number), or is `null` when no recorded turn added the line. `base` is `null` for a thread that began in a repository with no commit, and `model` and `subject` are `null` when the turn recorded none. `others` counts the other turns that also added the line. `unchecked_threads` counts threads whose first turn could not be compared because its `Baton-Base` commit is not in the repository. The matching rule is in `docs/design.md`, History.
+
 ### The notify input
 
 A notifier reads `{"verdict": <baton.verdict.v1>, "turn": <baton.turn.v1>}`. Its output is ignored. Notifiers run only in `live` mode, for the verdicts whose class is in the notifier's `on`.

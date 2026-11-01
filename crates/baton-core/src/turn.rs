@@ -31,6 +31,11 @@ impl Subject {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The message the agent gave, or `None` for the "(no message)" stand-in.
+    pub fn recorded(&self) -> Option<&str> {
+        (self.0 != NO_SUBJECT).then_some(self.0.as_str())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,4 +1,6 @@
 mod adapter;
+mod bisect;
+mod blame;
 mod commands;
 mod control;
 mod daemon;
@@ -93,6 +95,33 @@ enum Command {
         thread: Option<String>,
         #[arg(long)]
         apply: bool,
+    },
+    /// Find the recorded turn that wrote a line git blames on a commit.
+    Blame {
+        /// `file:line`, or a file with -L.
+        target: String,
+        /// `first,last` (or one line) of the file.
+        #[arg(short = 'L', value_name = "A,B")]
+        lines: Option<String>,
+        /// Print the `baton.blame.v1` document.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Find the first turn of a thread at which a command fails. Exit codes as in `git bisect run`: 0 good, 125 skip, else bad.
+    Bisect {
+        thread: String,
+        /// A turn number known to pass. Default: the thread's first turn.
+        #[arg(long)]
+        good: Option<u32>,
+        /// A turn number known to fail. Default: the latest turn, which is run first.
+        #[arg(long)]
+        bad: Option<u32>,
+        /// Longest one run may take, for example `90`, `500ms`, `5m` or `2h`; a bare number is seconds.
+        #[arg(long, default_value = "300")]
+        timeout: String,
+        /// The command to run in the scratch worktree, after `--`.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
     },
     /// Show the daemon and the enrolled worktrees.
     Status,
@@ -217,6 +246,29 @@ fn main() {
             thread,
             apply,
         } => commands::rewind(&turn, thread.as_deref(), apply),
+        Command::Blame {
+            target,
+            lines,
+            json,
+        } => blame::run(&target, lines.as_deref(), json),
+        Command::Bisect {
+            thread,
+            good,
+            bad,
+            timeout,
+            command,
+        } => bisect::run(bisect::Options {
+            thread,
+            good,
+            bad,
+            timeout,
+            command,
+        })
+        .map(|code| {
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }),
         Command::Status => commands::status(),
         Command::Pull { thread, into } => pull::pull(&thread, into.as_deref()),
         Command::Follow { thread, into } => pull::follow(&thread, into.as_deref()),

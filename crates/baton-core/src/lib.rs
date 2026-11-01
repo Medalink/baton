@@ -1,6 +1,7 @@
 mod apply;
 mod config;
 mod error;
+mod history;
 mod id;
 mod ignore;
 mod ingest;
@@ -23,6 +24,10 @@ mod worktree;
 pub use apply::{Applied, Guard, apply_tree};
 pub use config::{RepoConfig, ServerConfig, ServerUrl, Settings, Token, UserConfig};
 pub use error::{Error, Result};
+pub use history::{
+    BLAME_SCHEMA, BlameCommit, BlameDoc, BlameLine, BlameTurn, CommitFacts, Found, GitView,
+    Origins, Wanted, find_origins,
+};
 pub use id::{
     AgentName, BlobId, CheckName, FileKind, GitSha, MachineId, ModelName, Oid, ProjectKey, RelPath,
     ThreadId, TreeId, TurnId, TurnSeq, UnixMillis,
@@ -33,7 +38,9 @@ pub use names::{
     MAX_NAME_LEN, MAX_TREE_DEPTH, Special, check_blob, check_entry, check_file, check_name,
 };
 pub use paths::{Dirs, HOME_ENV, fnv1a, simplified};
-pub use plugin::{CommandSpec, run_command, run_command_bytes, run_for_effect};
+pub use plugin::{
+    CheckEnd, CommandSpec, run_check, run_command, run_command_bytes, run_for_effect,
+};
 pub use plugin_config::{Classifier, Lens, Mode, Notify, Plugins, parse_duration};
 pub use policy::StorePolicy;
 pub use redact::{Redactor, RuleSpec, load_literals};
