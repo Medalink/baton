@@ -1,0 +1,343 @@
+//! The commands a person runs. Most talk to the daemon, starting it first when its endpoint is absent.
+//! `log` and `rewind` read the side repo directly and work with the daemon stopped.
+
+use crate::control::{Reply, Request, TurnArgs};
+use crate::{endpoint, timefmt};
+use anyhow::{Context, Result, anyhow, bail};
+use baton_core::{
+    ChangeKind, Dirs, RepoConfig, RewindAction, SideRepo, ThreadId, TurnRecord, Worktree,
+    find_root, plan_rewind, project_key,
+};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+const DAEMON_START_DEADLINE: Duration = Duration::from_secs(20);
+const LISTED_PATHS: usize = 12;
+
+fn send(request: &Request) -> Result<Reply> {
+    let bytes = endpoint::call(&serde_json::to_vec(request)?)?;
+    match serde_json::from_slice(&bytes)? {
+        Reply::Failed { message } => Err(anyhow!(message)),
+        reply => Ok(reply),
+    }
+}
+
+fn daemon_is_up() -> bool {
+    matches!(send(&Request::Ping), Ok(Reply::Pong { .. }))
+}
+
+/// Windows lets a child inherit every inheritable handle the parent holds, including the pipe a shell is
+/// reading `$(baton ...)` from, which would keep that substitution waiting for as long as the daemon lives.
+#[cfg(windows)]
+fn stop_inheriting_std_handles() {
+    use std::os::windows::io::AsRawHandle;
+    unsafe extern "system" {
+        fn SetHandleInformation(handle: *mut std::ffi::c_void, mask: u32, flags: u32) -> i32;
+    }
+    const HANDLE_FLAG_INHERIT: u32 = 1;
+    for handle in [
+        std::io::stdin().as_raw_handle(),
+        std::io::stdout().as_raw_handle(),
+        std::io::stderr().as_raw_handle(),
+    ] {
+        if !handle.is_null() {
+            // SAFETY: the handle is one this process owns; the call only clears its inherit flag.
+            unsafe { SetHandleInformation(handle.cast(), HANDLE_FLAG_INHERIT, 0) };
+        }
+    }
+}
+
+fn spawn_daemon() -> Result<()> {
+    use std::process::{Command, Stdio};
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .arg("daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        stop_inheriting_std_handles();
+        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid is async-signal-safe and touches no memory.
+        unsafe {
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    command.spawn().context("starting the baton daemon")?;
+    Ok(())
+}
+
+pub fn ensure_daemon() -> Result<()> {
+    if daemon_is_up() {
+        return Ok(());
+    }
+    spawn_daemon()?;
+    let deadline = Instant::now() + DAEMON_START_DEADLINE;
+    while Instant::now() < deadline {
+        if daemon_is_up() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let log = Dirs::resolve()
+        .map(|d| d.log_file().display().to_string())
+        .unwrap_or_default();
+    bail!(
+        "the daemon did not start within {}s; see {log}",
+        DAEMON_START_DEADLINE.as_secs()
+    )
+}
+
+fn absolute(path: Option<&Path>) -> Result<PathBuf> {
+    let cwd = std::env::current_dir()?;
+    Ok(match path {
+        Some(p) if p.is_absolute() => p.to_owned(),
+        Some(p) => cwd.join(p),
+        None => cwd,
+    })
+}
+
+pub fn enroll(path: Option<&Path>) -> Result<()> {
+    let path = absolute(path)?;
+    ensure_daemon()?;
+    match send(&Request::Enroll {
+        path: path.to_string_lossy().into_owned(),
+    })? {
+        Reply::Enrolled {
+            root,
+            project,
+            files,
+            already,
+        } => {
+            let verb = if already {
+                "already enrolled"
+            } else {
+                "enrolled"
+            };
+            println!("{verb} {root} as {project} ({files} files)");
+            Ok(())
+        }
+        other => bail!("unexpected reply: {other:?}"),
+    }
+}
+
+pub fn unenroll(path: Option<&Path>) -> Result<()> {
+    let path = absolute(path)?;
+    ensure_daemon()?;
+    match send(&Request::Unenroll {
+        path: path.to_string_lossy().into_owned(),
+    })? {
+        Reply::Unenrolled { root, was_enrolled } => {
+            println!(
+                "{} {root}",
+                if was_enrolled {
+                    "unenrolled"
+                } else {
+                    "was not enrolled:"
+                }
+            );
+            Ok(())
+        }
+        other => bail!("unexpected reply: {other:?}"),
+    }
+}
+
+pub struct TurnOptions {
+    pub thread: String,
+    pub message: String,
+    pub agent: String,
+    pub model: Option<String>,
+    pub checks: Vec<String>,
+}
+
+pub fn turn(options: TurnOptions) -> Result<()> {
+    ensure_daemon()?;
+    let cwd = absolute(None)?;
+    let request = Request::Turn(TurnArgs {
+        cwd: cwd.to_string_lossy().into_owned(),
+        thread: options.thread,
+        message: options.message,
+        agent: options.agent,
+        model: options.model,
+        checks: options.checks,
+    });
+    match send(&request)? {
+        Reply::Turned {
+            thread,
+            seq,
+            id,
+            changed,
+        } => {
+            println!("{thread}@{seq} {} ({changed} paths changed)", &id[..8]);
+            Ok(())
+        }
+        other => bail!("unexpected reply: {other:?}"),
+    }
+}
+
+pub fn status() -> Result<()> {
+    ensure_daemon()?;
+    match send(&Request::Status)? {
+        Reply::Status {
+            pid,
+            up_secs,
+            worktrees,
+        } => {
+            println!(
+                "daemon pid {pid}, up {up_secs}s, {} enrolled",
+                worktrees.len()
+            );
+            for w in worktrees {
+                println!(
+                    "{}  {}  {} files  tree {}",
+                    w.root,
+                    w.project,
+                    w.files,
+                    w.tree.get(..8).unwrap_or("")
+                );
+            }
+            Ok(())
+        }
+        other => bail!("unexpected reply: {other:?}"),
+    }
+}
+
+struct Opened {
+    root: PathBuf,
+    side: SideRepo,
+}
+
+/// The current directory's worktree and its side repo, read-only.
+fn open_here() -> Result<Opened> {
+    let root = find_root(&absolute(None)?).map_err(|e| anyhow!("{e}"))?;
+    let config = RepoConfig::load(&root).map_err(|e| anyhow!("{e}"))?;
+    let project = project_key(&root, &config).map_err(|e| anyhow!("{e}"))?;
+    let dirs = Dirs::resolve().map_err(|e| anyhow!("{e}"))?;
+    let side = SideRepo::open_existing(&dirs.side_repo(&project)).map_err(|e| anyhow!("{e}"))?;
+    Ok(Opened { root, side })
+}
+
+fn describe(side: &SideRepo, turn: &TurnRecord) -> Result<()> {
+    let d = &turn.turn.draft;
+    println!(
+        "{}@{}  {}  {}  {}  {}  {}",
+        d.thread,
+        turn.turn.seq,
+        turn.id.short(),
+        timefmt::utc(turn.at),
+        d.agent,
+        d.model.as_ref().map_or("-", |m| m.as_str()),
+        d.subject.as_str()
+    );
+    let parent_tree = match turn.parent {
+        Some(parent) => Some(side.read_turn(parent).map_err(|e| anyhow!("{e}"))?.tree),
+        None => None,
+    };
+    if parent_tree.is_none() {
+        let files = side.flatten(turn.tree).map_err(|e| anyhow!("{e}"))?.len();
+        println!("    first turn of the thread: {files} files");
+        return Ok(());
+    }
+    let changes = side
+        .diff_trees(parent_tree, turn.tree)
+        .map_err(|e| anyhow!("{e}"))?;
+    for change in changes.iter().take(LISTED_PATHS) {
+        let mark = match change.kind {
+            ChangeKind::Added => 'A',
+            ChangeKind::Modified => 'M',
+            ChangeKind::Removed => 'D',
+        };
+        println!("    {mark} {}", change.path);
+    }
+    if changes.len() > LISTED_PATHS {
+        println!("    ... and {} more", changes.len() - LISTED_PATHS);
+    }
+    Ok(())
+}
+
+pub fn log(thread: Option<&str>) -> Result<()> {
+    let here = open_here()?;
+    let mut turns = Vec::new();
+    match thread {
+        Some(thread) => {
+            let thread = ThreadId::parse(thread).map_err(|e| anyhow!("{e}"))?;
+            turns = here.side.turns(&thread, 50).map_err(|e| anyhow!("{e}"))?;
+        }
+        None => {
+            for thread in here.side.threads().map_err(|e| anyhow!("{e}"))? {
+                turns.extend(here.side.turns(&thread, 10).map_err(|e| anyhow!("{e}"))?);
+            }
+            turns.sort_by_key(|t| std::cmp::Reverse(t.at));
+            turns.truncate(30);
+        }
+    }
+    if turns.is_empty() {
+        println!("no turns recorded for this project");
+    }
+    for turn in &turns {
+        describe(&here.side, turn)?;
+    }
+    Ok(())
+}
+
+pub fn rewind(selector: &str, thread: Option<&str>, apply: bool) -> Result<()> {
+    let here = open_here()?;
+    let default_thread = thread
+        .map(ThreadId::parse)
+        .transpose()
+        .map_err(|e| anyhow!("{e}"))?;
+    let turn = here
+        .side
+        .resolve_turn(selector, default_thread.as_ref())
+        .map_err(|e| anyhow!("{e}"))?;
+    let dirs = Dirs::resolve().map_err(|e| anyhow!("{e}"))?;
+    let worktree = Worktree::open(&here.root, &dirs, &|tree| here.side.has_tree(tree))
+        .map_err(|e| anyhow!("{e}"))?;
+    let plan = plan_rewind(&here.side, &worktree, turn).map_err(|e| anyhow!("{e}"))?;
+    let d = &plan.turn.turn.draft;
+    println!(
+        "rewind to {}@{} ({})",
+        d.thread,
+        plan.turn.turn.seq,
+        plan.turn.id.short()
+    );
+    for write in plan.writes.iter().take(LISTED_PATHS * 4) {
+        let verb = match write.action {
+            RewindAction::Create => "create",
+            RewindAction::Overwrite => "restore",
+        };
+        println!("  {verb} {}", write.path);
+    }
+    for refusal in &plan.refused {
+        println!("  refuse {}: {}", refusal.path, refusal.reason);
+    }
+    if !plan.left_alone.is_empty() {
+        println!(
+            "  {} tracked files are not in this turn and are left on disk",
+            plan.left_alone.len()
+        );
+    }
+    println!("  {} files already match", plan.same);
+    if !apply {
+        println!("dry run; pass --apply to write {} files", plan.writes.len());
+        return Ok(());
+    }
+    let written =
+        baton_core::apply_rewind(&here.side, &here.root, &plan).map_err(|e| anyhow!("{e}"))?;
+    println!("wrote {written} files");
+    if !plan.refused.is_empty() {
+        bail!("{} files were refused", plan.refused.len());
+    }
+    Ok(())
+}
