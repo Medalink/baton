@@ -6,7 +6,9 @@
 
 use crate::commands::{describe, open_here};
 use anyhow::{Context, Result, anyhow, bail};
-use baton_core::{Applied, Guard, SideRepo, ThreadId, TurnId, TurnRecord, apply_tree};
+use baton_core::{
+    Applied, Dirs, Guard, SideRepo, ThreadId, TurnId, TurnRecord, apply_tree, simplified,
+};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -48,6 +50,42 @@ fn report(applied: &Applied) {
     }
 }
 
+/// How a directory is named in `pulled.json`: its resolved path, folded where the file system folds case.
+fn pulled_key(dir: &Path) -> Result<String> {
+    let resolved =
+        std::fs::canonicalize(dir).with_context(|| format!("resolving {}", dir.display()))?;
+    let text = simplified(&resolved).to_string_lossy().into_owned();
+    Ok(if cfg!(any(windows, target_os = "macos")) {
+        text.to_lowercase()
+    } else {
+        text
+    })
+}
+
+fn pulled_list(dirs: &Dirs) -> Vec<String> {
+    std::fs::read(dirs.pulled_file())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn remember_pulled(dirs: &Dirs, dir: &Path) -> Result<()> {
+    let key = pulled_key(dir)?;
+    let mut list = pulled_list(dirs);
+    if !list.contains(&key) {
+        list.push(key);
+    }
+    let file = dirs.pulled_file();
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let temp = file.with_extension("json.tmp");
+    std::fs::write(&temp, serde_json::to_vec(&list)?)
+        .with_context(|| format!("writing {}", temp.display()))?;
+    std::fs::rename(&temp, &file).with_context(|| format!("replacing {}", file.display()))
+}
+
 fn thread_tip(side: &SideRepo, thread: &ThreadId) -> Result<TurnRecord> {
     let tip = side
         .tip(thread)
@@ -61,6 +99,7 @@ fn thread_tip(side: &SideRepo, thread: &ThreadId) -> Result<TurnRecord> {
 pub fn pull(thread: &str, into: Option<&Path>) -> Result<()> {
     let here = open_here()?;
     let thread = ThreadId::parse(thread).map_err(|e| anyhow!("{e}"))?;
+    let dirs = Dirs::resolve().map_err(|e| anyhow!("{e}"))?;
     let tip = thread_tip(&here.side, &thread)?;
     let draft = &tip.turn.draft;
     let base = draft.base.as_ref().ok_or_else(|| {
@@ -79,7 +118,7 @@ pub fn pull(thread: &str, into: Option<&Path>) -> Result<()> {
     }
 
     let dir: PathBuf = match into {
-        Some(dir) => dir.to_owned(),
+        Some(dir) => std::path::absolute(dir).context("resolving the target directory")?,
         None => {
             let name = here
                 .root
@@ -97,6 +136,7 @@ pub fn pull(thread: &str, into: Option<&Path>) -> Result<()> {
         &here.root,
         &["worktree", "add", "--detach", &dir_arg, &base.to_string()],
     )?;
+    remember_pulled(&dirs, &dir)?;
 
     let listed = git(&dir, &["ls-files", "-z"])?;
     let git_paths: Vec<String> = listed
@@ -153,6 +193,17 @@ fn turns_since(
 pub fn follow(thread: &str, into: Option<&Path>) -> Result<()> {
     let here = open_here()?;
     let thread = ThreadId::parse(thread).map_err(|e| anyhow!("{e}"))?;
+    if let Some(dir) = into {
+        let dirs = Dirs::resolve().map_err(|e| anyhow!("{e}"))?;
+        let made_by_pull = pulled_key(dir).is_ok_and(|key| pulled_list(&dirs).contains(&key));
+        if !made_by_pull {
+            bail!(
+                "{} is not a worktree `baton pull` made on this machine; `baton pull {thread} --into {}` makes one",
+                dir.display(),
+                dir.display()
+            );
+        }
+    }
     let mut last = here.side.tip(&thread).map_err(|e| anyhow!("{e}"))?;
     if into.is_some() && last.is_none() {
         bail!("this machine has no turns of {thread} yet; `baton pull {thread}` first");

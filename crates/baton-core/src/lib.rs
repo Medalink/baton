@@ -4,6 +4,7 @@ mod error;
 mod id;
 mod ignore;
 mod ingest;
+mod names;
 mod paths;
 mod plugin;
 mod plugin_config;
@@ -27,6 +28,9 @@ pub use id::{
 };
 pub use ignore::Case;
 pub use ingest::{Intake, Pool, Verdict, plan as plan_ingest, store as store_ingest};
+pub use names::{
+    MAX_NAME_LEN, MAX_TREE_DEPTH, Special, check_blob, check_entry, check_file, check_name,
+};
 pub use paths::{Dirs, HOME_ENV, fnv1a, simplified};
 pub use plugin::{CommandSpec, run_command, run_command_bytes, run_for_effect};
 pub use plugin_config::{Classifier, Lens, Mode, Notify, Plugins, parse_duration};

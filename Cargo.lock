@@ -89,6 +89,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "baton-bench"
+version = "0.1.0"
+dependencies = [
+ "gix",
+ "gix-pack",
+ "gix-zlib",
+ "ignore",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "baton-cli"
 version = "0.1.0"
 dependencies = [
@@ -116,6 +127,7 @@ dependencies = [
  "dirs",
  "gix",
  "globset",
+ "libc",
  "regex",
  "serde",
  "serde_json",
@@ -1032,16 +1044,20 @@ dependencies = [
  "crc32fast",
  "crossbeam-deque",
  "gix-chunk",
+ "gix-diff",
  "gix-error",
  "gix-hash",
  "gix-hashtable",
  "gix-object",
  "gix-parallel",
  "gix-path",
+ "gix-tempfile",
  "gix-trace",
+ "gix-traverse",
  "gix-utils",
  "gix-zlib",
  "memmap2",
+ "parking_lot",
  "smallvec",
 ]
 
@@ -1469,6 +1485,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27f864f10dfb56725ce5ce5472bc52252c8f93a4ab86327122cebf62c5f59a17"
 dependencies = [
  "typenum",
+]
+
+[[package]]
+name = "ignore"
+version = "0.4.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "484be5657551d7868d67587df967fb4fcbe9d266a761cc855aaa148fda0b3cc7"
+dependencies = [
+ "crossbeam-deque",
+ "globset",
+ "log",
+ "memchr",
+ "regex-automata",
+ "same-file",
+ "walkdir",
+ "winapi-util",
 ]
 
 [[package]]

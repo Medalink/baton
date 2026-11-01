@@ -46,6 +46,11 @@ impl Dirs {
         self.data.join("enrolled.json")
     }
 
+    /// The worktrees `baton pull` made. `follow --into` writes only into these.
+    pub fn pulled_file(&self) -> PathBuf {
+        self.data.join("pulled.json")
+    }
+
     pub fn worktree_state_file(&self, root: &Path) -> PathBuf {
         self.data.join("worktrees").join(format!(
             "{:016x}.json",

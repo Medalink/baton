@@ -1,0 +1,17 @@
+[package]
+name = "baton-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+gix = { version = "=0.90.0", default-features = false, features = ["sha1", "parallel", "excludes", "dirwalk"] }
+gix-pack = { version = "=0.77.0", default-features = false, features = ["generate", "streaming-input", "sha1"] }
+gix-zlib = "0.4"
+ignore = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Pipes", "Win32_Security"] }

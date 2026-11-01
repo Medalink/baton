@@ -27,12 +27,28 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_tungstenite::accept_hdr_async_with_config;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+
+/// How long a connection has to finish its TLS and WebSocket handshake, auth included.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Connections allowed to be mid-handshake at once. Beyond it a new connection is dropped at accept.
+const MAX_HANDSHAKES: usize = 128;
+/// A project writer with no work for this long ends, and its project is forgotten once nothing holds it.
+const WRITER_IDLE: Duration = Duration::from_secs(30);
+const SWEEP_EVERY: Duration = Duration::from_secs(10);
+
+/// A place in the pool of connections still shaking hands, and the time by which they must be done.
+struct Handshake {
+    deadline: tokio::time::Instant,
+    _place: OwnedSemaphorePermit,
+}
 
 pub struct ServeOptions {
     pub data: PathBuf,
@@ -98,7 +114,7 @@ fn refuse(status: StatusCode, why: &str) -> ErrorResponse {
 
 // The handshake callback's error type is tungstenite's `ErrorResponse`, which is large.
 #[allow(clippy::result_large_err)]
-async fn handle<S>(stream: S, peer: SocketAddr, shared: Arc<Shared>)
+async fn handle<S>(stream: S, peer: SocketAddr, shared: Arc<Shared>, handshake: Handshake)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -135,15 +151,23 @@ where
         Ok(response)
     };
     let config = WebSocketConfig::default()
-        .max_message_size(Some(MAX_FRAME + 64))
-        .max_frame_size(Some(MAX_FRAME + 64));
-    let ws = match accept_hdr_async_with_config(stream, check, Some(config)).await {
-        Ok(ws) => ws,
-        Err(e) => {
+        .max_message_size(Some(MAX_FRAME))
+        .max_frame_size(Some(MAX_FRAME));
+    let upgrade = accept_hdr_async_with_config(stream, check, Some(config));
+    let ws = match tokio::time::timeout_at(handshake.deadline, upgrade).await {
+        Ok(Ok(ws)) => ws,
+        Ok(Err(e)) => {
             log(&format!("{peer}: handshake failed: {e}"));
             return;
         }
+        Err(_) => {
+            log(&format!(
+                "{peer}: no handshake within {HANDSHAKE_TIMEOUT:?}"
+            ));
+            return;
+        }
     };
+    drop(handshake);
     let Some(identity) = identity else { return };
     let id = shared.next_session.fetch_add(1, Ordering::Relaxed);
     log(&format!("session {id}: {peer} is {}", identity.machine));
@@ -176,7 +200,7 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         None => None,
     };
     let shared = Arc::new(Shared {
-        projects: Projects::new(options.data.clone(), db.clone()),
+        projects: Projects::new(options.data.clone(), db.clone())?,
         db,
         auth,
         trace: options.trace,
@@ -191,35 +215,59 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         if acceptor.is_some() { "wss" } else { "ws" },
         listener.local_addr()?
     ));
+    let places = Arc::new(Semaphore::new(MAX_HANDSHAKES));
     let accepting = async {
         loop {
             let (stream, peer) = match listener.accept().await {
                 Ok(accepted) => accepted,
                 Err(e) => {
                     log(&format!("accept failed: {e}"));
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                     continue;
                 }
+            };
+            let Ok(place) = places.clone().try_acquire_owned() else {
+                log(&format!(
+                    "{peer}: dropped, {MAX_HANDSHAKES} handshakes are pending"
+                ));
+                continue;
+            };
+            let handshake = Handshake {
+                deadline: tokio::time::Instant::now() + HANDSHAKE_TIMEOUT,
+                _place: place,
             };
             let _ = stream.set_nodelay(true);
             let shared = shared.clone();
             match acceptor.clone() {
                 Some(acceptor) => {
                     tokio::spawn(async move {
-                        match acceptor.accept(stream).await {
-                            Ok(stream) => handle(stream, peer, shared).await,
-                            Err(e) => log(&format!("{peer}: TLS handshake failed: {e}")),
+                        match tokio::time::timeout_at(handshake.deadline, acceptor.accept(stream))
+                            .await
+                        {
+                            Ok(Ok(stream)) => handle(stream, peer, shared, handshake).await,
+                            Ok(Err(e)) => log(&format!("{peer}: TLS handshake failed: {e}")),
+                            Err(_) => log(&format!(
+                                "{peer}: no TLS handshake within {HANDSHAKE_TIMEOUT:?}"
+                            )),
                         }
                     });
                 }
                 None => {
-                    tokio::spawn(handle(stream, peer, shared));
+                    tokio::spawn(handle(stream, peer, shared, handshake));
                 }
             }
         }
     };
+    let sweeping = async {
+        let mut tick = tokio::time::interval(SWEEP_EVERY);
+        loop {
+            tick.tick().await;
+            shared.projects.sweep(WRITER_IDLE);
+        }
+    };
     tokio::select! {
         () = accepting => {}
+        () = sweeping => {}
         _ = tokio::signal::ctrl_c() => log("stopping"),
     }
     drop(lock);

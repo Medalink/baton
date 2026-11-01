@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/baton-core", "crates/baton-server", "crates/baton-cli"]
+members = ["crates/baton-core", "crates/baton-server", "crates/baton-cli", "tools/bench"]
 
 [workspace.package]
 version = "0.1.0"

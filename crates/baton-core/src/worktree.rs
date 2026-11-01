@@ -852,6 +852,13 @@ impl Worktree {
                     return Ok(0);
                 };
                 let content = self.policy.prepare(&rel, raw);
+                let name = spelling.rsplit('/').next().unwrap_or_default();
+                if crate::names::check_file(name.as_bytes(), kind.entry_kind() as u32, &content)
+                    .is_err()
+                {
+                    self.forget(key, plan);
+                    return Ok(0);
+                }
                 let racy = now_ns().saturating_sub(mtime) < RACY_WINDOW_NS;
                 (hash_blob(&content), Some(content), racy)
             }

@@ -73,7 +73,7 @@ pub fn device_list(data: Option<PathBuf>) -> Result<()> {
 
 pub fn device_revoke(data: Option<PathBuf>, name: &str) -> Result<()> {
     let n = baton_server::device_revoke(&data_dir(data)?, name)?;
-    println!("revoked {n} device(s) of {name}; open sessions end within 15 s");
+    println!("revoked {n} device(s) of {name}; open sessions end within 2 s");
     Ok(())
 }
 
