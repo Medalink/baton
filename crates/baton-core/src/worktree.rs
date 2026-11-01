@@ -261,6 +261,15 @@ pub fn open_policy(root: &Path, dirs: &Dirs) -> Result<StorePolicy> {
     StorePolicy::open(root, &load_settings(root, dirs)?)
 }
 
+/// The same policy with the fingerprint of everything it depends on, for a reader that caches what it
+/// derived from stored content.
+pub(crate) fn open_policy_fingerprinted(root: &Path, dirs: &Dirs) -> Result<(StorePolicy, String)> {
+    let settings = load_settings(root, dirs)?;
+    let policy = StorePolicy::open(root, &settings)?;
+    let print = fingerprint(root, dirs, &settings, &policy);
+    Ok((policy, print))
+}
+
 fn load_settings(root: &Path, dirs: &Dirs) -> Result<Settings> {
     let user = UserConfig::load(&dirs.user_config())?;
     let repo = RepoConfig::load(root)?;
