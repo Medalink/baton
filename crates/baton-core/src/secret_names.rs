@@ -63,7 +63,10 @@ const SOURCE: &[&str] = &[
 
 /// Everything the verdict depends on, for the policy fingerprint.
 pub(crate) fn describe() -> String {
-    format!("hard={HARD:?} soft={SOFT:?} exempt={EXEMPT:?} source={SOURCE:?}\n",)
+    // `case` names how the built-in names are matched, so changing that rule also reopens the cache.
+    format!(
+        "hard={HARD:?} soft={SOFT:?} exempt={EXEMPT:?} source={SOURCE:?} case=ascii-insensitive\n",
+    )
 }
 
 pub(crate) struct SecretNames {
