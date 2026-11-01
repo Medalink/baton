@@ -77,15 +77,33 @@ impl Daemon {
     }
 
     pub(super) fn restore_repos(&self, repos: &[String], declined: &[String]) {
-        let mut registry = self.registry();
+        {
+            let mut registry = self.registry();
+            for dir in repos {
+                let dir = PathBuf::from(dir);
+                registry.repos.insert(path_key(&dir), dir);
+            }
+            for dir in declined {
+                let dir = PathBuf::from(dir);
+                registry.declined.insert(path_key(&dir), dir);
+            }
+        }
         for dir in repos {
-            let dir = PathBuf::from(dir);
-            registry.repos.insert(path_key(&dir), dir);
+            if let Err(e) = self.follow_repo(Path::new(dir)) {
+                self.log
+                    .line(&format!("sync: not following repository {dir}: {e:#}"));
+            }
         }
-        for dir in declined {
-            let dir = PathBuf::from(dir);
-            registry.declined.insert(path_key(&dir), dir);
-        }
+    }
+
+    /// Opens the project's writer, which subscribes it on the sync link, so turns other machines record in an
+    /// enrolled repository arrive before any turn is recorded here.
+    fn follow_repo(&self, path: &Path) -> Result<ProjectKey> {
+        let location = repo_of(path).map_err(|e| anyhow!("{e}"))?;
+        let probe = location.workdir.as_deref().unwrap_or(&location.common_dir);
+        let project = key_of(probe)?;
+        self.writer_for(&project)?;
+        Ok(project)
     }
 
     /// The projects `[enroll] projects` names now. The user config is read again whenever its bytes differ
@@ -186,8 +204,7 @@ impl Daemon {
     /// Enrolls the repository `path` is in. It must name a project, as a worktree must.
     pub(super) fn enroll_repo(&self, path: &Path) -> Result<Reply> {
         let location = repo_of(path).map_err(|e| anyhow!("{e}"))?;
-        let probe = location.workdir.as_deref().unwrap_or(&location.common_dir);
-        let project = key_of(probe)?;
+        let project = self.follow_repo(path)?;
         let key = path_key(&location.common_dir);
         let already = {
             let mut registry = self.registry();
