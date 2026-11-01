@@ -1,0 +1,34 @@
+# A baton server on one machine of your tailnet, and the other machines syncing to it.
+# Every name below is a placeholder: replace it with your own.
+#
+# Only machines on your tailnet can reach the server, so the network is the first lock; the
+# device token is the second.
+#
+# 1. On the machine that hosts the server, get a certificate for its tailnet name and serve
+#    with it (`tailscale cert` writes the two files; run it once and again before it expires):
+#
+#      tailscale cert baton-host.example-tailnet.ts.net
+#      baton serve --listen 0.0.0.0:7878 \
+#        --tls-cert baton-host.example-tailnet.ts.net.crt \
+#        --tls-key  baton-host.example-tailnet.ts.net.key
+#
+#    To keep the port off every interface but the tailnet, pass the machine's tailnet address
+#    to --listen instead of 0.0.0.0.
+#
+# 2. Make one device per machine and save its token in the `token_file` below on that machine.
+#    The token is printed once:
+#
+#      baton admin device add laptop
+#
+# 3. On each machine, copy the rest of this file into `config.toml` in baton's config directory
+#    (`~/.config/baton` on Linux, `~/Library/Application Support/baton` on macOS, `%APPDATA%aton`
+#    on Windows), then restart the daemon.
+
+[machine]
+id = "laptop"
+
+[server]
+url = "wss://baton-host.example-tailnet.ts.net:7878"
+# Read at each connect, so rotating a token needs no restart. The file is yours alone.
+token_file = "~/.config/baton/device-token"
+# The certificate comes from a public CA through Tailscale, so no ca_file is needed.

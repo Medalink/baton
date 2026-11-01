@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""A baton notifier that POSTs the notification document to a URL.
+
+baton writes `{"verdict": ..., "turn": ...}` to stdin when a verdict's class matches `on`. This sends
+it on as the body of one POST. A non-2xx answer or a network error exits non-zero; baton logs that and
+carries on.
+
+Environment:
+  BATON_WEBHOOK_URL  where to POST; the URL is the secret for most chat webhooks, so it is not an argument
+  BATON_WEBHOOK_TIMEOUT_S  seconds to wait (default 4); keep baton's own timeout above it
+
+Config:
+  [classify]
+  mode = "live"
+
+  [[notify]]
+  on = ["react"]
+  command = ["python3", "/path/to/notify-webhook"]
+  timeout = "6s"
+"""
+
+import os
+import sys
+import urllib.request
+
+
+def main():
+    url = os.environ.get("BATON_WEBHOOK_URL", "")
+    if not url:
+        print("notify-webhook: BATON_WEBHOOK_URL is not set", file=sys.stderr)
+        sys.exit(1)
+    wait = float(os.environ.get("BATON_WEBHOOK_TIMEOUT_S") or 4)
+    body = sys.stdin.buffer.read()
+    request = urllib.request.Request(
+        url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=wait) as response:
+            response.read()
+    except Exception as e:
+        print(f"notify-webhook: the POST failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
