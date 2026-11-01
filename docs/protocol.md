@@ -13,6 +13,8 @@ This file defines everything a third party needs to talk to baton: the WebSocket
 
 One WebSocket per machine. The client sends the subprotocol `baton.v1` and an `Authorization: Bearer <token>` header. The server refuses any other subprotocol with `400`. A request the auth provider does not accept is answered with `401` and the connection is never upgraded, so no `welcome` follows. The server may serve `wss://`; a client then trusts the system roots plus an optional CA file named in its config, and never skips verification.
 
+A connection has 10 s from accept to finish its TLS handshake and the WebSocket upgrade, auth included, and the server closes it without a reply after that. At most 128 connections may be in that state at once, and the server closes one more at accept. `hello` must follow the upgrade within 5 s.
+
 Every WebSocket message is binary. Byte 0 is the frame kind:
 
 | Kind | Layout |
@@ -22,9 +24,15 @@ Every WebSocket message is binary. Byte 0 is the frame kind:
 
 An object larger than 1 MiB is split into frames of at most 1 MiB of payload with increasing `offset`. The receiver stores an object only when all `total` bytes have arrived and the git hash of `type` plus bytes equals the id. A disconnect discards partial objects.
 
+A receiver grows its buffer for an unfinished object as payload arrives and never reserves `total` ahead of it. A session's budget is 512 MiB, and it counts the bytes of its finished objects plus the announced `total` of every unfinished one. The frame that takes the sum past it is a `too_large` violation, so a sender cannot hold memory by announcing objects it never sends. One object is at most 64 MiB (`max_object`).
+
 `xfer` groups the object frames that precede one control message. The client numbers its transfers with odd numbers and the server with even numbers.
 
 The first message after the upgrade must be `hello`. A message before it, a second `hello`, a text message, or a frame over `max_frame` is a violation: the server sends `error` and closes the connection. A message with a tag the receiver does not know is ignored.
+
+`max_frame` is exact: a frame of `max_frame` bytes is accepted and one byte more is not. The WebSocket layer enforces it while the frame is read, so a longer frame is not buffered before it is refused.
+
+A session names at most 256 distinct projects in all its messages together, across `hello`, `subscribe`, `advance` and `want`. The first message that names a 257th is a `too_large` violation.
 
 ## Control messages
 
@@ -46,7 +54,7 @@ The first message after the upgrade must be `hello`. A message before it, a seco
 {"t":"want","xfer":9,"project":"github.com/acme/app","ids":["<id>","<id>"]}
 ```
 
-`want` asks the server for objects, after a `moved` whose objects did not all arrive. It carries at most 2,048 ids. The server answers with the object frames and then `objects_sent`.
+`want` asks the server for objects, after a `moved` whose objects did not all arrive. It carries at most 2,048 ids; more is a `too_large` violation. An id listed twice is read and sent once. The server answers with the object frames and then `objects_sent`.
 
 ```json
 {"t":"subscribe","project":"github.com/acme/app"}
@@ -96,14 +104,27 @@ The end of a server reply to `want`. Its `xfer` is the server's own, the one on 
 {"t":"error","code":"unsupported_version","message":"..."}
 ```
 
-`error` is followed by a close. `code` is one of `unsupported_version`, `protocol`, `invalid_message`, `too_large`, `unauthorized` (the device was revoked while connected; the server checks at each `advance` and at each heartbeat) and `internal`. The server sends a ping every 15 s and closes a connection that has been silent for 60 s. A client treats 45 s without any message as a dead link.
+`error` is followed by a close. `code` is one of `unsupported_version`, `protocol`, `invalid_message`, `too_large`, `unauthorized` (the device was revoked while connected) and `internal`. The server sends a ping every 15 s and closes a connection that has been silent for 60 s. A client treats 45 s without any message as a dead link.
+
+A revoked device is cut off within 2 s: the server checks that the device is still enrolled every 2 s, and also before it handles `subscribe`, `advance` or `want` and before it forwards a `moved`. After the `error`, no further `moved` or object frame is sent to that session. This holds for the built-in token provider. A `command` provider is asked once, at the upgrade, so revoking in its own system takes effect at the device's next connection.
+
+The server bounds every write. A send that makes no progress for 30 s ends the session, and the closing `error` and close frame get 5 s more before the socket is dropped. A client that stops reading is therefore gone within 35 s of the first send that cannot finish, and a client that also stops answering pings is gone after 60 s of silence.
 
 ## Server invariants
 
 1. An object stored on the server has every object it references stored.
 2. A ref moves only after the new commit's closure is complete, by compare-and-swap.
 3. A thread has one owner machine, the one named by the `Baton-Machine` trailer of its tip. The first accepted `advance` sets it, and only an operator editing the ref by hand changes it. An `advance` from any other machine is refused with `not_owner`.
-4. Tree entry names are non-empty, contain no `/` or NUL, are not `.`, `..`, or `.git` in any case, and appear once per tree.
+4. Every tree and entry is one git itself accepts. Each rule is a port of git v2.54.0, so a tree baton keeps passes `git fsck --strict`:
+   - A name is non-empty, at most 4,096 bytes, has no `/` or NUL, is not `.` or `..`, and appears once per tree (`fsck_tree`, `verify_path_internal`).
+   - A name is not `.git` under any of git's spellings: any case, trailing spaces or dots, NTFS short names (`GIT~1`), NTFS alternate data streams (`.git::$INDEX_ALLOCATION`), HFS+ ignorable code points (`.g\u{200c}it`) (`is_ntfs_dotgit`, `is_hfs_dotgit`). `.gitmodules` and `.gitattributes` are recognised under the same spellings.
+   - A mode is one of `100644`, `100755`, `120000`, `040000`, `160000`. `.gitmodules` is a regular file, never a symbolic link, a directory or a gitlink; `.gitattributes` is never a directory or a gitlink (`fsck_tree`).
+   - A `.gitmodules` blob has no submodule name that is empty or has a `..` path part, no `url` that starts with `-`, no relative or `git://` url that holds an encoded newline or climbs out with `../` before a `:` or `/`, no http-like url without a scheme and a host or with a control character, no `path` that starts with `-`, and no `update` that starts with `!` (`fsck_gitmodules_fn`, `check_submodule_name`, `check_submodule_url`, `parse_submodule_update_type`). The url check refuses a little more than git does for http-like urls and never less. A `.gitattributes` blob has no line of 2,048 bytes or more (`ATTR_MAX_LINE_LENGTH`).
+   - A tree entry's id names an object of the kind its mode says, even when the server already stores that id as another kind: a tree entry for a blob, a commit parent that is not a commit, a tree id that is not a tree are `invalid`.
+   - Trees nest at most 512 levels deep, the root being level 0. The check walks the trees with a heap stack, so a deeper chain is refused with `invalid` and never overruns the server's stack.
+
+   A client applies the same rules to every path it writes into a worktree and to every turn it receives, so a name the server would refuse is not written to disk and not stored on a peer.
+5. A project costs the server nothing until an `advance` for it is accepted. `subscribe`, `want`, `need` and a refused `advance` leave no repository and no writer thread behind, and the server stops a project's writer after 30 s without work.
 
 These make every server repo a plain bare repo that `git fetch` reads completely.
 
