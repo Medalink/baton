@@ -71,6 +71,9 @@ enum Command {
         options: Vec<String>,
         #[arg(long)]
         context: Option<String>,
+        /// The agent's session or thread id, passed to the decider. Defaults to $BATON_THREAD.
+        #[arg(long)]
+        thread: Option<String>,
     },
     /// Put a turn's files back on disk. Without --apply it only shows what would change.
     Rewind {
@@ -189,11 +192,14 @@ fn main() {
             question,
             options,
             context,
-        } => commands::ask(&question, &options, context.as_deref()).map(|code| {
-            if code != 0 {
-                std::process::exit(code);
-            }
-        }),
+            thread,
+        } => {
+            commands::ask(&question, &options, context.as_deref(), thread.as_deref()).map(|code| {
+                if code != 0 {
+                    std::process::exit(code);
+                }
+            })
+        }
         Command::Rewind {
             turn,
             thread,

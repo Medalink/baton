@@ -356,7 +356,12 @@ pub fn verdict(selector: &str, thread: Option<&str>, json: bool) -> Result<()> {
 
 /// `baton ask`. Returns the exit code: 0 when the decider chose, 2 when a human must answer.
 /// Every way the decider can fail is "ask a human", since the caller is an agent that must not guess.
-pub fn ask(question: &str, options: &[String], context: Option<&str>) -> Result<i32> {
+pub fn ask(
+    question: &str,
+    options: &[String],
+    context: Option<&str>,
+    thread: Option<&str>,
+) -> Result<i32> {
     if options.len() < 2 {
         bail!("give at least two --option values to choose between");
     }
@@ -381,7 +386,12 @@ pub fn ask(question: &str, options: &[String], context: Option<&str>) -> Result<
             project_key(&root, &config).ok()
         })
         .map(|key| key.to_string());
-    let request = Ask::new(question, options, context, project.as_deref(), None);
+    let from_env = std::env::var("BATON_THREAD").ok();
+    let thread = thread
+        .or(from_env.as_deref())
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    let request = Ask::new(question, options, context, project.as_deref(), thread);
     let decision =
         run_command::<_, Answer>(&decider, &request).and_then(|answer| answer.decide(options));
     match decision {

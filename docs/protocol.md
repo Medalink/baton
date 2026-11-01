@@ -207,6 +207,8 @@ A notifier reads `{"verdict": <baton.verdict.v1>, "turn": <baton.turn.v1>}`. Its
 {"schema": "baton.answer.v1", "choice": "remove", "confidence": 0.82, "reason": "matches 4 earlier decisions", "ask_human": false}
 ```
 
+`thread` is the value of `baton ask --thread <id>`, else the `BATON_THREAD` environment variable, else `null`; an agent passes its session id so the decider can tell whose question it is. The flag wins over the variable, and an empty value is no thread.
+
 `ask_human: true`, a failure, or no configured decider means `baton ask` reports that a human must answer.
 
 ### `baton.auth.v1`, for a command auth provider
