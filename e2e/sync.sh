@@ -6,12 +6,15 @@
 #   BATON_BIN=/path/baton e2e/sync.sh
 #   BATON_E2E_BIG_REPO=/path/to/a/large/repo   the tree copied for the latency run (git archive HEAD)
 #   BATON_E2E_TURNS=100             turns timed in the latency run
-#   BATON_E2E_PORT=47880            the main server; the TLS and command-auth servers take the next two
+#   BATON_E2E_PORT=47880            the main server; the TLS, command-auth and raw-wire servers take the next three
 #   BATON_E2E_BURST=30              threads in the burst
 #   BATON_E2E_KILL_ROUNDS=8         times the server is killed mid-push
 #
 # Everything lives under one temp dir. The big repo is only read through `git archive`. Needs bash 5
 # (EPOCHREALTIME), git, tar, sha256sum, awk. The TLS section also needs openssl and is skipped without it.
+# The sections that send what no daemon would (hostile trees, floods, stalled readers, a revoked session)
+# drive e2e/wire.py, a raw baton.v1 client that needs Python 3.8 or newer and nothing else; without it they
+# fail one check instead of passing silently. They take about two minutes, most of it waiting out timeouts.
 
 set -u
 export LC_ALL=C
@@ -55,7 +58,7 @@ fail=0
 declare -a REPORT=()
 declare -a SECTION_ORDER=()
 declare -A SECTION_MS=() SECTION_PASS=() SECTION_FAIL=()
-declare -A SERVER_PID=()
+declare -A SERVER_PID=() WIRE_SLOW=()
 declare -a BG_PIDS=()
 current=""
 section_start=0
@@ -335,6 +338,42 @@ tree_matches() { # tree_matches dir gitdir ref
 }
 
 # --------------------------------------------------------------------------------------------------
+# The raw wire client: e2e/wire.py prints `ok name` or `bad name :: why` per check, and these turn each line
+# into one check here. A python that is only the Windows store stub fails the version probe and is skipped.
+WIRE_PY=""
+for cand in python python3 py; do
+  if command -v "$cand" >/dev/null 2>&1 && "$cand" -c 'import sys; sys.exit(sys.version_info < (3, 8))' >/dev/null 2>&1; then
+    WIRE_PY=$cand
+    break
+  fi
+done
+WIRE_SCRIPT=$(wp "$root/e2e/wire.py")
+
+wire_cmd() { # wire_cmd port case device [args...] : as the device, whose token file is $TMP/token-device
+  local port=$1 c=$2 d=$3
+  shift 3
+  "$WIRE_PY" -I "$WIRE_SCRIPT" "$c" "$port" "$(wp "$TMP/token-$d")" "$d" "$@" 2>&1
+}
+
+wire_lines() { # wire_lines case text
+  local c=$1 line rest n=0
+  while IFS= read -r line; do
+    line=${line%$'\r'}
+    case $line in
+      "ok "*) ok "${line#ok }"; n=$((n + 1)) ;;
+      "bad "*)
+        rest=${line#bad }
+        n=$((n + 1))
+        if [[ $rest == *" :: "* ]]; then bad "${rest%% :: *}" "${rest#* :: }"; else bad "$rest"; fi
+        ;;
+      "") ;;
+      *) bad "wire $c printed [$line]" ;;
+    esac
+  done <<<"$2"
+  ((n > 0)) || bad "wire $c printed no check"
+}
+
+# --------------------------------------------------------------------------------------------------
 real_dirs=()
 case ${OSTYPE:-} in
   msys* | cygwin*) real_dirs=("${LOCALAPPDATA:-}/baton" "${APPDATA:-}/baton") ;;
@@ -546,7 +585,7 @@ await "D's turn reaches the server" 10000 everywhere dthread "$D1" b
 out=$("$BIN" admin --data "$SRV" device revoke d 2>&1)
 contains "revoke says what it did" "$out" "revoked 1"
 contains "the device list marks it revoked" "$("$BIN" admin --data "$SRV" device list)" "revoked"
-await "the open session of D ends" 20000 log_has "$(dlog d)" "sync: disconnected"
+await "the open session of D ends within 6 s of the revoke" 6000 log_has "$(dlog d)" "sync: disconnected"
 printf 'd2\n' >>"$(repo_of d)/a.txt"
 turn_as d dthread "d after revoke" >/dev/null
 D2=$(tip_on d dthread)
@@ -589,6 +628,15 @@ section_end
 
 # ==================================================================================================
 section "baton follow --into"
+mkdir -p "$TMP/plain"
+printf 'mine\n' >"$TMP/plain/keep.txt"
+out=$(btr b follow t1 --into "$TMPW/plain")
+contains "follow refuses a directory that baton pull did not make" "$out" "is not a worktree \`baton pull\` made"
+eq "and writes nothing into it" "keep.txt" "$(ls "$TMP/plain")"
+HOOKS_BEFORE=$(ls -A "$(repo_of b)/.git/hooks" | sort)
+out=$(btr b follow t1 --into "$(wp "$(repo_of b)")/.git/hooks")
+contains "follow refuses a path under .git" "$out" "is not a worktree \`baton pull\` made"
+eq "and the hooks directory is unchanged" "$HOOKS_BEFORE" "$(ls -A "$(repo_of b)/.git/hooks" | sort)"
 cd "$(repo_of b)" || exit 2
 export BATON_HOME=$(home_of b)
 "$BIN" follow t1 --into "$PULLED" >"$TMP/follow.out" 2>&1 &
@@ -848,6 +896,8 @@ case $token in
   secret-ca) echo '{"schema":"baton.auth.v1","ok":true,"machine":"ca"}' ;;
   secret-cb) echo '{"schema":"baton.auth.v1","ok":true,"machine":"cb"}' ;;
   crash) echo 'this is not json'; exit 3 ;;
+  late) (sleep 7; echo '{"schema":"baton.auth.v1","ok":true,"machine":"cl"}') & exit 0 ;;
+  hold) echo '{"schema":"baton.auth.v1","ok":true,"machine":"ch"}'; (sleep 13) & exit 0 ;;
   *) echo '{"ok":false}' ;;
 esac
 EOF
@@ -879,7 +929,87 @@ never "nothing from a rejected machine reaches the server" 2000 ref_nonempty "$(
 contains "the provider saw the bearer token" "$(cat "$TMP/auth.calls")" "secret-ca"
 contains "and the rejected one" "$(cat "$TMP/auth.calls")" "wrong"
 check "the command-auth server repo passes fsck" gitd "$(srv_repo cmdproj "$CMD_DATA")" fsck --strict --no-dangling
+# The deadline covers the whole call, not just the provider process: a grandchild that answers after the
+# provider exited, or that keeps the pipe open after a good answer, must not move the verdict or the time.
+if [[ -z $WIRE_PY ]]; then
+  bad "Python 3.8 or newer is needed to time the provider cases"
+else
+  printf 'late' >"$TMP/token-cl"
+  printf 'hold' >"$TMP/token-ch"
+  out=$(wire_cmd "$CMD_PORT" connect cl cl)
+  read -r status ms <<<"$out"
+  eq "a provider that exits and leaves a grandchild to answer later gets 401" "401" "$status"
+  check "and it gets it in under 3 s, not when the grandchild is done at 7 s" test "${ms:-99999}" -lt 3000
+  out=$(wire_cmd "$CMD_PORT" connect ch ch)
+  read -r status ms <<<"$out"
+  eq "a good answer is accepted although a grandchild keeps the pipe open" "101" "$status"
+  check "and it is accepted in under 3 s, not when the grandchild lets go at 13 s" test "${ms:-99999}" -lt 3000
+fi
 stop_server cmd
+section_end
+
+# ==================================================================================================
+section "a hostile .gitmodules is not captured"
+printf '[submodule "x"]\n\tpath = x\n\turl = -uevil\n' >"$(repo_of a)/.gitmodules"
+printf 'fine\n' >"$(repo_of a)/capture-ok.txt"
+turn_as a hostile "a repo file git would refuse" >/dev/null
+HOSTILE=$(tip_on a hostile)
+check "the turn was recorded" test -n "$HOSTILE"
+files=$(gitd "$(side_of a)" ls-tree -r --name-only refs/baton/hostile 2>/dev/null)
+contains "the ordinary file is in the turn" "$files" "capture-ok.txt"
+lacks "the .gitmodules that git would refuse is not" "$files" ".gitmodules"
+rm -f "$(repo_of a)/.gitmodules" "$(repo_of a)/capture-ok.txt"
+section_end
+
+# ==================================================================================================
+section "hostile clients on the raw wire"
+if [[ -z $WIRE_PY ]]; then
+  bad "Python 3.8 or newer is needed to drive e2e/wire.py"
+else
+  WIRE_PORT=$((PORT + 3))
+  WIRE_DATA="$TMPW/server-wire"
+  WIRE_LOG="$TMP/server-wire.log"
+  wire_repo() { echo "$WIRE_DATA/projects/wire+$1.git"; }
+  wire() { # wire case [args...] : as w1, one check per line the case prints
+    local c=$1
+    shift
+    wire_lines "$c" "$(wire_cmd "$WIRE_PORT" "$c" w1 "$@")"
+  }
+  start_server wire "$WIRE_DATA" "$WIRE_PORT"
+  for n in w1 w2 w3; do add_device "$n" "$WIRE_DATA"; done
+
+  # The two slow cases wait out the server's timers while the quick ones run.
+  for slow in stall quiet; do
+    "$WIRE_PY" -I "$WIRE_SCRIPT" "$slow" "$WIRE_PORT" "$(wp "$TMP/token-w1")" w1 "$(wp "$WIRE_LOG")" >"$TMP/wire-$slow.out" 2>&1 &
+    WIRE_SLOW[$slow]=$!
+    BG_PIDS+=("$(native_pid $!)")
+  done
+
+  wire names
+  check "the server repo passes fsck --strict after the hostile names" gitd "$(wire_repo names)" fsck --strict --no-dangling
+  eq "and holds only the two clean turns" "2" "$(gitd "$(wire_repo names)" for-each-ref --format=x refs/baton | wc -l | tr -d ' ')"
+  wire kinds
+  check "the server repo passes fsck --strict after the kind mismatches" gitd "$(wire_repo kinds)" fsck --strict --no-dangling
+  wire depth
+  check "the server repo passes fsck --strict after the deep trees" gitd "$(wire_repo depth)" fsck --strict --no-dangling
+  wire partial
+  wire frames
+  wire want
+  wire flood
+  eq "no project directory exists for a key that was only named" "" "$(ls "$WIRE_DATA/projects" | grep -E '^wire\+(sub|adv|flood)-' || true)"
+  wire_lines revoke "$(wire_cmd "$WIRE_PORT" revoke w3 "$(wp "$TMP/token-w2")" w2 "$(wp "$BIN")" admin --data "$WIRE_DATA" device revoke w3)"
+  wire handshake
+
+  wait "${WIRE_SLOW[quiet]}"
+  wire_lines quiet "$(cat "$TMP/wire-quiet.out")"
+  contains "the server logged that the idle writer stopped" "$(cat "$WIRE_LOG")" "writer stopped after 30s idle"
+  wait "${WIRE_SLOW[stall]}"
+  wire_lines stall "$(cat "$TMP/wire-stall.out")"
+  contains "the server logged why it closed the reader that stopped" "$(cat "$WIRE_LOG")" "the client did not read for 30s"
+  contains "the server logged the handshakes it timed out" "$(cat "$WIRE_LOG")" "no handshake within"
+  check "the server repo of the idle project passes fsck --strict" gitd "$(wire_repo idle)" fsck --strict --no-dangling
+  stop_server wire
+fi
 section_end
 
 # ==================================================================================================
