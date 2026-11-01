@@ -46,7 +46,6 @@ pub fn run() -> Res<()> {
         let hex = id.to_string();
         let loose = dir.join("objects").join(&hex[..2]).join(&hex[2..]);
         let probe = git(&dir).args(["cat-file", "-e", &hex]).output()?;
-        let known = gix::objs::compute_hash(gix::hash::Kind::Sha1, *kind, b"")?;
         assert_eq!(id, known, "write returned an unexpected id");
         println!(
             "{:<32} {:<18} {:<16} {:<10} {:<14} {:<16} {}",
