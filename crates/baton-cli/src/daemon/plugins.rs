@@ -172,15 +172,27 @@ fn read_lens(plugins: &Plugins, job: &Work, policy: &StorePolicy, log: &Log) -> 
         }
     };
     match text {
-        Ok(text) => {
-            let text: String = text.chars().take(LENS_MAX_BYTES as usize).collect();
-            Some(policy.redact_text(&text))
-        }
+        // Cut after redacting, so a secret that straddles the cut is not left half-visible.
+        Ok(text) => Some(cut_at_boundary(
+            policy.redact_text(&text),
+            LENS_MAX_BYTES as usize,
+        )),
         Err(e) => {
             log.line(&format!("the lens could not be read: {e}"));
             None
         }
     }
+}
+
+fn cut_at_boundary(mut text: String, max: usize) -> String {
+    if text.len() > max {
+        let mut end = max;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
 }
 
 /// A clone can carry a symlink, so a lens file that resolves outside the repository is not read.
