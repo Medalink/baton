@@ -21,7 +21,7 @@
 #      baton admin device add laptop
 #
 # 3. On each machine, copy the rest of this file into `config.toml` in baton's config directory
-#    (`~/.config/baton` on Linux, `~/Library/Application Support/baton` on macOS, `%APPDATA%aton`
+#    (`~/.config/baton` on Linux, `~/Library/Application Support/baton` on macOS, `%APPDATA%\baton`
 #    on Windows), then restart the daemon.
 
 [machine]
