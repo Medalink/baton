@@ -1,20 +1,44 @@
 //! Turns an agent's raw hook payload into a turn request. The payload is untrusted input: every field is
 //! parsed into a typed value here, and nothing but ids, a directory and a subject leaves this module.
+//! A built-in adapter only maps the fields its agent documents into `baton.turnreq.v1`; a payload it
+//! cannot map is dropped, and `baton turn` records the turn instead.
 
-use baton_core::{AgentName, ThreadId};
+use baton_core::{AgentName, ThreadId, TurnReq};
 use serde::Deserialize;
 use serde_json::Value;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
 const TRANSCRIPT_TAIL: u64 = 256 * 1024;
+const SUBJECT_CHARS: usize = 200;
 
-pub struct TurnRequest {
-    pub cwd: PathBuf,
-    pub thread: ThreadId,
-    pub agent: AgentName,
-    pub model: Option<String>,
-    pub message: String,
+fn request(
+    cwd: String,
+    session: &str,
+    agent: &str,
+    model: Option<String>,
+    subject: String,
+) -> Option<TurnReq> {
+    Some(TurnReq {
+        cwd: PathBuf::from(cwd),
+        thread: ThreadId::parse(session).ok()?,
+        subject,
+        agent: AgentName::parse(agent).ok()?,
+        model: model.filter(|m| !m.is_empty()),
+        checks: Vec::new(),
+    })
+}
+
+/// `claude` is the hook's argument (`baton hook claude`); `claude-code` is the name recorded in the turn.
+/// `None` means the payload is not the end of a turn this adapter can read.
+pub fn parse(hook_agent: &str, payload: &[u8]) -> Option<TurnReq> {
+    match hook_agent {
+        "claude" | "claude-code" => claude_code(payload),
+        "codex" => codex(payload),
+        "opencode" => opencode(payload),
+        "pi" => pi(payload),
+        _ => None,
+    }
 }
 
 #[derive(Deserialize)]
@@ -25,28 +49,126 @@ struct ClaudeStop {
     hook_event_name: Option<String>,
 }
 
-/// `claude` is the hook's argument (`baton hook claude`); `claude-code` is the name recorded in the turn.
-pub fn parse(hook_agent: &str, payload: &[u8]) -> Option<TurnRequest> {
-    match hook_agent {
-        "claude" | "claude-code" => claude_code(payload),
-        _ => None,
-    }
-}
-
-fn claude_code(payload: &[u8]) -> Option<TurnRequest> {
+fn claude_code(payload: &[u8]) -> Option<TurnReq> {
     let stop: ClaudeStop = serde_json::from_slice(payload).ok()?;
     if stop.hook_event_name.as_deref().is_some_and(|e| e != "Stop") {
         return None;
     }
     let transcript = stop.transcript_path.as_deref().and_then(read_tail);
     let (message, model) = transcript.map_or((None, None), |t| latest_prompt_and_model(&t));
-    Some(TurnRequest {
-        cwd: PathBuf::from(stop.cwd),
-        thread: ThreadId::parse(&stop.session_id).ok()?,
-        agent: AgentName::parse("claude-code").ok()?,
+    request(
+        stop.cwd,
+        &stop.session_id,
+        "claude-code",
         model,
-        message: message.unwrap_or_default(),
-    })
+        message.unwrap_or_default(),
+    )
+}
+
+/// Codex runs a hook command with one JSON object on stdin
+/// (<https://developers.openai.com/codex/hooks>). Its `Stop` event carries `session_id`, `cwd`,
+/// `hook_event_name`, `model`, `turn_id`, `transcript_path` and `last_assistant_message`, and no prompt,
+/// so the subject is the start of the agent's last message.
+#[derive(Deserialize)]
+struct CodexStop {
+    session_id: String,
+    cwd: String,
+    hook_event_name: Option<String>,
+    model: Option<String>,
+    last_assistant_message: Option<String>,
+}
+
+fn codex(payload: &[u8]) -> Option<TurnReq> {
+    let stop: CodexStop = serde_json::from_slice(payload).ok()?;
+    if stop.hook_event_name.as_deref().is_some_and(|e| e != "Stop") {
+        return None;
+    }
+    let subject = stop.last_assistant_message.as_deref().map(first_line);
+    request(
+        stop.cwd,
+        &stop.session_id,
+        "codex",
+        stop.model,
+        subject.unwrap_or_default(),
+    )
+}
+
+/// opencode has no command hooks. Its plug-ins receive `{ directory, worktree, ... }` and an event
+/// `{ type: "session.idle", properties: { sessionID } }` (`@opencode-ai/plugin`, `@opencode-ai/sdk`
+/// `types.gen.d.ts`). The glue in `docs/design.md` pipes that event, with the plug-in's `directory`
+/// added, into `baton hook opencode`.
+#[derive(Deserialize)]
+struct OpencodeIdle {
+    #[serde(rename = "type")]
+    event: String,
+    properties: OpencodeProperties,
+    directory: String,
+    model: Option<String>,
+    message: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OpencodeProperties {
+    #[serde(rename = "sessionID")]
+    session: String,
+}
+
+fn opencode(payload: &[u8]) -> Option<TurnReq> {
+    let idle: OpencodeIdle = serde_json::from_slice(payload).ok()?;
+    if idle.event != "session.idle" {
+        return None;
+    }
+    let subject = idle.message.as_deref().map(first_line);
+    request(
+        idle.directory,
+        &idle.properties.session,
+        "opencode",
+        idle.model,
+        subject.unwrap_or_default(),
+    )
+}
+
+/// Pi has no command hooks either. An extension's `agent_settled` handler has `ctx.cwd`,
+/// `ctx.sessionManager.getSessionId()` and `ctx.model` (<https://pi.dev/docs/latest/extensions>), which
+/// the glue in `docs/design.md` pipes into `baton hook pi` as `session_id`, `cwd` and `model`.
+/// The docs do not show the model's field names, so the glue passes `ctx.model.id` unconfirmed.
+#[derive(Deserialize)]
+struct PiSettled {
+    #[serde(rename = "type")]
+    event: Option<String>,
+    session_id: String,
+    cwd: String,
+    model: Option<String>,
+    message: Option<String>,
+}
+
+fn pi(payload: &[u8]) -> Option<TurnReq> {
+    let settled: PiSettled = serde_json::from_slice(payload).ok()?;
+    if settled
+        .event
+        .as_deref()
+        .is_some_and(|e| e != "agent_settled")
+    {
+        return None;
+    }
+    let subject = settled.message.as_deref().map(first_line);
+    request(
+        settled.cwd,
+        &settled.session_id,
+        "pi",
+        settled.model,
+        subject.unwrap_or_default(),
+    )
+}
+
+fn first_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or_default()
+        .chars()
+        .take(SUBJECT_CHARS)
+        .collect()
 }
 
 /// The last 256 KiB of the transcript. A path in a payload names a file the sender chose, so only a

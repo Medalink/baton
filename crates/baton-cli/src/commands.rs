@@ -5,8 +5,8 @@ use crate::control::{Reply, Request, TurnArgs};
 use crate::{endpoint, timefmt};
 use anyhow::{Context, Result, anyhow, bail};
 use baton_core::{
-    ChangeKind, Dirs, RepoConfig, RewindAction, SideRepo, ThreadId, TurnRecord, Worktree,
-    find_root, plan_rewind, project_key,
+    Answer, Ask, ChangeKind, Decision, Dirs, Plugins, RepoConfig, RewindAction, SideRepo, ThreadId,
+    TurnRecord, TurnVerdict, Worktree, find_root, plan_rewind, project_key, run_command,
 };
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -78,24 +78,39 @@ fn spawn_daemon() -> Result<()> {
     Ok(())
 }
 
+/// What the daemon said when it stopped since `from` bytes into its log: the bind error, say, that a
+/// 20 s wait would otherwise hide.
+fn daemon_failure(log: &Path, from: u64) -> Option<String> {
+    let text = std::fs::read(log).ok()?;
+    let text = String::from_utf8_lossy(text.get(from as usize..)?);
+    let line = text.lines().rfind(|l| l.contains("daemon stopped: "))?;
+    Some(line.split_once("daemon stopped: ")?.1.to_owned())
+}
+
 pub fn ensure_daemon() -> Result<()> {
     if daemon_is_up() {
         return Ok(());
     }
+    // A path that cannot exist is an error now, not a 20 s wait.
+    #[cfg(unix)]
+    endpoint::socket_path().context("finding the daemon socket")?;
+    let log = Dirs::resolve().map(|d| d.log_file()).unwrap_or_default();
+    let log_start = std::fs::metadata(&log).map_or(0, |m| m.len());
     spawn_daemon()?;
     let deadline = Instant::now() + DAEMON_START_DEADLINE;
     while Instant::now() < deadline {
         if daemon_is_up() {
             return Ok(());
         }
+        if let Some(why) = daemon_failure(&log, log_start) {
+            bail!("the daemon could not start: {why}; see {}", log.display());
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
-    let log = Dirs::resolve()
-        .map(|d| d.log_file().display().to_string())
-        .unwrap_or_default();
     bail!(
-        "the daemon did not start within {}s; see {log}",
-        DAEMON_START_DEADLINE.as_secs()
+        "the daemon did not start within {}s; see {}",
+        DAEMON_START_DEADLINE.as_secs(),
+        log.display()
     )
 }
 
@@ -153,6 +168,54 @@ pub fn unenroll(path: Option<&Path>) -> Result<()> {
     }
 }
 
+pub fn enroll_repo(path: Option<&Path>) -> Result<()> {
+    let path = absolute(path)?;
+    ensure_daemon()?;
+    match send(&Request::EnrollRepo {
+        path: path.to_string_lossy().into_owned(),
+    })? {
+        Reply::EnrolledRepo {
+            dir,
+            project,
+            already,
+            cap,
+        } => {
+            let verb = if already {
+                "already enrolled"
+            } else {
+                "enrolled"
+            };
+            println!(
+                "{verb} repository {dir} as {project}; each worktree is recorded from its first turn, up to {cap} watched at once"
+            );
+            Ok(())
+        }
+        other => bail!("unexpected reply: {other:?}"),
+    }
+}
+
+pub fn unenroll_repo(path: Option<&Path>) -> Result<()> {
+    let path = absolute(path)?;
+    ensure_daemon()?;
+    match send(&Request::UnenrollRepo {
+        path: path.to_string_lossy().into_owned(),
+    })? {
+        Reply::UnenrolledRepo {
+            dir,
+            was_enrolled,
+            stopped,
+        } => {
+            if was_enrolled {
+                println!("unenrolled repository {dir} ({stopped} worktrees stopped)");
+            } else {
+                println!("repository was not enrolled: {dir}");
+            }
+            Ok(())
+        }
+        other => bail!("unexpected reply: {other:?}"),
+    }
+}
+
 pub struct TurnOptions {
     pub thread: String,
     pub message: String,
@@ -193,6 +256,8 @@ pub fn status() -> Result<()> {
             pid,
             up_secs,
             worktrees,
+            repos,
+            cap,
         } => {
             println!(
                 "daemon pid {pid}, up {up_secs}s, {} enrolled",
@@ -200,11 +265,18 @@ pub fn status() -> Result<()> {
             );
             for w in worktrees {
                 println!(
-                    "{}  {}  {} files  tree {}",
+                    "{}  {}  {} files  tree {}{}",
                     w.root,
                     w.project,
                     w.files,
-                    w.tree.get(..8).unwrap_or("")
+                    w.tree.get(..8).unwrap_or(""),
+                    w.repo.map_or_else(String::new, |r| format!("  via {r}"))
+                );
+            }
+            for r in repos {
+                println!(
+                    "repository {}  {} of at most {cap} worktrees watched",
+                    r.dir, r.active
                 );
             }
             Ok(())
@@ -266,7 +338,7 @@ pub fn describe(side: &SideRepo, turn: &TurnRecord) -> Result<()> {
     Ok(())
 }
 
-pub fn log(thread: Option<&str>) -> Result<()> {
+pub fn log(thread: Option<&str>, verdicts: bool) -> Result<()> {
     let here = open_here()?;
     let mut turns = Vec::new();
     match thread {
@@ -286,9 +358,134 @@ pub fn log(thread: Option<&str>) -> Result<()> {
         println!("no turns recorded for this project");
     }
     for turn in &turns {
-        describe(&here.side, turn)?;
+        if verdicts {
+            let verdict = here.side.verdict(turn.id).map_err(|e| anyhow!("{e}"))?;
+            println!("{}", verdict_line(turn, verdict.as_ref()));
+        } else {
+            describe(&here.side, turn)?;
+        }
     }
     Ok(())
+}
+
+/// `thread@seq  id  class  kinds  subject`; the class is `-` for a turn with no verdict.
+fn verdict_line(turn: &TurnRecord, verdict: Option<&TurnVerdict>) -> String {
+    let d = &turn.turn.draft;
+    let (class, kinds) = match verdict {
+        Some(v) => {
+            let mut kinds: Vec<&str> = v.findings.iter().map(|f| f.kind.as_str()).collect();
+            kinds.dedup();
+            (v.class.as_str(), kinds.join(","))
+        }
+        None => ("-", String::new()),
+    };
+    format!(
+        "{}@{}  {}  {class:<5}  {kinds}  {}",
+        d.thread,
+        turn.turn.seq,
+        turn.id.short(),
+        d.subject.as_str()
+    )
+}
+
+pub fn verdict(selector: &str, thread: Option<&str>, json: bool) -> Result<()> {
+    let here = open_here()?;
+    let default_thread = thread
+        .map(ThreadId::parse)
+        .transpose()
+        .map_err(|e| anyhow!("{e}"))?;
+    let turn = here
+        .side
+        .resolve_turn(selector, default_thread.as_ref())
+        .map_err(|e| anyhow!("{e}"))?;
+    let Some(verdict) = here.side.verdict(turn.id).map_err(|e| anyhow!("{e}"))? else {
+        bail!(
+            "no verdict for {} (classification is off, still running, or failed; the daemon log says which)",
+            turn.id.short()
+        );
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&verdict)?);
+        return Ok(());
+    }
+    println!("{}", verdict_line(&turn, Some(&verdict)));
+    for finding in &verdict.findings {
+        let place = finding
+            .evidence
+            .first()
+            .map_or(String::new(), |e| match e.lines {
+                Some([from, to]) if from == to => format!("{}:{from}", e.path),
+                Some([from, to]) => format!("{}:{from}-{to}", e.path),
+                None => e.path.clone(),
+            });
+        println!(
+            "    {}  {:.2}  {place}  {}",
+            finding.kind, finding.score, finding.note
+        );
+    }
+    Ok(())
+}
+
+/// `baton ask`. Returns the exit code: 0 when the decider chose, 2 when a human must answer.
+/// Every way the decider can fail is "ask a human", since the caller is an agent that must not guess.
+pub fn ask(
+    question: &str,
+    options: &[String],
+    context: Option<&str>,
+    thread: Option<&str>,
+) -> Result<i32> {
+    if options.len() < 2 {
+        bail!("give at least two --option values to choose between");
+    }
+    let human = |why: &str| {
+        println!("ask a human");
+        eprintln!("baton: {why}");
+        Ok(2)
+    };
+    let dirs = Dirs::resolve().map_err(|e| anyhow!("{e}"))?;
+    let plugins = match Plugins::load(&dirs.user_config()) {
+        Ok(plugins) => plugins,
+        Err(e) => return human(&e.to_string()),
+    };
+    let Some(decider) = plugins.decide else {
+        return human("no [decide] command is configured");
+    };
+    let project = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| find_root(&cwd).ok())
+        .and_then(|root| {
+            let config = RepoConfig::load(&root).ok()?;
+            project_key(&root, &config).ok()
+        })
+        .map(|key| key.to_string());
+    let from_env = std::env::var("BATON_THREAD").ok();
+    let thread = thread
+        .or(from_env.as_deref())
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    let request = Ask::new(question, options, context, project.as_deref(), thread);
+    let decision =
+        run_command::<_, Answer>(&decider, &request).and_then(|answer| answer.decide(options));
+    match decision {
+        Ok(Decision::Chose {
+            choice,
+            confidence,
+            reason,
+        }) => {
+            println!("choice: {choice}");
+            if let Some(confidence) = confidence {
+                println!("confidence: {confidence:.2}");
+            }
+            if !reason.is_empty() {
+                println!("reason: {reason}");
+            }
+            Ok(0)
+        }
+        Ok(Decision::AskHuman { reason }) => {
+            human(&format!("the decider asks for a human: {reason}"))
+        }
+        Err(e) => human(&format!("the decider failed: {e}")),
+    }
 }
 
 pub fn rewind(selector: &str, thread: Option<&str>, apply: bool) -> Result<()> {

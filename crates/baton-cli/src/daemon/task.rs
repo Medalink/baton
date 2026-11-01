@@ -2,6 +2,7 @@
 //! thread. It talks to its project's writer by message and to nobody else.
 
 use super::log::Log;
+use super::plugins::{Runner, Work};
 use super::writer::Writer;
 use crate::control::TurnArgs;
 use baton_core::{
@@ -78,6 +79,11 @@ pub struct Handle {
     pub project: ProjectKey,
     pub tx: Sender<Cmd>,
     pub status: Arc<std::sync::Mutex<Snapshot>>,
+    /// The key of the enrolled repository that brought this worktree in. None for a worktree enrolled by
+    /// itself, which is never reaped or evicted.
+    pub via: Option<String>,
+    /// When a turn was last sent to it; the least recently used repository worktree is unwatched at the cap.
+    pub used: Instant,
 }
 
 /// What `status` shows, updated by the task after each sync.
@@ -91,6 +97,7 @@ struct Task {
     wt: Worktree,
     writer: Writer,
     log: Arc<Log>,
+    plugins: Runner,
     label: String,
     dirty: DirtySet,
     rx: Receiver<Cmd>,
@@ -98,8 +105,21 @@ struct Task {
     status: Arc<std::sync::Mutex<Snapshot>>,
 }
 
+/// What a worktree task talks to besides its own watcher.
+struct Services {
+    writer: Writer,
+    log: Arc<Log>,
+    plugins: Runner,
+}
+
 /// Starts the task and waits until its first sync is done, so an enroll answer means the baseline exists.
-pub fn spawn(root: PathBuf, dirs: Dirs, writer: Writer, log: Arc<Log>) -> Result<(Handle, Ready)> {
+pub fn spawn(
+    root: PathBuf,
+    dirs: Dirs,
+    writer: Writer,
+    log: Arc<Log>,
+    plugins: Runner,
+) -> Result<(Handle, Ready)> {
     let (tx, rx) = channel::<Cmd>();
     let (ready_tx, ready_rx) = sync_channel::<Result<Ready>>(1);
     let status = Arc::new(std::sync::Mutex::new(Snapshot::default()));
@@ -109,15 +129,12 @@ pub fn spawn(root: PathBuf, dirs: Dirs, writer: Writer, log: Arc<Log>) -> Result
     std::thread::Builder::new()
         .name("baton-worktree".into())
         .spawn(move || {
-            let started = start(
-                &thread_root,
-                &dirs,
+            let services = Services {
                 writer,
                 log,
-                rx,
-                event_tx,
-                thread_status,
-            );
+                plugins,
+            };
+            let started = start(&thread_root, &dirs, services, rx, event_tx, thread_status);
             match started {
                 Ok((mut task, watcher, ready)) => {
                     let _ = ready_tx.send(Ok(ready));
@@ -138,25 +155,44 @@ pub fn spawn(root: PathBuf, dirs: Dirs, writer: Writer, log: Arc<Log>) -> Result
         project: ready.project.clone(),
         tx,
         status,
+        via: None,
+        used: Instant::now(),
     };
     Ok((handle, ready))
+}
+
+/// inotify spends one watch per directory, and a distribution's default limit is easily met by a tree with
+/// a `node_modules`. Say which setting to raise instead of leaving the user with "limit reached".
+fn watch_failure(e: &notify::Error) -> String {
+    #[cfg(target_os = "linux")]
+    if matches!(e.kind, notify::ErrorKind::MaxFilesWatch) {
+        return format!(
+            "{e}; every directory costs one inotify watch, so raise the sysctl fs.inotify.max_user_watches"
+        );
+    }
+    e.to_string()
 }
 
 fn start(
     root: &Path,
     dirs: &Dirs,
-    writer: Writer,
-    log: Arc<Log>,
+    services: Services,
     rx: Receiver<Cmd>,
     event_tx: Sender<Cmd>,
     status: Arc<std::sync::Mutex<Snapshot>>,
 ) -> Result<(Task, notify::RecommendedWatcher, Ready)> {
+    let Services {
+        writer,
+        log,
+        plugins,
+    } = services;
     let wt = Worktree::open(root, dirs, &|tree| writer.has_tree(tree))?;
     let mut task = Task {
         label: root.display().to_string(),
         wt,
         writer,
         log,
+        plugins,
         dirty: DirtySet::default(),
         rx,
         backlog: VecDeque::new(),
@@ -166,10 +202,14 @@ fn start(
     let mut watcher = notify::recommended_watcher(move |event| {
         let _ = event_tx.send(Cmd::Event(event));
     })
-    .map_err(|e| Error::Refused(format!("starting the watcher: {e}")))?;
-    watcher
-        .watch(root, RecursiveMode::Recursive)
-        .map_err(|e| Error::Refused(format!("watching {}: {e}", root.display())))?;
+    .map_err(|e| Error::Refused(format!("starting the watcher: {}", watch_failure(&e))))?;
+    watcher.watch(root, RecursiveMode::Recursive).map_err(|e| {
+        Error::Refused(format!(
+            "watching {}: {}",
+            root.display(),
+            watch_failure(&e)
+        ))
+    })?;
 
     let began = Instant::now();
     task.dirty.overflow();
@@ -202,6 +242,13 @@ impl Task {
             match cmd {
                 Cmd::Event(first) => {
                     let batch = self.gather(first);
+                    if self.suggests_gone(&batch) && self.gone() {
+                        self.log.line(&format!(
+                            "{} is gone; the task ended and the watcher is closed",
+                            self.label
+                        ));
+                        return;
+                    }
                     self.ingest(batch);
                 }
                 Cmd::Turn(job) => {
@@ -238,6 +285,23 @@ impl Task {
             }
         }
         batch
+    }
+
+    /// Whether a batch holds an error or an event on the root or its `.git`, which is what deleting a
+    /// worktree reports. Everything else is a file change and is not worth a look at the disk.
+    fn suggests_gone(&self, batch: &[notify::Result<notify::Event>]) -> bool {
+        batch.iter().any(|event| match event {
+            Err(_) => true,
+            Ok(event) => event.paths.iter().any(|path| {
+                self.relative(path)
+                    .is_none_or(|rel| rel.eq_ignore_ascii_case(".git"))
+            }),
+        })
+    }
+
+    /// A removed worktree has no `.git`: `git worktree remove` takes it out with the rest.
+    fn gone(&self) -> bool {
+        !self.wt.root().join(".git").exists()
     }
 
     /// Waits until no tracked path has changed for `QUIET`, or `MAX_WAIT` has passed.
@@ -448,12 +512,20 @@ impl Task {
             ms(done),
             ms(saved)
         ));
-        Ok(Done {
+        let done = Done {
             thread: record.turn.draft.thread.to_string(),
             seq: record.turn.seq.get(),
             id: record.id.to_string(),
             changed,
-        })
+        };
+        // After the ref has moved and the state is saved: a plug-in can only come after the turn.
+        self.plugins.submit(Work {
+            root: self.wt.root().to_owned(),
+            project: self.wt.project().clone(),
+            record,
+            writer: self.writer.clone(),
+        });
+        Ok(done)
     }
 
     /// Built after the sync, so the policy is today's and `Baton-Skipped` lists what this sync skipped.

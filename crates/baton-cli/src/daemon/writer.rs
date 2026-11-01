@@ -5,8 +5,8 @@
 use super::link::Link;
 use baton_core::{
     BlobPayload, Error, MachineId, Oid, Pool, ProjectKey, Result, SideRepo, StageTimes, Stored,
-    ThreadId, TipMove, TreeEdit, TreeId, TurnDraft, TurnId, TurnRecord, UnixMillis, Verdict,
-    plan_ingest, store_ingest,
+    ThreadId, TipMove, TreeEdit, TreeId, TurnDraft, TurnId, TurnRecord, TurnVerdict, UnixMillis,
+    Verdict, plan_ingest, store_ingest,
 };
 use std::path::PathBuf;
 use std::sync::mpsc::{Sender, SyncSender, channel, sync_channel};
@@ -51,6 +51,12 @@ enum Job {
         draft: TurnDraft,
         at: UnixMillis,
         reply: SyncSender<Result<(TurnRecord, StageTimes)>>,
+    },
+    StoreVerdict {
+        turn: TurnId,
+        verdict: Box<TurnVerdict>,
+        source: &'static str,
+        reply: SyncSender<Result<()>>,
     },
     Tips(Reply<Vec<Tip>>),
     Outgoing {
@@ -127,6 +133,14 @@ impl Writer {
                             }
                             let _ = reply.send(committed);
                         }
+                        Job::StoreVerdict {
+                            turn,
+                            verdict,
+                            source,
+                            reply,
+                        } => {
+                            let _ = reply.send(repo.store_verdict(turn, &verdict, source));
+                        }
                         Job::Tips(reply) => {
                             let _ = reply.send(tips(&repo));
                         }
@@ -194,6 +208,26 @@ impl Writer {
                 tree,
                 draft,
                 at,
+                reply,
+            })
+            .map_err(|_| gone())?;
+        answer.recv().map_err(|_| gone())?
+    }
+
+    /// Stores the verdict for a committed turn. It goes through the writer like every other write to the
+    /// side repo, so a verdict never races a turn.
+    pub fn store_verdict(
+        &self,
+        turn: TurnId,
+        verdict: TurnVerdict,
+        source: &'static str,
+    ) -> Result<()> {
+        let (reply, answer) = sync_channel(1);
+        self.tx
+            .send(Job::StoreVerdict {
+                turn,
+                verdict: Box::new(verdict),
+                source,
                 reply,
             })
             .map_err(|_| gone())?;

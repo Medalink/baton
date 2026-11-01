@@ -46,6 +46,12 @@ struct RawUserRedact {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawWatch {
+    max_repo_worktrees: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawServer {
     url: Option<String>,
     token: Option<String>,
@@ -53,9 +59,22 @@ struct RawServer {
     ca_file: Option<String>,
 }
 
+/// The plug-in tables of the user config. `plugin_config` reads them; `UserConfig` only has to let them
+/// pass, so a mistake in one never stops capture.
+type PluginTable = Option<toml::Value>;
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(
+    dead_code,
+    reason = "parsed so the file loads; `Plugins` reads these tables"
+)]
 struct RawUser {
+    classify: PluginTable,
+    decide: PluginTable,
+    notify: PluginTable,
+    lens: PluginTable,
+    agents: PluginTable,
     #[serde(default)]
     machine: RawMachine,
     server: Option<RawServer>,
@@ -63,6 +82,8 @@ struct RawUser {
     snapshot: RawSnapshot,
     #[serde(default)]
     redact: RawUserRedact,
+    #[serde(default)]
+    watch: RawWatch,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -76,6 +97,14 @@ struct RawRepoRedact {
 #[serde(deny_unknown_fields)]
 struct RawRepo {
     project: Option<String>,
+    // Tables only the user config may hold. They parse, so a clone that carries one still records, and
+    // they are never read: `RepoConfig` has no field for a command, a rule or a lens, and so cannot
+    // hand one on.
+    classify: PluginTable,
+    decide: PluginTable,
+    notify: PluginTable,
+    lens: PluginTable,
+    agents: PluginTable,
     #[serde(default)]
     snapshot: RawSnapshot,
     #[serde(default)]
@@ -103,13 +132,19 @@ impl From<RawSnapshot> for SnapshotConfig {
 
 /// `~/.config/baton/config.toml`. Only this file can name `value_files`: literal secrets differ per
 /// machine, so blob ids of a file containing one can differ between machines.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct UserConfig {
     pub machine: Option<MachineId>,
     pub server: Option<ServerConfig>,
     pub snapshot: SnapshotConfig,
     pub value_files: Vec<PathBuf>,
+    /// At most this many worktrees of enrolled repositories are watched at once.
+    pub max_repo_worktrees: usize,
 }
+
+/// Default for `[watch] max_repo_worktrees`. The design target is 30 active agents, so the cap sits well
+/// above that; each watched worktree costs one watcher handle (a kernel watch per directory on Linux).
+pub const DEFAULT_MAX_REPO_WORKTREES: usize = 64;
 
 /// `ws://host:port/path` or `wss://host:port/path`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -244,6 +279,8 @@ pub struct RepoConfig {
     pub project: Option<ProjectKey>,
     pub snapshot: SnapshotConfig,
     pub rules: Vec<RuleSpec>,
+    /// What the file held that only the user config may hold; the daemon logs it.
+    pub notices: Vec<String>,
 }
 
 fn read_optional(path: &Path) -> Result<Option<String>> {
@@ -265,6 +302,18 @@ fn expand_home(raw: &str) -> PathBuf {
     match raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
         Some(rest) => dirs::home_dir().map_or_else(|| PathBuf::from(raw), |h| h.join(rest)),
         None => PathBuf::from(raw),
+    }
+}
+
+impl Default for UserConfig {
+    fn default() -> Self {
+        Self {
+            machine: None,
+            server: None,
+            snapshot: SnapshotConfig::default(),
+            value_files: Vec::new(),
+            max_repo_worktrees: DEFAULT_MAX_REPO_WORKTREES,
+        }
     }
 }
 
@@ -293,6 +342,11 @@ impl UserConfig {
                 .iter()
                 .map(|p| expand_home(p))
                 .collect(),
+            max_repo_worktrees: raw
+                .watch
+                .max_repo_worktrees
+                .unwrap_or(DEFAULT_MAX_REPO_WORKTREES)
+                .max(1),
         })
     }
 }
@@ -304,7 +358,21 @@ impl RepoConfig {
             return Ok(Self::default());
         };
         let raw: RawRepo = toml::from_str(&text).map_err(|e| config_error(&path, e))?;
+        let notices = [
+            ("classify", &raw.classify),
+            ("decide", &raw.decide),
+            ("notify", &raw.notify),
+            ("lens", &raw.lens),
+            ("agents", &raw.agents),
+        ]
+        .into_iter()
+        .filter(|(_, table)| table.is_some())
+        .map(|(name, _)| {
+            format!(".baton/config.toml sets [{name}], which only the user config may; ignored")
+        })
+        .collect();
         Ok(Self {
+            notices,
             project: raw.project.as_deref().map(ProjectKey::parse).transpose()?,
             snapshot: raw.snapshot.into(),
             rules: raw.redact.rule,
@@ -346,7 +414,7 @@ impl Settings {
             .chain(&repo.snapshot.store_secret_named)
             .cloned()
             .collect();
-        let mut notices = Vec::new();
+        let mut notices = repo.notices.clone();
         if !repo.snapshot.store_whole.is_empty() {
             notices.push(
                 ".baton/config.toml sets store_whole, which only the user config may; ignored"

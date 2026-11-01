@@ -4,7 +4,8 @@
 #
 #   e2e/sync.sh                     uses target/release/baton, building it when missing
 #   BATON_BIN=/path/baton e2e/sync.sh
-#   BATON_E2E_BIG_REPO=/path/to/a/large/repo   the tree copied for the latency run (git archive HEAD)
+#   BATON_E2E_BIG_REPO=/path/to/a/large/repo   the tree copied for the latency run (git archive HEAD); without it
+#                                   the latency run is skipped, except on the owner's Windows box
 #   BATON_E2E_TURNS=100             turns timed in the latency run
 #   BATON_E2E_PORT=47880            the main server; the TLS, command-auth and raw-wire servers take the next three
 #   BATON_E2E_BURST=30              threads in the burst
@@ -23,7 +24,8 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 exe=""
 [[ ${OSTYPE:-} == msys* || ${OSTYPE:-} == cygwin* ]] && exe=".exe"
 BIN=${BATON_BIN:-$root/target/release/baton$exe}
-BIG_REPO=${BATON_E2E_BIG_REPO:-E:/Dev/Laravel/iris}
+BIG_REPO=${BATON_E2E_BIG_REPO:-}
+[[ -z $BIG_REPO && -n $exe ]] && BIG_REPO=E:/Dev/Laravel/iris # the owner's Windows default; elsewhere the latency run is skipped unless set
 TURNS=${BATON_E2E_TURNS:-100}
 PORT=${BATON_E2E_PORT:-47880}
 BURST=${BATON_E2E_BURST:-30}
@@ -657,6 +659,8 @@ await "the next turn reaches B" 10000 everywhere t1 "$T4_A" b
 file_has() { grep -q -- "$2" "$1"; }
 await "follow applies a path nobody touched here" 10000 file_has "$TMP/pulled/a.txt" "next from a"
 await "follow prints the turn" 10000 log_has "$TMP/follow.out" "fourth turn from a"
+# The turn is printed before its files are written, so wait for the report that ends the apply.
+await "follow reports what it applied" 10000 log_has "$TMP/follow.out" "kept b.txt"
 check "follow added the new file" test -f "$TMP/pulled/src/new.rs"
 eq "follow kept the locally edited path" "edited here" "$(cat "$TMP/pulled/b.txt")"
 contains "follow says it kept b.txt and why" "$(cat "$TMP/follow.out")" "kept b.txt"

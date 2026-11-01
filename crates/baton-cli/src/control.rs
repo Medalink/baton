@@ -9,6 +9,8 @@ pub enum Request {
     Ping,
     Enroll { path: String },
     Unenroll { path: String },
+    EnrollRepo { path: String },
+    UnenrollRepo { path: String },
     Turn(TurnArgs),
     Status,
 }
@@ -29,6 +31,14 @@ pub struct WorktreeStatus {
     pub project: String,
     pub files: usize,
     pub tree: String,
+    /// The repository it was enrolled through, or none for a worktree enrolled by itself.
+    pub repo: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RepoStatus {
+    pub dir: String,
+    pub active: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -47,6 +57,17 @@ pub enum Reply {
         root: String,
         was_enrolled: bool,
     },
+    EnrolledRepo {
+        dir: String,
+        project: String,
+        already: bool,
+        cap: usize,
+    },
+    UnenrolledRepo {
+        dir: String,
+        was_enrolled: bool,
+        stopped: usize,
+    },
     Turned {
         thread: String,
         seq: u32,
@@ -57,6 +78,8 @@ pub enum Reply {
         pid: u32,
         up_secs: u64,
         worktrees: Vec<WorktreeStatus>,
+        repos: Vec<RepoStatus>,
+        cap: usize,
     },
     Failed {
         message: String,

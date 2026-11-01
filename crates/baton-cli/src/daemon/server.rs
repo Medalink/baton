@@ -122,25 +122,28 @@ async fn listen(
 
 #[cfg(unix)]
 pub async fn serve(daemon: Arc<Daemon>) -> Result<()> {
+    use anyhow::Context as _;
     use std::os::unix::fs::PermissionsExt;
-    let path = crate::endpoint::socket_path();
-    let dir = path
-        .parent()
-        .ok_or_else(|| anyhow!("socket path has no directory"))?;
-    std::fs::create_dir_all(dir)?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    let path = crate::endpoint::socket_path()?;
+    crate::endpoint::prepare_socket_dir(&path)?;
     // The single-instance lock is held, so a socket file left here belongs to a dead daemon.
     let _ = std::fs::remove_file(&path);
-    let listener = tokio::net::UnixListener::bind(&path)?;
+    let listener = tokio::net::UnixListener::bind(&path)
+        .with_context(|| format!("binding {}", path.display()))?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     daemon.log.line(&format!("listening on {}", path.display()));
+    // SIGTERM is how `kill`, systemd and a logout ask a process to stop; Ctrl-C is SIGINT.
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
                 tokio::spawn(handle(Arc::clone(&daemon), stream));
             }
-            _ = tokio::signal::ctrl_c() => return Ok(()),
+            _ = tokio::signal::ctrl_c() => break,
+            _ = terminate.recv() => break,
         }
     }
+    let _ = std::fs::remove_file(&path);
+    Ok(())
 }
