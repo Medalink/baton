@@ -5,12 +5,17 @@ use crate::error::{Error, Result};
 use crate::id::RelPath;
 use crate::ignore::IgnoreRules;
 use crate::redact::{Redactor, load_literals};
+use crate::secret_names::SecretNames;
 use globset::{GlobSet, GlobSetBuilder};
 use std::path::Path;
 
 const BINARY_PROBE_BYTES: usize = 8 * 1024;
 
-fn globs(patterns: &[String], what: &'static str, include_below: bool) -> Result<GlobSet> {
+pub(crate) fn globs(
+    patterns: &[String],
+    what: &'static str,
+    include_below: bool,
+) -> Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     for raw in patterns {
         let pattern = raw.trim_start_matches('/');
@@ -42,6 +47,7 @@ pub struct StorePolicy {
     ignore: IgnoreRules,
     exclude: GlobSet,
     whole: GlobSet,
+    secret_names: SecretNames,
     max_file_bytes: u64,
     redactor: Redactor,
     notices: Vec<String>,
@@ -57,8 +63,10 @@ impl StorePolicy {
             .chain(redactor.notices())
             .cloned()
             .collect();
+        let ignore = IgnoreRules::discover(worktree)?;
         Ok(Self {
-            ignore: IgnoreRules::discover(worktree)?,
+            secret_names: SecretNames::new(ignore.case(), &settings.store_secret_named)?,
+            ignore,
             exclude: globs(&settings.exclude, "exclude glob", true)?,
             whole: globs(&settings.store_whole, "store_whole glob", false)?,
             max_file_bytes: settings.max_file_bytes,
@@ -94,6 +102,12 @@ impl StorePolicy {
 
     pub(crate) fn excluded_by_config(&self, path: &str) -> bool {
         self.exclude.is_match(path)
+    }
+
+    /// The built-in rule that leaves `path` out because its name looks like a secret's, or `None`. Only an
+    /// untracked path is asked: git tracks what it should keep, and a tracked file is always stored.
+    pub(crate) fn secret_named(&self, path: &str) -> Option<&'static str> {
+        self.secret_names.rule(path)
     }
 
     pub fn exceeds_size_limit(&self, size: u64) -> bool {

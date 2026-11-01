@@ -10,6 +10,7 @@ mod plugin;
 mod policy;
 mod redact;
 mod rewind;
+mod secret_names;
 mod store;
 mod turn;
 mod wire;

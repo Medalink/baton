@@ -453,12 +453,12 @@ section_end
 
 # ==================================================================================================
 section "redacted content stays redacted"
-printf 'AWS_KEY=%s\nnote=plain\n' "$SECRET_KEY" >"$(repo_of a)/secrets.env"
+printf 'AWS_KEY=%s\nnote=plain\n' "$SECRET_KEY" >"$(repo_of a)/app.cfg"
 turn_as a sec "key $SECRET_KEY added" >/dev/null
 SEC_A=$(tip_on a sec)
 await "the turn reaches the server and B" 10000 everywhere sec "$SEC_A" b
-check "the secret is in A's working file, so the check below is not vacuous" grep -q "$SECRET_KEY" "$(repo_of a)/secrets.env"
-blob=$(gitd "$SRV_GIT" cat-file -p refs/baton/sec:secrets.env)
+check "the secret is in A's working file, so the check below is not vacuous" grep -q "$SECRET_KEY" "$(repo_of a)/app.cfg"
+blob=$(gitd "$SRV_GIT" cat-file -p refs/baton/sec:app.cfg)
 lacks "the server's blob has no AWS key" "$blob" "$SECRET_KEY"
 contains "the server's blob carries the redaction marker" "$blob" "[baton:redacted:aws-access-key]"
 for where in "$SRV_GIT" "$(side_of a)" "$(side_of b)"; do
