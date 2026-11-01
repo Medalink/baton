@@ -18,8 +18,10 @@ baton hook claude                 # agent end-of-turn hook; raw payload on stdin
 baton turn --thread T --message M [--agent A] [--model X] [--check name=code]...
 baton daemon                      # per-user process; other commands start it when absent
 baton enroll [path]               # start watching a worktree
+baton unenroll [path]             # stop watching; its history stays
+baton status
 baton log [thread]
-baton rewind <turn> [--apply]
+baton rewind <turn> [--thread T] [--apply]
 baton pull <thread> [--into dir]
 baton follow <thread>
 baton ask <question> --option a --option b
@@ -78,7 +80,8 @@ One `StorePolicy` decides, per path, whether to store it and how:
 
 - **Ignore.** Nested `.gitignore`, `.git/info/exclude`, and global excludes, plus config `exclude` globs. `.git` is never stored.
 - **Whole.** Lockfiles, files matching `store_whole` globs, and files with a NUL in the first 8 KiB are stored byte for byte, without redaction.
-- **Redact.** Every other file, and the commit message and trailers, pass through the redactor. Built-in patterns plus the project's `.baton/config.toml` patterns. User config cannot add patterns, because two machines with different lists would produce different blob ids for the same file. A match becomes `[baton:redacted:<rule>]`.
+- **Redact.** Every other file, the commit subject, and the model trailer pass through the redactor. Built-in patterns plus the project's `.baton/config.toml` patterns, which are shared through git and so identical on every machine. A match becomes `[baton:redacted:<rule>]`. A thread or agent id that redaction would change is refused rather than rewritten, because ids are keys.
+- **Literal values.** User config alone may name `[redact] value_files`: files whose contents are secrets to cut out wherever they appear. A `.json` file contributes every string value, any other file contributes every line, and values under 8 characters are dropped so a short word cannot blank out source code. A listed file that cannot be read stops the turn, since silently skipping it would store the secret. This list is per machine, so a file that contains one of these values gets a different blob id on a machine without it, and that machine's snapshot trees differ from a peer's for that file. Nothing breaks (a turn is still complete and valid on its own), but it is the one place two machines can disagree about the same bytes. Project patterns do not have this problem, which is why the project config is the place for anything every machine should agree on.
 - **Skip.** Files over `max_file_bytes` (default 64 MiB) are left out and listed in a `Baton-Skipped:` trailer.
 
 ## Daemon
@@ -93,9 +96,9 @@ One daemon per user. Single owners, no shared locks:
 
 Turn path: the hook writes one frame to the local pipe and exits. The daemon's IPC task parses it through the agent adapter into a `TurnRequest`, routes it to the worktree task, which drains its dirty set and calls `snapshot_from_dirty` on the project writer. The writer writes blobs, edits the previous tree with gix's tree editor, writes the commit, moves `refs/baton/<thread>` by compare-and-swap, and hands the new objects to the link.
 
-Worktree discovery of what changed is settled by measurement in `tools/bench` (see Open questions): a file watcher with rescan on overflow, a stat sweep against a private stat cache, or both.
+Worktree discovery of what changed is a file watcher feeding a dirty set, with a full rescan on start, on overflow or any watcher error, and when `.gitignore`, `.git/info/exclude`, or `.baton/config.toml` changes (see Decisions). Only enrolled worktrees are watched, so enrollment is the allowlist.
 
-Local IPC: a named pipe `\\.\pipe\baton-<user>` on Windows, a unix socket `<runtime dir>/baton/daemon.sock` with mode 0600 elsewhere. The hook computes the path without reading config.
+Local IPC: a named pipe `\\.\pipe\baton-<user>` on Windows, a unix socket `$XDG_RUNTIME_DIR/baton/daemon.sock` (else `<tmp>/baton-<uid>/daemon.sock`) with mode 0600 in a 0700 directory elsewhere. The hook computes the name without reading config. When `BATON_HOME` is set, data, config, and the endpoint all live under it, which is how the e2e run stays hermetic. The same endpoint carries two frame types: `BTN1` hook frames, which get no reply, and `BTC1` control frames (a JSON request, a `u32` LE length and JSON reply) used by `enroll`, `unenroll`, `turn`, and `status`. One endpoint keeps single-instance and permissions in one place.
 
 ## Hook contract
 
@@ -104,6 +107,7 @@ Local IPC: a named pipe `\\.\pipe\baton-<user>` on Windows, a unix socket `<runt
 - A missing pipe or socket, a full pipe, or any error means exit 0 with nothing written.
 - A 50 ms watchdog calls `exit(0)`. The body runs under `catch_unwind`, and the release profile keeps `panic = "unwind"`.
 - Never prints to stdout or stderr. Never spawns the daemon.
+- The argument is the adapter name (`claude`). The turn records the agent as `claude-code`.
 
 ## Server
 
@@ -151,10 +155,45 @@ Verdicts never rewrite a turn commit. They are stored on `refs/baton-verdict/<tu
 
 `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, real runs of the binaries, measurement tools under `tools/`, and end-to-end scenarios under `e2e/` that drive the real binaries. No unit tests and no CI workflows.
 
-## Open questions settled by `tools/bench`
+## Decisions
 
-1. Cost of a gix loose-object write on Windows, serial and parallel, which decides whether turns persist as loose objects or one pack per turn.
-2. Cost of a full stat sweep of a large worktree with ignore rules, which decides watcher, sweep, or both.
-3. Cost of a tree edit and commit for a three-file turn on a 9,700-file baseline.
-4. Wall time of starting the `baton` binary and writing one pipe frame on Windows.
-5. Whether gix stores the empty blob, and whether its excludes stack honors nested `.gitignore` the same way `git check-ignore` does.
+`tools/bench` measured the questions this section used to list. The numbers below are from `tools/bench` on Windows unless a row says `e2e/local.sh`, which drives the release binary on the same machine against a copy of the IRIS tree (7,384 files, 7,359 of them stored).
+
+| Question | Decision | Evidence |
+|---|---|---|
+| Loose objects or a pack per turn | Loose objects, written serially by the project's one writer thread | 12 objects take about 1.2 ms serially. A pack per turn is no faster. Threaded writes stalled once near 150 ms. |
+| Tree edit | Plumbing `gix::objs::tree::Editor` on the previous tree. Never `Repository::edit_tree` | About 5 ms for a 3-file turn on 9,700 files, against 53 ms, because `edit_tree` probes the object database per entry. In the daemon, sync plus commit plus ref update for the 3-file turns of the latency run take a median 3.9 ms. |
+| Empty blob | Written explicitly, and the empty tree only when a commit needs it | `write_blob(b"")` does not store the empty blob. `e2e/local.sh` checks it with `git cat-file -e` and runs `fsck --strict --no-dangling` over the side repo. |
+| Ignore rules | gix excludes over an empty in-memory index, for every decision | It matches `git check-ignore` exactly. The `ignore` crate disagrees on repo-local `core.excludesFile` and on nested repos. |
+| Baseline | gix dirwalk (paths only) with the excludes stack, then chunked writes of 4,096 files or 64 MiB with no commit and no ref | The dirwalk costs 58 ms on 9,700 files. Enrolling the IRIS copy stores 7,359 files in 1.6 s (`e2e/local.sh`), almost all of it reading, hashing, and writing the objects. |
+| Finding what changed | A file watcher feeds a per-worktree dirty set. A full rescan runs on start, on overflow or any watcher error, and when `.gitignore`, `.git/info/exclude`, or `.baton/config.toml` changes. No periodic stat sweep | The dirwalk is cheap enough to be the backstop. A create, remove, or rename re-reads that subtree, because the watcher cannot say what a directory move carried. |
+| Quiescence | A turn waits for 5 ms without events, and at most 30 ms | The hook can fire before the last write reaches the watcher. 0 of 50 writes made immediately before the hook were missed (`e2e/local.sh`). |
+| Racy files | A file whose mtime is within 2 s of the time it was read is read again at the next turn | Same rule git uses for its index: equal size and mtime do not prove equal content inside the timestamp's resolution. |
+| Hook cost | A 50 ms watchdog, one frame to the endpoint, exit 0 | Spawn to frame received is about 5.5 ms in the bench. Timed from Git Bash, which adds its own fork and exec cost, a hook process takes a median 33 ms and 44 ms at p95 against a running daemon (`e2e/local.sh`), so the bench figure is the better measure of the hook itself. |
+| First ref compare-and-swap stall of 2 to 3 s | Did not reproduce | Slowest first ref update per new side repo and thread was 1.4 ms, 9.5 ms, and 1.3 ms in three full runs, and no update of any kind took over a second. The stage times are logged per turn in `daemon.log` (`sync`, `commit`, `ref`, `save`, `total`), so a recurrence shows which stage it was. |
+
+Latency from `e2e/local.sh`, 100 turns of three edited files on the 7,384-file IRIS copy, daemon already running, measured in bash from just before the hook starts until `refs/baton/<thread>` changes:
+
+| Span | p50 | p95 |
+|---|---|---|
+| Hook call to ref moved | 58.4 ms | 68.9 ms |
+| of which the hook process, spawn to exit | 33.2 ms | 47.9 ms |
+| of which hook exit to ref moved | 21.9 ms | 31.2 ms |
+
+Inside the daemon the median turn takes 3.5 ms to sync, 0.3 ms to commit, 0.2 ms to move the ref, and 3.9 ms in all. The rest of hook exit to ref moved is the 5 ms quiescence wait and the script's own polling of the ref file. A target of 50 ms from hook call to the ref visible on a second machine cannot be judged from this run: p50 on one machine is already 58 ms, and most of that is process spawn under Git Bash and the polling, which a native agent hook does not pay. This slice has no network, so the second-machine figure belongs to the sync slice.
+
+### Behavior fixed by this slice
+
+- The first line of a hook run decides the agent from its argument (`claude`). The turn records the adapter's own name (`claude-code`).
+- `rewind` never deletes a file. It refuses a file whose stored copy has a redaction marker, a file whose parent is a symlink, any symlink on Windows, and a file whose content on disk is not what the last snapshot stored (take a turn first). `--apply` writes the files it can, lists the ones it refused, and exits 1 if any were refused. It compares contents, not timestamps, since two writes inside one timestamp tick are indistinguishable by mtime.
+- `log` shows each turn's changed paths as a diff against the thread's previous turn, and for a thread's first turn only the number of files in its tree.
+- `Baton-Skipped` values are escaped so a path cannot add a trailer line.
+- A turn is a sync of the worktree followed by one commit on the thread's tip. The tree belongs to the worktree and the parent chain to the thread, so a turn's diff against its parent can include changes another thread in the same worktree made in between.
+- The writer removes stale ref `.lock` files left in a side repo by a killed daemon when it starts. `e2e/local.sh` kills the daemon during a 60 MB write five times and checks that `fsck` passes, no lock is left, and the restarted daemon captures the file correctly.
+- A non-hook, non-daemon command starts the daemon when it is absent, with its standard handles closed, so `$(baton status)` in a shell returns.
+
+### Differences from the sections above
+
+- Control commands share the hook's endpoint through a second frame type, `BTC1`, rather than listening on another.
+- `pull`, `follow`, `ask`, `serve`, and `admin` are not in this slice, nor are the other agent adapters. Only `claude` is.
+- The state of each worktree's stat cache and current tree is saved to `<data>/worktrees/<hash>.json` after each turn and after the baseline. It is a mirror of the side repo, so a lost or unreadable file costs one rescan, not data.
