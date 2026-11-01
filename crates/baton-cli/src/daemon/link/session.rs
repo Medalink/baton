@@ -17,7 +17,7 @@ use baton_core::{
 };
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::time::{interval, timeout};
@@ -73,7 +73,9 @@ struct Session<'a> {
     /// Tips the server refused for good, so they are not offered again until the thread moves on.
     blocked: HashMap<Key, TurnId>,
     follows: HashMap<Key, Follow>,
-    waiting: HashMap<u32, Key>,
+    /// The threads of the `want`s sent, oldest first. The server answers them in order, and its
+    /// `objects_sent` carries its own transfer number, so order is the only thing that pairs them.
+    waiting: VecDeque<Key>,
     pool: Pool,
     unsynced: BTreeSet<ProjectKey>,
     xfer: u32,
@@ -131,7 +133,7 @@ pub async fn run(
         stale: HashMap::new(),
         blocked: HashMap::new(),
         follows: HashMap::new(),
-        waiting: HashMap::new(),
+        waiting: VecDeque::new(),
         pool: Pool::default(),
         unsynced: BTreeSet::new(),
         xfer: 1,
@@ -304,10 +306,14 @@ impl Session<'_> {
                 }
                 self.follow(key, new).await
             }
-            Control::ObjectsSent { xfer } => {
-                let Some(key) = self.waiting.remove(&xfer) else {
+            Control::ObjectsSent { .. } => {
+                let Some(key) = self.waiting.pop_front() else {
                     return Ok(());
                 };
+                // A later answer for the same thread is still coming; judge after the last one.
+                if self.waiting.contains(&key) {
+                    return Ok(());
+                }
                 match self.follows.get(&key).map(|f| f.new) {
                     Some(new) => self.follow(key, new).await,
                     None => Ok(()),
@@ -603,7 +609,6 @@ impl Session<'_> {
                     .is_some_and(|f| f.new == new && f.asked == ids);
                 if repeated {
                     self.follows.remove(&key);
-                    self.waiting.retain(|_, waiting| waiting != &key);
                     self.log.line(&format!(
                         "sync: the server could not send {} objects of {}",
                         ids.len(),
@@ -617,8 +622,7 @@ impl Session<'_> {
                         ids: ids.clone(),
                     })
                     .await?;
-                    self.waiting.retain(|_, waiting| waiting != &key);
-                    self.waiting.insert(xfer, key.clone());
+                    self.waiting.push_back(key.clone());
                     self.follows.insert(key, Follow { new, asked: ids });
                 }
             }

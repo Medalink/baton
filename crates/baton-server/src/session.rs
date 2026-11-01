@@ -25,6 +25,8 @@ use tokio_tungstenite::tungstenite::{Bytes, Message};
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 const HEARTBEAT: Duration = Duration::from_secs(15);
 const SILENCE: Duration = Duration::from_secs(60);
+/// A client that stops reading must not hold a session (and its broadcast queue) forever.
+const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PROJECTS: usize = 256;
 const HEADS_PER_MESSAGE: usize = 1000;
 const POOL_MAX: usize = 512 << 20;
@@ -94,10 +96,15 @@ where
     }
 
     async fn send_frames(&mut self, frames: Vec<Vec<u8>>) -> Result<()> {
-        for frame in frames {
-            self.ws.feed(Message::Binary(Bytes::from(frame))).await?;
-        }
-        self.ws.flush().await?;
+        let ws = &mut self.ws;
+        timeout(SEND_TIMEOUT, async {
+            for frame in frames {
+                ws.feed(Message::Binary(Bytes::from(frame))).await?;
+            }
+            ws.flush().await
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("the client did not read for {SEND_TIMEOUT:?}"))??;
         Ok(())
     }
 
