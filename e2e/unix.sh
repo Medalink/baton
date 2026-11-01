@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # End-to-end run of the parts of baton that only exist on unix, against the real release binary: the socket
-# at mode 0600 in a 0700 directory, where `XDG_RUNTIME_DIR` and `TMPDIR` put it, a `BATON_HOME` too deep for
-# `sun_path`, the daemon detached by `setsid`, SIGTERM and SIGKILL, inotify, and the inotify watch limit.
+# at mode 0600 in the data dir (0700), the same socket whatever `XDG_RUNTIME_DIR`, `TMPDIR` or spelling of the
+# home a process has, a `BATON_HOME` too deep for `sun_path` and its fixed /tmp socket, a poisoned /tmp
+# directory, the daemon detached by `setsid`, SIGTERM and SIGKILL, inotify, and the inotify watch limit.
 #
 #   e2e/unix.sh                     uses target/release/baton, building it when missing
 #   BATON_BIN=/path/baton e2e/unix.sh
@@ -93,9 +94,17 @@ cleanup() {
     [[ -n $pid ]] && kill -9 "$pid" 2>/dev/null
   done
   sleep 0.2
+  for sock in "${SHORT_SOCKS[@]:-}"; do [[ -n $sock ]] && rm -f "$sock"; done
+  if ((short_existed == 0)); then
+    [[ -L $SHORT_DIR && $(readlink "$SHORT_DIR") == "$TMP/elsewhere" ]] && rm -f "$SHORT_DIR"
+    [[ -d $SHORT_DIR && ! -L $SHORT_DIR ]] && rmdir "$SHORT_DIR" 2>/dev/null
+  fi
   rm -rf "$TMP"
 }
 HOMES=()
+SHORT_SOCKS=()
+short_existed=1
+SHORT_DIR=/tmp/baton-$UID_NOW
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
 
@@ -110,14 +119,15 @@ DATA="$HOME/.local/share/baton"
 real_before=$(stat -c %Y "$REAL_HOME/.local/share/baton" 2>/dev/null || stat -f %m "$REAL_HOME/.local/share/baton" 2>/dev/null || echo none)
 
 # --------------------------------------------------------------------------------------------------
-section "the socket under XDG_RUNTIME_DIR"
+section "the socket in the data dir"
 out=$("$BIN" enroll "$REPO" 2>&1)
 contains "enroll starts the daemon and enrolls" "$out" "enrolled"
-SOCK="$XDG_RUNTIME_DIR/baton/daemon.sock"
-check "the socket is at \$XDG_RUNTIME_DIR/baton/daemon.sock" test -S "$SOCK"
+SOCK="$DATA/daemon.sock"
+check "the socket is at <data dir>/daemon.sock" test -S "$SOCK"
 eq "the socket is mode 0600" 600 "$(mode_of "$SOCK")"
-eq "its directory is mode 0700" 700 "$(mode_of "$XDG_RUNTIME_DIR/baton")"
-check "the data dir follows HOME" test -f "$DATA/daemon.lock"
+eq "the data dir is mode 0700" 700 "$(mode_of "$DATA")"
+check "the lock sits beside it" test -f "$DATA/daemon.lock"
+check "nothing is made under XDG_RUNTIME_DIR" test ! -e "$XDG_RUNTIME_DIR/baton"
 PID=$(daemon_pid)
 check "status reports a live daemon pid" alive "${PID:-0}"
 section_end
@@ -182,54 +192,116 @@ section "a permissive umask does not widen the socket"
 PID3=$(daemon_pid)
 kill -TERM "$PID3"
 await "the daemon is gone" 3000 bash -c "! kill -0 $PID3 2>/dev/null"
-rm -rf "$XDG_RUNTIME_DIR/baton"
+rm -f "$SOCK"
+chmod 755 "$DATA"
 (umask 000; "$BIN" status >/dev/null 2>&1)
 eq "the socket is mode 0600 under umask 000" 600 "$(mode_of "$SOCK")"
-eq "the directory is mode 0700 under umask 000" 700 "$(mode_of "$XDG_RUNTIME_DIR/baton")"
+eq "the data dir is mode 0700 again" 700 "$(mode_of "$DATA")"
 section_end
 
-section "without XDG_RUNTIME_DIR the socket is in the temp dir"
+section "XDG_RUNTIME_DIR and TMPDIR do not move the socket"
 PID4=$(daemon_pid)
-kill -TERM "$PID4"
-await "the daemon is gone" 3000 bash -c "! kill -0 $PID4 2>/dev/null"
-FALLBACK="$TMPDIR/baton-$UID_NOW"
-(
-  unset XDG_RUNTIME_DIR
-  "$BIN" status >"$TMP/status.out" 2>&1
-  pid=$(daemon_pid)
-  echo "$pid" >"$TMP/fallback.pid"
-)
-contains "a daemon starts" "$(cat "$TMP/status.out")" "daemon pid"
-check "the socket is at \$TMPDIR/baton-<uid>/daemon.sock" test -S "$FALLBACK/daemon.sock"
-eq "it is mode 0600" 600 "$(mode_of "$FALLBACK/daemon.sock")"
-eq "its directory is mode 0700" 700 "$(mode_of "$FALLBACK")"
-PID5=$(cat "$TMP/fallback.pid")
-kill -TERM "$PID5" 2>/dev/null
-await "that daemon is gone" 3000 bash -c "! kill -0 $PID5 2>/dev/null"
+check "a daemon is up" alive "${PID4:-0}"
+other=$(XDG_RUNTIME_DIR="$TMP/other-run" TMPDIR="$TMP/other-tmp" daemon_pid)
+eq "another XDG_RUNTIME_DIR and TMPDIR reach the same daemon" "$PID4" "$other"
+other=$(env -u XDG_RUNTIME_DIR -u TMPDIR "$BIN" status 2>&1 | sed -n 's/^daemon pid \([0-9]*\).*/\1/p')
+eq "no XDG_RUNTIME_DIR or TMPDIR reaches the same daemon" "$PID4" "$other"
+longrun="$TMP/$(printf 'r%.0s' $(seq 1 150))"
+other=$(XDG_RUNTIME_DIR="$longrun" daemon_pid)
+eq "a 150-byte XDG_RUNTIME_DIR reaches the same daemon" "$PID4" "$other"
+check "no socket appeared in those other dirs" test ! -e "$TMP/other-run/baton" -a ! -e "$TMP/other-tmp/baton-$UID_NOW" -a ! -e "$longrun/baton"
 section_end
 
-section "a BATON_HOME too deep for sun_path gets a short socket"
+section "a BATON_HOME too deep for sun_path gets a short socket in /tmp"
+sha256_of() { { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-32; }
+deep_sock() { printf '/tmp/baton-%s/%s.sock' "$UID_NOW" "$(printf %s "$(cd -P "$1/data" && pwd -P)" | sha256_of)"; }
+short_existed=0
+[[ -e $SHORT_DIR || -L $SHORT_DIR ]] && short_existed=1
 DEEP="$TMP"
 while ((${#DEEP} < 120)); do DEEP="$DEEP/deeper-than-a-socket-path-allows"; done
 DEEP="$DEEP/home"
-mkdir -p "$DEEP"
+mkdir -p "$DEEP/data"
 HOMES+=("$DEEP")
 if ((${#DEEP} + 17 > 108)); then ok "the plain path ($((${#DEEP} + 17)) bytes) would not fit sun_path"; else bad "the test home is not deep enough"; fi
+DEEP_SOCK=$(deep_sock "$DEEP")
+SHORT_SOCKS+=("$DEEP_SOCK")
 out=$(BATON_HOME="$DEEP" "$BIN" enroll "$REPO" 2>&1)
 contains "the daemon starts and enroll succeeds" "$out" "enrolled"
 check "no socket file sits in the deep BATON_HOME" test ! -e "$DEEP/data/daemon.sock"
-shortsock=$(find "$XDG_RUNTIME_DIR/baton" -name '????????.sock' | head -1)
-check "a short socket is in the runtime dir" test -S "${shortsock:-/nonexistent}"
-eq "it is mode 0600" 600 "$(mode_of "${shortsock:-/nonexistent}")"
+check "the socket is /tmp/baton-<uid>/<32 hex of SHA-256 of the data dir>.sock" test -S "$DEEP_SOCK"
+eq "it is mode 0600" 600 "$(mode_of "$DEEP_SOCK")"
+eq "its directory is mode 0700" 700 "$(mode_of "$SHORT_DIR")"
 DEEP_PID=$(BATON_HOME="$DEEP" daemon_pid)
 check "the deep home has its own live daemon" alive "${DEEP_PID:-0}"
+ln -sfn "$DEEP" "$TMP/deep-link"
+for spelling in "$DEEP/" "$TMP/deep-link" "$DEEP/../home/"; do
+  other=$(BATON_HOME="$spelling" XDG_RUNTIME_DIR="$TMP/other-run" TMPDIR="$TMP/other-tmp" daemon_pid)
+  eq "BATON_HOME spelled [${spelling#"$TMP"/}] under other XDG_RUNTIME_DIR and TMPDIR reaches that daemon" "$DEEP_PID" "$other"
+done
+other=$(BATON_HOME="$DEEP" XDG_RUNTIME_DIR="$longrun" daemon_pid)
+eq "a 150-byte XDG_RUNTIME_DIR reaches it too" "$DEEP_PID" "$other"
 DEEP2="$TMP/second"
 for _ in 1 2 3 4 5 6; do DEEP2="$DEEP2/deeper-than-a-socket-path-allows"; done
-mkdir -p "$DEEP2"
+mkdir -p "$DEEP2/data"
 HOMES+=("$DEEP2")
+SHORT_SOCKS+=("$(deep_sock "$DEEP2")")
 BATON_HOME="$DEEP2" "$BIN" status >/dev/null 2>&1
 DEEP2_PID=$(BATON_HOME="$DEEP2" daemon_pid)
 if [[ -n $DEEP2_PID && $DEEP2_PID != "${DEEP_PID:-}" ]]; then ok "a second deep home gets a second daemon"; else bad "two deep homes share a daemon" "$DEEP_PID $DEEP2_PID"; fi
+# Two homes whose FNV-1a, cut to 32 bits, is the same: the old name made them share one socket.
+if command -v python3 >/dev/null 2>&1; then
+  pair=$(python3 -I "$root/e2e/fnv32_pair.py" "$TMP/col/$(printf 'p%.0s' $(seq 1 70))/")
+  C1=$(sed -n 1p <<<"$pair")
+  C2=$(sed -n 2p <<<"$pair")
+  if [[ -n $C1 && -n $C2 ]]; then
+    mkdir -p "$C1/data" "$C2/data"
+    HOMES+=("$C1" "$C2")
+    SHORT_SOCKS+=("$(deep_sock "$C1")" "$(deep_sock "$C2")")
+    BATON_HOME="$C1" "$BIN" status >/dev/null 2>&1
+    BATON_HOME="$C2" "$BIN" status >/dev/null 2>&1
+    p1=$(BATON_HOME="$C1" daemon_pid)
+    p2=$(BATON_HOME="$C2" daemon_pid)
+    if [[ -n $p1 && -n $p2 && $p1 != "$p2" ]]; then ok "two homes with the same 32-bit FNV-1a get their own daemons"; else bad "colliding homes share a daemon" "$p1 $p2"; fi
+    check "and each has its own daemon.log" test -s "$C1/data/daemon.log" -a -s "$C2/data/daemon.log"
+  else
+    echo "  skipped: no colliding pair found"
+  fi
+else
+  echo "  skipped: the FNV collision needs python3"
+fi
+section_end
+
+section "a bad /tmp/baton-<uid> is refused with a message"
+# Only when this run made the directory: another run's sockets there must not be disturbed.
+if ((short_existed == 0)); then
+  for h in "${HOMES[@]:-}"; do
+    pid=$(BATON_HOME=$h daemon_pid)
+    [[ -n $pid ]] && kill -TERM "$pid" 2>/dev/null
+  done
+  sleep 0.5
+  for sock in "${SHORT_SOCKS[@]:-}"; do [[ -n $sock ]] && rm -f "$sock"; done
+  rmdir "$SHORT_DIR" 2>/dev/null
+  BAD="$TMP/bad-home"
+  for _ in 1 2 3 4 5 6 7; do BAD="$BAD/deeper-than-a-socket-path-allows"; done
+  mkdir -p "$BAD/data"
+  HOMES+=("$BAD")
+  mkdir "$TMP/elsewhere"
+  ln -s "$TMP/elsewhere" "$SHORT_DIR"
+  start=$(now_ms)
+  out=$(BATON_HOME="$BAD" "$BIN" status 2>&1)
+  took=$(($(now_ms) - start))
+  contains "a symlink there is refused, naming the path" "$out" "$SHORT_DIR is unusable"
+  contains "and saying what is wrong" "$out" "not a directory"
+  if ((took < 10000)); then ok "in ${took} ms, not after the 20 s wait"; else bad "it took ${took} ms"; fi
+  check "nothing was written through the symlink" test -z "$(ls -A "$TMP/elsewhere")"
+  rm -f "$SHORT_DIR"
+  mkdir -m 755 "$SHORT_DIR"
+  out=$(BATON_HOME="$BAD" "$BIN" status 2>&1)
+  contains "a group- and world-readable directory is refused" "$out" "group or other can access it"
+  rmdir "$SHORT_DIR"
+else
+  echo "  skipped: $SHORT_DIR existed before this run"
+fi
 section_end
 
 section "the inotify watch limit is named"

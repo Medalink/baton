@@ -78,24 +78,39 @@ fn spawn_daemon() -> Result<()> {
     Ok(())
 }
 
+/// What the daemon said when it stopped since `from` bytes into its log: the bind error, say, that a
+/// 20 s wait would otherwise hide.
+fn daemon_failure(log: &Path, from: u64) -> Option<String> {
+    let text = std::fs::read(log).ok()?;
+    let text = String::from_utf8_lossy(text.get(from as usize..)?);
+    let line = text.lines().rfind(|l| l.contains("daemon stopped: "))?;
+    Some(line.split_once("daemon stopped: ")?.1.to_owned())
+}
+
 pub fn ensure_daemon() -> Result<()> {
     if daemon_is_up() {
         return Ok(());
     }
+    // A path that cannot exist is an error now, not a 20 s wait.
+    #[cfg(unix)]
+    endpoint::socket_path().context("finding the daemon socket")?;
+    let log = Dirs::resolve().map(|d| d.log_file()).unwrap_or_default();
+    let log_start = std::fs::metadata(&log).map_or(0, |m| m.len());
     spawn_daemon()?;
     let deadline = Instant::now() + DAEMON_START_DEADLINE;
     while Instant::now() < deadline {
         if daemon_is_up() {
             return Ok(());
         }
+        if let Some(why) = daemon_failure(&log, log_start) {
+            bail!("the daemon could not start: {why}; see {}", log.display());
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
-    let log = Dirs::resolve()
-        .map(|d| d.log_file().display().to_string())
-        .unwrap_or_default();
     bail!(
-        "the daemon did not start within {}s; see {log}",
-        DAEMON_START_DEADLINE.as_secs()
+        "the daemon did not start within {}s; see {}",
+        DAEMON_START_DEADLINE.as_secs(),
+        log.display()
     )
 }
 
