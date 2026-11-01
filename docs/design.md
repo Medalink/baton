@@ -48,7 +48,7 @@ baton admin [--data dir] reindex|threads
 `ThreadId`, `MachineId`, `ProjectKey`, `TurnId`, `TreeId`, `BlobId` are newtypes with private fields and a `parse` constructor. A value that exists is valid. Ref names are derived from them in one function, `turn_ref(thread) -> refs/baton/<thread>`, and the wire carries ids, never ref names, so a peer cannot name an arbitrary ref.
 
 - `ThreadId` is the agent's session id, matching `^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$`.
-- `ProjectKey` comes from `.baton/config.toml` `project`, else the normalized `origin` URL. With neither, enrollment is refused.
+- `ProjectKey` comes from `.baton/config.toml` `project`, else the normalized URL of `origin`, else of the repo's only remote. Only remotes named in the repo's own config (`.git/config`, `config.worktree`) count, so the user's global git config cannot change a key. With no such remote, or several and none named `origin`, enrollment is refused.
 - `MachineId` comes from user config, defaulting to the hostname. The server takes the authoritative value from auth.
 
 ## Where turns live

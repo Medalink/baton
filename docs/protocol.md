@@ -6,7 +6,7 @@ This file defines everything a third party needs to talk to baton: the WebSocket
 
 - Object ids are lowercase hex SHA-1 strings in JSON and 20 raw bytes in binary frames.
 - `thread` is a thread id matching `^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$`.
-- `project` is a project key: lowercase, `[a-z0-9._-]` and `/`, no leading or trailing `/`, no `..`, at most 200 bytes. It is derived from the origin URL as `host/path` without a `.git` suffix, or set in `.baton/config.toml`.
+- `project` is a project key: lowercase, `[a-z0-9._-]` and `/`, no leading or trailing `/`, no `..`, at most 200 bytes. It is derived from the URL of the repo's `origin` remote (or of its only remote, when it has no `origin`; remotes from the global git config do not count) as `host/path` without a `.git` suffix, or set in `.baton/config.toml`.
 - Times are Unix milliseconds.
 
 ## Transport
