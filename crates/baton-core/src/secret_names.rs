@@ -75,25 +75,31 @@ pub(crate) struct SecretNames {
 }
 
 impl SecretNames {
-    /// `allowed` is the user's `store_secret_named`. Under `core.ignorecase` every glob and every path is
-    /// folded to ASCII lower case, as git folds; otherwise both are compared exactly.
+    /// `allowed` is the user's `store_secret_named`, matched as `exclude` is: folded under
+    /// `core.ignorecase`, exact otherwise. The built-in names always ignore ASCII case, on every file
+    /// system: `Password.txt` or `ID_RSA` in a case-sensitive repo is no less a secret, and a file left out
+    /// by mistake costs less than one stored by mistake.
     pub(crate) fn new(case: Case, allowed: &[String]) -> Result<Self> {
-        let fold =
-            |patterns: &[&str]| -> Vec<String> { patterns.iter().map(|p| case.key(p)).collect() };
+        let lower = |patterns: &[&str]| -> Vec<String> {
+            patterns.iter().map(|p| p.to_ascii_lowercase()).collect()
+        };
         let folded_allowed: Vec<String> = allowed.iter().map(|p| case.key(p)).collect();
         Ok(Self {
             case,
             allowed: globs(&folded_allowed, "store_secret_named glob", true)?,
-            exempt: globs(&fold(EXEMPT), "exempt names", false)?,
-            hard: globs(&fold(HARD), "secret names", false)?,
-            soft: globs(&fold(SOFT), "secret names", false)?,
+            exempt: globs(&lower(EXEMPT), "exempt names", false)?,
+            hard: globs(&lower(HARD), "secret names", false)?,
+            soft: globs(&lower(SOFT), "secret names", false)?,
         })
     }
 
     /// The rule that makes `path` look like a secret, or `None` when it is fine to store.
     pub(crate) fn rule(&self, path: &str) -> Option<&'static str> {
-        let key = self.case.key(path);
-        if self.allowed.is_match(&key) || self.exempt.is_match(&key) {
+        if self.allowed.is_match(self.case.key(path)) {
+            return None;
+        }
+        let key = path.to_ascii_lowercase();
+        if self.exempt.is_match(&key) {
             return None;
         }
         if let Some(&i) = self.hard.matches(&key).first() {
