@@ -292,12 +292,12 @@ mk_machine() {
   } >"$h/config/config.toml"
 }
 
-server_listening() { local n; n=$(grep -c 'listening on' "$1" 2>/dev/null || true); ((${n:-0} > $2)); }
+server_listening() { local n; n=$(grep -cE 'listening on wss?://' "$1" 2>/dev/null || true); ((${n:-0} > $2)); }
 
 start_server() { # start_server tag data port [serve args...]
   local tag=$1 data=$2 port=$3 log="$TMP/server-$1.log" before
   shift 3
-  before=$(grep -c 'listening on' "$log" 2>/dev/null || true)
+  before=$(grep -cE 'listening on wss?://' "$log" 2>/dev/null || true)
   "$BIN" serve --data "$data" --listen "127.0.0.1:$port" --trace "$@" 2>>"$log" &
   SERVER_PID[$tag]=$(native_pid $!)
   await "server $tag listens on $port" 10000 server_listening "$log" "${before:-0}"
