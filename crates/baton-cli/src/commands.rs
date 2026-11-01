@@ -153,7 +153,11 @@ pub fn unenroll(path: Option<&Path>) -> Result<()> {
     match send(&Request::Unenroll {
         path: path.to_string_lossy().into_owned(),
     })? {
-        Reply::Unenrolled { root, was_enrolled } => {
+        Reply::Unenrolled {
+            root,
+            was_enrolled,
+            via_repo,
+        } => {
             println!(
                 "{} {root}",
                 if was_enrolled {
@@ -162,6 +166,11 @@ pub fn unenroll(path: Option<&Path>) -> Result<()> {
                     "was not enrolled:"
                 }
             );
+            if via_repo {
+                println!(
+                    "its repository is still enrolled, so its next turn enrolls it again; `baton unenroll --repo` stops the repository"
+                );
+            }
             Ok(())
         }
         other => bail!("unexpected reply: {other:?}"),
@@ -204,11 +213,17 @@ pub fn unenroll_repo(path: Option<&Path>) -> Result<()> {
             dir,
             was_enrolled,
             stopped,
+            opted_out,
         } => {
             if was_enrolled {
                 println!("unenrolled repository {dir} ({stopped} worktrees stopped)");
             } else {
                 println!("repository was not enrolled: {dir}");
+            }
+            if opted_out {
+                println!(
+                    "[enroll] projects names its project, so it is opted out: no turn enrolls it again, across daemon restarts. To undo, run `baton enroll --repo` in it"
+                );
             }
             Ok(())
         }
@@ -259,6 +274,7 @@ pub fn status() -> Result<()> {
             repos,
             cap,
             projects,
+            opted_out,
         } => {
             println!(
                 "daemon pid {pid}, up {up_secs}s, {} enrolled",
@@ -286,6 +302,11 @@ pub fn status() -> Result<()> {
             }
             if !projects.is_empty() {
                 println!("enroll projects: {}", projects.join(", "));
+            }
+            for dir in opted_out {
+                println!(
+                    "opted out of [enroll] projects: {dir}  (undo: baton enroll --repo, run in it)"
+                );
             }
             Ok(())
         }

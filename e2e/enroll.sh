@@ -168,7 +168,7 @@ linked() { # linked repo dir branch file : a linked worktree with its own commit
 }
 
 set_config() { printf '%s\n' "$@" >"$CONFIG"; }
-status() { "$BIN" status 2>&1; }
+status() { "$BIN" status 2>&1 | tr '\' '/'; } # paths with forward slashes on every platform
 
 # --------------------------------------------------------------------------------------------------
 section "no list: a repository is not recorded, so the daemon has nothing to enroll by"
@@ -308,6 +308,73 @@ check "never more than the cap of two are watched" test "$via" -le 2
 contains "status reports the cap" "$out" "at most 2"
 printf 'late\n' >"$TMP/c-wt1/late.txt"
 if turn_lands "$TMP/c-wt1" c1; then ok "an unwatched worktree is recorded again at its next turn"; else bad "evicted worktree dropped"; fi
+section_end
+
+# --------------------------------------------------------------------------------------------------
+section "unenroll --repo sticks for a repository the list brought in, across a daemon restart"
+SIDE=$(side_of listed)
+printf 'live\n' >"$TMP/l-wt1/live.txt"
+turn_lands "$TMP/l-wt1" u0 >/dev/null || bad "the listed repository was not recording before the unenroll"
+out=$(cd "$L" && "$BIN" unenroll --repo 2>&1)
+contains "unenroll --repo says it stopped the repository" "$out" "unenrolled repository"
+contains "and that it is opted out" "$out" "opted out"
+contains "and how to undo it" "$out" "baton enroll --repo"
+if turn_ignored "$TMP/l-wt1" u1; then ok "a hook from the worktree it was recording is now ignored"; else bad "hook not ignored after unenroll --repo"; fi
+if turn_ignored "$TMP/l-wt2" u2; then ok "and one from another worktree"; else bad "hook from another worktree not ignored"; fi
+out=$(status)
+contains "status names the opt-out" "$out" "opted out of [enroll] projects: "
+lacks "and no longer lists the repository as enrolled through the list" "$out" "through [enroll] projects (github.com/e2e/listed)"
+contains "the project is still on the list" "$out" "github.com/e2e/listed"
+
+kill_pid "$(daemon_pid)"
+sleep 0.5
+"$BIN" status >/dev/null
+if turn_ignored "$TMP/l-wt1" u3; then ok "after a daemon restart the repository is still not enrolled"; else bad "the opt-out did not survive a restart"; fi
+contains "and status still names the opt-out" "$(status)" "opted out of [enroll] projects: "
+check "nothing was recorded for it" test ! -e "$SIDE/refs/baton/u1"
+check "nothing from the second worktree either" test ! -e "$SIDE/refs/baton/u2"
+
+set_config '[watch]' 'max_repo_worktrees = 2' '' '[enroll]' 'projects = ["github.com/e2e/listed", "github.com/e2e/capped", "github.com/e2e/pre"]'
+turn_ignored "$TMP/l-wt2" u4
+check "editing the list does not undo it" test ! -e "$SIDE/refs/baton/u4"
+
+out=$(cd "$L" && "$BIN" enroll --repo 2>&1)
+contains "enroll --repo enrolls it again" "$out" "enrolled repository"
+if turn_lands "$TMP/l-wt1" u5; then ok "its hooks are recorded again"; else bad "hook dropped after enroll --repo"; fi
+lacks "status no longer names the opt-out" "$(status)" "opted out of [enroll] projects: "
+kill_pid "$(daemon_pid)"
+sleep 0.5
+contains "after a restart the repository is enrolled with no turn, since enroll --repo saves it" "$(status)" "listed/.git"
+
+out=$(cd "$L" && "$BIN" unenroll --repo 2>&1)
+contains "unenrolling a repository the person enrolled, whose project is listed, is also an opt-out" "$out" "opted out"
+turn_ignored "$TMP/l-wt1" u6
+check "and its next hook is ignored" test ! -e "$SIDE/refs/baton/u6"
+(cd "$L" && "$BIN" enroll --repo >/dev/null 2>&1)
+section_end
+
+# --------------------------------------------------------------------------------------------------
+section "opt-outs only where they mean something"
+out=$(cd "$O" && "$BIN" unenroll --repo 2>&1)
+contains "an unlisted repository is just not enrolled" "$out" "was not enrolled"
+lacks "and nothing is opted out" "$out" "opted out"
+
+P="$TMP/pre"
+mkrepo "$P" pre
+linked "$P" "$TMP/p-wt1" pb1 p1.txt
+out=$(cd "$P" && "$BIN" unenroll --repo 2>&1)
+contains "a listed repository that was never enrolled can be opted out beforehand" "$out" "opted out"
+turn_ignored "$TMP/p-wt1" p1
+check "and its first hook is ignored" test ! -d "$(side_of pre)"
+(cd "$P" && "$BIN" enroll --repo >/dev/null 2>&1)
+SIDE=$(side_of pre)
+if turn_lands "$TMP/p-wt1" p2; then ok "enroll --repo undoes it"; else bad "pre-opted-out repository not recorded after enroll --repo"; fi
+
+SIDE=$(side_of capped)
+turn_lands "$TMP/c-wt2" c4 >/dev/null || bad "the capped repository was not recording"
+out=$("$BIN" unenroll "$(wp "$TMP/c-wt2")" 2>&1)
+contains "plain unenroll of a worktree a repository brought in says it returns" "$out" "next turn enrolls it again"
+if turn_lands "$TMP/c-wt2" c5; then ok "and its next turn is recorded"; else bad "worktree did not come back after plain unenroll"; fi
 section_end
 
 # --------------------------------------------------------------------------------------------------

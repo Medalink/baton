@@ -36,6 +36,10 @@ struct EnrolledFile {
     /// comes back with its next turn.
     #[serde(default)]
     repos: Vec<String>,
+    /// Common git dirs the person unenrolled although `[enroll] projects` names their project. The list
+    /// does not enroll them again until `baton enroll --repo` says so.
+    #[serde(default)]
+    declined: Vec<String>,
 }
 
 #[derive(Default)]
@@ -48,6 +52,8 @@ struct Registry {
     /// The repositories among `repos` that `[enroll] projects` brought in, with the project that matched.
     /// They are not saved: the list is evaluated again when the daemon starts.
     listed: BTreeMap<String, ProjectKey>,
+    /// Repositories the list must not enroll: `path_key` of the common git dir to the dir itself. Saved.
+    declined: BTreeMap<String, PathBuf>,
 }
 
 pub struct Daemon {
@@ -129,7 +135,7 @@ impl Daemon {
     }
 
     fn save_enrolled(&self) -> Result<()> {
-        let (mut roots, repos): (Vec<String>, Vec<String>) = {
+        let (mut roots, repos, declined): (Vec<String>, Vec<String>, Vec<String>) = {
             let registry = self.registry();
             (
                 registry
@@ -144,6 +150,11 @@ impl Daemon {
                     .filter(|(key, _)| !registry.listed.contains_key(*key))
                     .map(|(_, d)| d.to_string_lossy().into_owned())
                     .collect(),
+                registry
+                    .declined
+                    .values()
+                    .map(|d| d.to_string_lossy().into_owned())
+                    .collect(),
             )
         };
         roots.extend(self.lost().values().cloned());
@@ -152,7 +163,11 @@ impl Daemon {
         let tmp = file.with_extension("json.tmp");
         std::fs::write(
             &tmp,
-            serde_json::to_vec_pretty(&EnrolledFile { roots, repos })?,
+            serde_json::to_vec_pretty(&EnrolledFile {
+                roots,
+                repos,
+                declined,
+            })?,
         )?;
         std::fs::rename(&tmp, &file).context("saving the enrolled list")
     }
@@ -239,14 +254,18 @@ impl Daemon {
         .map_err(|e| anyhow!("{e}"))
     }
 
-    fn unenroll(&self, root: &Path) -> Result<bool> {
+    /// Whether the worktree was enrolled, and whether a repository brought it in (and so would again).
+    fn unenroll(&self, root: &Path) -> Result<(bool, bool)> {
         self.lost().remove(&path_key(root));
         let removed = self.registry().worktrees.remove(&path_key(root));
         if let Some(handle) = &removed {
             let _ = handle.tx.send(Cmd::Stop);
         }
         self.save_enrolled()?;
-        Ok(removed.is_some())
+        Ok((
+            removed.is_some(),
+            removed.is_some_and(|handle| handle.via.is_some()),
+        ))
     }
 
     /// The task of the enrolled worktree that contains `cwd`; the innermost one when they nest.
@@ -434,10 +453,11 @@ impl Daemon {
             Request::Unenroll { path } => {
                 run_blocking(move || {
                     let root = find_root(Path::new(&path)).map_err(|e| anyhow!("{e}"))?;
-                    let was_enrolled = this.unenroll(&root)?;
+                    let (was_enrolled, via_repo) = this.unenroll(&root)?;
                     Ok(Reply::Unenrolled {
                         root: root.to_string_lossy().into_owned(),
                         was_enrolled,
+                        via_repo,
                     })
                 })
                 .await
@@ -533,6 +553,11 @@ impl Daemon {
                     .count(),
             })
             .collect();
+        let opted_out = registry
+            .declined
+            .values()
+            .map(|dir| dir.to_string_lossy().into_owned())
+            .collect();
         Reply::Status {
             pid: std::process::id(),
             up_secs: self.started.elapsed().as_secs(),
@@ -540,6 +565,7 @@ impl Daemon {
             repos,
             cap: self.max_watched,
             projects,
+            opted_out,
         }
     }
 }
@@ -577,7 +603,7 @@ pub fn run() -> Result<()> {
     ));
 
     let enrolled = daemon.enrolled_file();
-    daemon.restore_repos(&enrolled.repos);
+    daemon.restore_repos(&enrolled.repos, &enrolled.declined);
     let restoring: Vec<_> = enrolled
         .roots
         .into_iter()

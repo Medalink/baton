@@ -20,7 +20,7 @@ baton daemon                      # per-user process; other commands start it wh
 baton enroll [path]               # start watching a worktree
 baton enroll --repo [path]        # enroll the repository; any of its worktrees is recorded from its first turn
 baton unenroll [path]             # stop watching; its history stays
-baton unenroll --repo [path]
+baton unenroll --repo [path]       # also opts a repository out of [enroll] projects; baton enroll --repo undoes that
 baton status                      # worktrees, enrolled repositories and their watched worktrees
 baton log [thread] [--verdicts]
 baton verdict <turn> [--thread T] [--json]   # the verdict stored for a turn
@@ -139,7 +139,7 @@ Worktrees that came in through a repository are not written to `enrolled.json`. 
 
 **Worktrees that disappear.** Agent tools delete their worktrees. A repository worktree is dropped when its root has no `.git` (`git worktree remove` takes it out with the rest). Its task ends by itself when its watcher reports an error or an event on the root or its `.git` and the check says it is gone, which closes the watcher handle promptly. `e2e/local.sh` removes a watched worktree with `git worktree remove --force` and checks that git succeeds and the directory is gone at once. A reaper thread runs the same check every 2 s as a backstop, removes the worktree from the registry, deletes its mirror file and logs `<root> is gone; no longer watched`. Nothing is an error: a turn that arrives later from the same path is an ordinary first turn. A worktree enrolled by itself is kept when its directory vanishes, since an unmounted drive looks the same, and that is the person's call.
 
-`baton status` prints its first line as before, then one line per watched worktree (with `via <repo>` for one a repository brought in), then one `repository <dir>  <n> of at most <cap> worktrees watched` line per enrolled repository (ending in `through [enroll] projects (<project>)` for one the list brought in), then `enroll projects: <keys>` when the list is not empty.
+`baton status` prints its first line as before, then one line per watched worktree (with `via <repo>` for one a repository brought in), then one `repository <dir>  <n> of at most <cap> worktrees watched` line per enrolled repository (ending in `through [enroll] projects (<project>)` for one the list brought in), then `enroll projects: <keys>` when the list is not empty, then one `opted out of [enroll] projects: <dir>` line per opt-out.
 
 ### Enrolling by project key
 
@@ -159,6 +159,8 @@ When a hook or `baton turn` comes from a worktree no enrolled worktree owns and 
 3. The repository's project key is worked out (`.baton/config.toml` `project`, else `origin`, else the only remote). If the list names it, the repository is enrolled exactly as `baton enroll --repo` does, in memory: every worktree is recorded from its first turn, the `[watch] max_repo_worktrees` cap applies, and then the turn is recorded. The daemon logs `enrolled <dir> as <key>: it is in [enroll] projects`.
 
 A no is remembered per repository (by common git dir), so a busy repository the list does not name costs one `repo_of` and a few `stat` calls per turn, not a repository open and a key derivation. The memory ends when the user config changes, when the repository's `config` file or its `.baton/config.toml` changes (a `git remote set-url` or `rename` counts at the next turn), or after 30 seconds, which covers what is not watched (an included git config file, `config.worktree`). A repository with no resolvable key is remembered the same way, with its reason in the log.
+
+**Opting out.** `baton unenroll --repo` of a repository the list brought in, or whose project the list names, stops its worktrees and records an opt-out: its common git dir goes under `declined` in `enrolled.json`, and the daemon checks that before it reads the list, so no later turn enrolls it again, across daemon restarts and edits of the list. The command says so and names the undo, `baton enroll --repo` run in the repository, which clears the opt-out and enrolls it by hand (saved). An opt-out is by directory, not by project, so a changed remote does not lift it. Unenrolling a repository the list does not name is not an opt-out. `baton unenroll <worktree>` of a worktree a repository brought in still stops it only until its next turn, and says so, pointing at `--repo`.
 
 The list is not saved. A repository it brought in is not in `enrolled.json`; after a daemon restart it comes back with the next turn from any of its worktrees, as its worktrees do. Enrolling by hand (`baton enroll --repo`) makes it a saved enrollment like any other.
 
@@ -393,7 +395,7 @@ The per-turn statistics are cached in `report-cache/<project>.bin` under baton's
 
 `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, real runs of the binaries, measurement tools under `tools/`, and end-to-end scenarios under `e2e/` that drive the real binaries: `e2e/local.sh` for capture (including enrolling a repository, linked worktrees created afterwards, a removed worktree, the watch cap, and the user's `.git` and every worktree's admin dir staying byte-identical) and `e2e/sync.sh` for the server, the daemon link, `pull`, `follow` and the latency measurement, `e2e/history.sh` for `blame` (three threads, a commit that ships some lines, a hand-written line) and `bisect` (a planted failing turn, a skip, a timeout, a failing first turn, a one-turn thread, a planted directory that survives, a hard-killed run cleaned by the next bisect, Ctrl+C on Unix, no worktree left behind)., and `e2e/report.sh` for `report` (one planted case of each pattern next to clean threads, then a cold and a cached run over thousands of turns). No unit tests and no CI workflows.
 
-`e2e/enroll.sh` covers enrollment by project key: a listed repository enrolled by its first hook from a linked worktree, an unlisted one not, a config edit that adds a key with no restart, one that removes it, a repo config that cannot list anything, a remote that is changed or renamed, and the watch cap.
+`e2e/enroll.sh` covers enrollment by project key: a listed repository enrolled by its first hook from a linked worktree, an unlisted one not, a config edit that adds a key with no restart, one that removes it, an opt-out by `unenroll --repo` that survives a daemon restart and is undone by `enroll --repo`, a repo config that cannot list anything, a remote that is changed or renamed, and the watch cap.
 
 `e2e/sync.sh` starts real `baton serve` and `baton daemon` processes under a temp dir, each machine with its own `BATON_HOME` and its own clone, on loopback ports from `BATON_E2E_PORT` (default 47880). It never reads or writes the user's real baton dirs, and a final scenario checks that they are untouched.
 
@@ -495,7 +497,7 @@ A burst of 30 threads, one turn each at 100 ms spacing, takes a median 11.6 ms a
 ### Differences from the sections above, enroll-by-key slice
 
 - The user config gained `[enroll] projects`. Unlike `[server]` and `[watch]`, it is read while the daemon runs: each turn from a worktree no enrolled repository covers reads the file again if it changed, and the reaper's pass does the same to notice removals.
-- A repository the list enrolled is not saved to `enrolled.json`; the list is the record.
+- A repository the list enrolled is not saved to `enrolled.json`; the list is the record. What is saved is the opt-out: `declined` in `enrolled.json`, an optional field. An older baton ignores it, and an older baton that saves the file drops it, so a rollback past this change loses opt-outs.
 
 ### Known limits
 

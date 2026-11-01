@@ -59,6 +59,9 @@ pub enum Reply {
     Unenrolled {
         root: String,
         was_enrolled: bool,
+        /// A repository brought the worktree in, so its next turn enrolls it again.
+        #[serde(default)]
+        via_repo: bool,
     },
     EnrolledRepo {
         dir: String,
@@ -70,6 +73,9 @@ pub enum Reply {
         dir: String,
         was_enrolled: bool,
         stopped: usize,
+        /// `[enroll] projects` names the repository's project, so it stays out until `enroll --repo`.
+        #[serde(default)]
+        opted_out: bool,
     },
     Turned {
         thread: String,
@@ -86,6 +92,9 @@ pub enum Reply {
         /// `[enroll] projects` as the daemon reads it now.
         #[serde(default)]
         projects: Vec<String>,
+        /// Repositories the list would enroll that the person unenrolled.
+        #[serde(default)]
+        opted_out: Vec<String>,
     },
     Failed {
         message: String,

@@ -76,11 +76,15 @@ impl Daemon {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    pub(super) fn restore_repos(&self, dirs: &[String]) {
+    pub(super) fn restore_repos(&self, repos: &[String], declined: &[String]) {
         let mut registry = self.registry();
-        for dir in dirs {
+        for dir in repos {
             let dir = PathBuf::from(dir);
             registry.repos.insert(path_key(&dir), dir);
+        }
+        for dir in declined {
+            let dir = PathBuf::from(dir);
+            registry.declined.insert(path_key(&dir), dir);
         }
     }
 
@@ -141,6 +145,9 @@ impl Daemon {
     /// repository until something it was derived from changes, so a busy repository the list does not
     /// name costs a few `stat` calls per turn, not a repository open.
     fn admit(&self, location: &RepoLocation, workdir: &Path, repo: &str) -> Option<ProjectKey> {
+        if self.registry().declined.contains_key(repo) {
+            return None;
+        }
         let projects = self.listed_projects();
         if projects.is_empty() {
             return None;
@@ -184,8 +191,9 @@ impl Daemon {
         let key = path_key(&location.common_dir);
         let already = {
             let mut registry = self.registry();
-            // Enrolling by hand makes a repository the list brought in permanent.
+            // Enrolling by hand makes a repository the list brought in permanent, and undoes an opt-out.
             registry.listed.remove(&key);
+            registry.declined.remove(&key);
             registry
                 .repos
                 .insert(key, location.common_dir.clone())
@@ -221,16 +229,39 @@ impl Daemon {
         (was_enrolled, ours.len(), listed)
     }
 
-    /// Stops recording the worktrees the repository brought in. A worktree enrolled by itself stays.
+    /// Whether the list names the project of the repository `location` is in.
+    fn names_listed_project(&self, location: &RepoLocation) -> bool {
+        let projects = self.listed_projects();
+        if projects.is_empty() {
+            return false;
+        }
+        let probe = location.workdir.as_deref().unwrap_or(&location.common_dir);
+        key_of(probe).is_ok_and(|key| projects.contains(&key))
+    }
+
+    /// Stops recording the worktrees the repository brought in. A worktree enrolled by itself stays. A
+    /// repository the list names (or brought in) is opted out, so the next turn does not enroll it again
+    /// until `enroll --repo` says so.
     pub(super) fn unenroll_repo(&self, path: &Path) -> Result<Reply> {
         let location = repo_of(path).map_err(|e| anyhow!("{e}"))?;
         let key = path_key(&location.common_dir);
-        let (was_enrolled, stopped, _) = self.stop_repo(&key);
+        let (was_enrolled, stopped, listed) = self.stop_repo(&key);
+        let opted_out = listed.is_some() || self.names_listed_project(&location);
+        if opted_out {
+            self.registry()
+                .declined
+                .insert(key, location.common_dir.clone());
+            self.log.line(&format!(
+                "{} opted out of [enroll] projects; `baton enroll --repo` undoes it",
+                location.common_dir.display()
+            ));
+        }
         self.save_enrolled()?;
         Ok(Reply::UnenrolledRepo {
             dir: location.common_dir.to_string_lossy().into_owned(),
             was_enrolled,
             stopped,
+            opted_out,
         })
     }
 
