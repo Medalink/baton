@@ -683,11 +683,26 @@ impl Worktree {
         self.tracked.get(path.as_str()).map(|t| t.blob)
     }
 
-    pub fn read_current(&self, path: &RelPath) -> Option<Vec<u8>> {
+    pub fn current(&self, path: &RelPath) -> Current {
         let abs = self.root.join(path.as_str());
-        let meta = std::fs::symlink_metadata(&abs).ok()?;
-        read_content(&abs, file_kind(&meta)?)
+        let meta = match std::fs::symlink_metadata(&abs) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Current::Absent,
+            Err(_) => return Current::Blocked,
+        };
+        match file_kind(&meta).and_then(|kind| read_content(&abs, kind)) {
+            Some(bytes) => Current::Content(bytes),
+            None => Current::Blocked,
+        }
     }
+}
+
+/// What is on disk at a path, as rewind needs to tell it apart.
+pub enum Current {
+    Absent,
+    Content(Vec<u8>),
+    /// A directory, a special file, or something that cannot be read.
+    Blocked,
 }
 
 fn file_kind(meta: &Metadata) -> Option<FileKind> {

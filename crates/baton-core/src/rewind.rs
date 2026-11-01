@@ -7,7 +7,7 @@ use crate::error::{Error, IoContext, Result};
 use crate::id::{BlobId, FileKind, RelPath};
 use crate::redact::REDACTION_PREFIX;
 use crate::store::{SideRepo, TurnRecord};
-use crate::worktree::Worktree;
+use crate::worktree::{Current, Worktree};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -96,9 +96,19 @@ pub fn plan(side: &SideRepo, worktree: &Worktree, turn: TurnRecord) -> Result<Re
                 .push(refuse("the stored copy has a secret cut out of it"));
             continue;
         }
-        let action = match worktree.read_current(&file.path) {
-            None => RewindAction::Create,
-            Some(current) => {
+        let action = match worktree.current(&file.path) {
+            Current::Absent if worktree.stored_blob(&file.path).is_some() => {
+                out.refused
+                    .push(refuse("deleted since the last snapshot; take a turn first"));
+                continue;
+            }
+            Current::Absent => RewindAction::Create,
+            Current::Blocked => {
+                out.refused
+                    .push(refuse("a directory or an unreadable file is in the way"));
+                continue;
+            }
+            Current::Content(current) => {
                 let prepared = worktree.policy().prepare(&file.path, current);
                 let on_disk = crate::worktree::hash_blob(&prepared);
                 if on_disk == file.blob {
@@ -128,45 +138,59 @@ pub fn plan(side: &SideRepo, worktree: &Worktree, turn: TurnRecord) -> Result<Re
 pub fn apply(side: &SideRepo, root: &Path, plan: &RewindPlan) -> Result<usize> {
     let mut written = 0;
     for item in &plan.writes {
-        if !parents_are_plain(root, &item.path) {
-            return Err(Error::Refused(format!(
-                "{} sits below a symlink",
-                item.path
-            )));
-        }
-        let target: PathBuf = root.join(item.path.as_str());
-        if let Some(dir) = target.parent() {
-            std::fs::create_dir_all(dir).ctx(|| format!("creating {}", dir.display()))?;
-        }
-        let bytes = side.read_blob(item.blob)?;
-        let temp = target.with_file_name(format!(".baton-rewind-{}", std::process::id()));
-        match item.kind {
-            FileKind::File | FileKind::Executable => {
-                std::fs::write(&temp, &bytes).ctx(|| format!("writing {}", temp.display()))?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let mode = if item.kind == FileKind::Executable {
-                        0o755
-                    } else {
-                        0o644
-                    };
-                    std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(mode))
-                        .ctx(|| format!("setting mode on {}", temp.display()))?;
-                }
-            }
-            FileKind::Symlink => {
-                #[cfg(unix)]
-                {
-                    let link = String::from_utf8_lossy(&bytes).into_owned();
-                    let _ = std::fs::remove_file(&temp);
-                    std::os::unix::fs::symlink(link, &temp)
-                        .ctx(|| format!("linking {}", temp.display()))?;
-                }
-            }
-        }
-        std::fs::rename(&temp, &target).ctx(|| format!("replacing {}", target.display()))?;
+        write_one(side, root, item)?;
         written += 1;
     }
     Ok(written)
+}
+
+fn write_one(side: &SideRepo, root: &Path, item: &RewindWrite) -> Result<()> {
+    if !parents_are_plain(root, &item.path) {
+        return Err(Error::Refused(format!(
+            "{} sits below a symlink",
+            item.path
+        )));
+    }
+    let target: PathBuf = root.join(item.path.as_str());
+    if let Some(dir) = target.parent() {
+        std::fs::create_dir_all(dir).ctx(|| format!("creating {}", dir.display()))?;
+    }
+    let bytes = side.read_blob(item.blob)?;
+    let temp = target.with_file_name(format!(".baton-rewind-{}", std::process::id()));
+    let result = write_temp(&temp, item.kind, &bytes).and_then(|()| {
+        std::fs::rename(&temp, &target).ctx(|| format!("replacing {}", target.display()))
+    });
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+fn write_temp(temp: &Path, kind: FileKind, bytes: &[u8]) -> Result<()> {
+    match kind {
+        FileKind::File | FileKind::Executable => {
+            std::fs::write(temp, bytes).ctx(|| format!("writing {}", temp.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = if kind == FileKind::Executable {
+                    0o755
+                } else {
+                    0o644
+                };
+                std::fs::set_permissions(temp, std::fs::Permissions::from_mode(mode))
+                    .ctx(|| format!("setting mode on {}", temp.display()))?;
+            }
+        }
+        FileKind::Symlink => {
+            #[cfg(unix)]
+            {
+                let link = String::from_utf8_lossy(bytes).into_owned();
+                let _ = std::fs::remove_file(temp);
+                std::os::unix::fs::symlink(link, temp)
+                    .ctx(|| format!("linking {}", temp.display()))?;
+            }
+        }
+    }
+    Ok(())
 }
