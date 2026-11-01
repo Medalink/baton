@@ -258,6 +258,7 @@ pub fn status() -> Result<()> {
             worktrees,
             repos,
             cap,
+            projects,
         } => {
             println!(
                 "daemon pid {pid}, up {up_secs}s, {} enrolled",
@@ -275,9 +276,16 @@ pub fn status() -> Result<()> {
             }
             for r in repos {
                 println!(
-                    "repository {}  {} of at most {cap} worktrees watched",
-                    r.dir, r.active
+                    "repository {}  {} of at most {cap} worktrees watched{}",
+                    r.dir,
+                    r.active,
+                    r.listed.map_or_else(String::new, |p| format!(
+                        "  through [enroll] projects ({p})"
+                    ))
                 );
+            }
+            if !projects.is_empty() {
+                println!("enroll projects: {}", projects.join(", "));
             }
             Ok(())
         }

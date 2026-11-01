@@ -39,6 +39,9 @@ pub struct WorktreeStatus {
 pub struct RepoStatus {
     pub dir: String,
     pub active: usize,
+    /// The project `[enroll] projects` enrolled it under; none when the person enrolled it.
+    #[serde(default)]
+    pub listed: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -80,6 +83,9 @@ pub enum Reply {
         worktrees: Vec<WorktreeStatus>,
         repos: Vec<RepoStatus>,
         cap: usize,
+        /// `[enroll] projects` as the daemon reads it now.
+        #[serde(default)]
+        projects: Vec<String>,
     },
     Failed {
         message: String,

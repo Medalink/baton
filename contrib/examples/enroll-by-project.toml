@@ -1,0 +1,16 @@
+# ~/.config/baton/config.toml (or $BATON_HOME/config/config.toml)
+#
+# Record these projects wherever they are cloned, on this device, with no `baton enroll` per path. A
+# project key is what baton derives for a repository: `project` in its .baton/config.toml, else the
+# normalized URL of `origin` (host/owner/repo, lowercase), else of its only remote. Keep one list and
+# sync it to every device. Only this file may set it; a .baton/config.toml that does is ignored.
+#
+# The first turn from any worktree of a listed repository enrolls the repository, as
+# `baton enroll --repo` does. An edit here counts at the next turn, with no daemon restart. Removing a
+# project stops its repositories within a few seconds. `baton status` shows the list and which
+# repositories it enrolled.
+[enroll]
+projects = [
+  "github.com/acme/app",
+  "github.com/acme/infra",
+]

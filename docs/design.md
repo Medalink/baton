@@ -139,7 +139,30 @@ Worktrees that came in through a repository are not written to `enrolled.json`. 
 
 **Worktrees that disappear.** Agent tools delete their worktrees. A repository worktree is dropped when its root has no `.git` (`git worktree remove` takes it out with the rest). Its task ends by itself when its watcher reports an error or an event on the root or its `.git` and the check says it is gone, which closes the watcher handle promptly. `e2e/local.sh` removes a watched worktree with `git worktree remove --force` and checks that git succeeds and the directory is gone at once. A reaper thread runs the same check every 2 s as a backstop, removes the worktree from the registry, deletes its mirror file and logs `<root> is gone; no longer watched`. Nothing is an error: a turn that arrives later from the same path is an ordinary first turn. A worktree enrolled by itself is kept when its directory vanishes, since an unmounted drive looks the same, and that is the person's call.
 
-`baton status` prints its first line as before, then one line per watched worktree (with `via <repo>` for one a repository brought in), then one `repository <dir>  <n> of at most <cap> worktrees watched` line per enrolled repository.
+`baton status` prints its first line as before, then one line per watched worktree (with `via <repo>` for one a repository brought in), then one `repository <dir>  <n> of at most <cap> worktrees watched` line per enrolled repository (ending in `through [enroll] projects (<project>)` for one the list brought in), then `enroll projects: <keys>` when the list is not empty.
+
+### Enrolling by project key
+
+A person who keeps one list of projects for every device does not want to run `enroll --repo` per clone. The user config names the projects:
+
+```toml
+[enroll]
+projects = ["github.com/acme/app", "github.com/acme/infra"]
+```
+
+An entry is a `ProjectKey` as baton derives it (see Identity). It is trimmed and lowercased; one that is not a key is logged (`enroll list: skipped ...`) and skipped, never an error, because the file is shared by every device and one typo must not stop capture on all of them. Only the user config may set it. A `.baton/config.toml` that carries `[enroll]` parses, is never read, and logs the same notice as a plug-in table, since a clone must not be able to get itself recorded. (A repo that names a listed key in its own `project` is recorded under that key, as for every other use of `project`.)
+
+When a hook or `baton turn` comes from a worktree no enrolled worktree owns and no enrolled repository covers, the daemon puts the repository to the list, on the hook's worker thread and never on the hook process: the hook is unchanged and never resolves a key.
+
+1. `repo_of(cwd)` gives the worktree and the common git dir. A bare repository with no worktree is never admitted.
+2. The user config is read again if its bytes differ from the ones last parsed. With an empty list the answer is no, and nothing else is read.
+3. The repository's project key is worked out (`.baton/config.toml` `project`, else `origin`, else the only remote). If the list names it, the repository is enrolled exactly as `baton enroll --repo` does, in memory: every worktree is recorded from its first turn, the `[watch] max_repo_worktrees` cap applies, and then the turn is recorded. The daemon logs `enrolled <dir> as <key>: it is in [enroll] projects`.
+
+A no is remembered per repository (by common git dir), so a busy repository the list does not name costs one `repo_of` and a few `stat` calls per turn, not a repository open and a key derivation. The memory ends when the user config changes, when the repository's `config` file or its `.baton/config.toml` changes (a `git remote set-url` or `rename` counts at the next turn), or after 30 seconds, which covers what is not watched (an included git config file, `config.worktree`). A repository with no resolvable key is remembered the same way, with its reason in the log.
+
+The list is not saved. A repository it brought in is not in `enrolled.json`; after a daemon restart it comes back with the next turn from any of its worktrees, as its worktrees do. Enrolling by hand (`baton enroll --repo`) makes it a saved enrollment like any other.
+
+The list is live. An edit that adds a project counts at the next turn, with no restart (`e2e/enroll.sh` edits the file under a running daemon). Removing a project stops the repositories it brought in (their worktrees stop, mirror files stay) within the 2 s of the reaper's pass, and the log says `left [enroll] projects`. A config that does not parse, or one seen empty while a list is in force (a write in progress), keeps the list as it was. A remote that changes is handled where a repository next meets a worktree: a listed repository whose key now names another project is dropped when one of its worktrees is first seen (its watched worktrees stop), and an unlisted one whose remote now names a listed project is enrolled at its next turn. A worktree's project is fixed while it is watched, so a worktree already recording keeps its old project until it stops. Renaming the only remote keeps the key. `contrib/examples/enroll-by-project.toml` shows the config.
 
 ## Hook contract
 
@@ -370,6 +393,8 @@ The per-turn statistics are cached in `report-cache/<project>.bin` under baton's
 
 `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, real runs of the binaries, measurement tools under `tools/`, and end-to-end scenarios under `e2e/` that drive the real binaries: `e2e/local.sh` for capture (including enrolling a repository, linked worktrees created afterwards, a removed worktree, the watch cap, and the user's `.git` and every worktree's admin dir staying byte-identical) and `e2e/sync.sh` for the server, the daemon link, `pull`, `follow` and the latency measurement, `e2e/history.sh` for `blame` (three threads, a commit that ships some lines, a hand-written line) and `bisect` (a planted failing turn, a skip, a timeout, a failing first turn, a one-turn thread, a planted directory that survives, a hard-killed run cleaned by the next bisect, Ctrl+C on Unix, no worktree left behind)., and `e2e/report.sh` for `report` (one planted case of each pattern next to clean threads, then a cold and a cached run over thousands of turns). No unit tests and no CI workflows.
 
+`e2e/enroll.sh` covers enrollment by project key: a listed repository enrolled by its first hook from a linked worktree, an unlisted one not, a config edit that adds a key with no restart, one that removes it, a repo config that cannot list anything, a remote that is changed or renamed, and the watch cap.
+
 `e2e/sync.sh` starts real `baton serve` and `baton daemon` processes under a temp dir, each machine with its own `BATON_HOME` and its own clone, on loopback ports from `BATON_E2E_PORT` (default 47880). It never reads or writes the user's real baton dirs, and a final scenario checks that they are untouched.
 
 ## Decisions
@@ -467,9 +492,17 @@ A burst of 30 threads, one turn each at 100 ms spacing, takes a median 11.6 ms a
 - A second caller for a worktree that is being enrolled now waits for the first. It used to get "is already being enrolled", which would have dropped the second hook's turn.
 - `baton turn` and a hook route through one delivery function. It resolves the worktree, enrolls it through its repository when needed, and queues the turn under the registry lock.
 
+### Differences from the sections above, enroll-by-key slice
+
+- The user config gained `[enroll] projects`. Unlike `[server]` and `[watch]`, it is read while the daemon runs: each turn from a worktree no enrolled repository covers reads the file again if it changed, and the reaper's pass does the same to notice removals.
+- A repository the list enrolled is not saved to `enrolled.json`; the list is the record.
+
 ### Known limits
 
 These are chosen limits, not open bugs. Each says what is not covered and what bounds it.
+
+- The policy fingerprint hashes the whole user config, so an edit to `[enroll] projects` makes every watched worktree rescan in full at its next turn, like any other user-config edit. A list that changes often costs a rescan per edit on each device.
+- Linked worktrees of one repository can carry different `project` values in their own `.baton/config.toml`. The list is judged on the worktree that is first seen, so such a repository can be dropped when one worktree is seen and enrolled again when another is.
 
 - The 128-connection handshake pool is global. A host that opens 128 silent sockets holds every place for up to 10 s, and a new connection in that window is dropped at accept. There is no per-address limit, so an operator who needs one puts a firewall or a proxy in front.
 - A session authenticated by a command provider is not asked again. Revoking such an identity is the provider's job and takes effect at the identity's next connect. Token auth is checked every 2 s.

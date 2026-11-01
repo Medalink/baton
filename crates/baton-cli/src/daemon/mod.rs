@@ -45,6 +45,9 @@ struct Registry {
     starting: HashSet<String>,
     /// Enrolled repositories: `path_key` of the common git dir to the dir itself.
     repos: BTreeMap<String, PathBuf>,
+    /// The repositories among `repos` that `[enroll] projects` brought in, with the project that matched.
+    /// They are not saved: the list is evaluated again when the daemon starts.
+    listed: BTreeMap<String, ProjectKey>,
 }
 
 pub struct Daemon {
@@ -60,6 +63,8 @@ pub struct Daemon {
     /// Enrolled roots that could not be started (a drive that is not mounted). They stay enrolled on disk.
     unrestored: Mutex<BTreeMap<String, String>>,
     started: Instant,
+    /// What `[enroll] projects` says, and the repositories it did not admit.
+    listing: Mutex<repos::Listing>,
 }
 
 enum Route {
@@ -102,6 +107,7 @@ impl Daemon {
             link,
             unrestored: Mutex::new(BTreeMap::new()),
             started: Instant::now(),
+            listing: Mutex::default(),
         }
     }
 
@@ -134,8 +140,9 @@ impl Daemon {
                     .collect(),
                 registry
                     .repos
-                    .values()
-                    .map(|d| d.to_string_lossy().into_owned())
+                    .iter()
+                    .filter(|(key, _)| !registry.listed.contains_key(*key))
+                    .map(|(_, d)| d.to_string_lossy().into_owned())
                     .collect(),
             )
         };
@@ -489,6 +496,11 @@ impl Daemon {
     }
 
     fn status(&self) -> Reply {
+        let projects = self
+            .listed_projects()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
         let registry = self.registry();
         let worktrees = registry
             .worktrees
@@ -513,6 +525,7 @@ impl Daemon {
             .iter()
             .map(|(key, dir)| RepoStatus {
                 dir: dir.to_string_lossy().into_owned(),
+                listed: registry.listed.get(key).map(ToString::to_string),
                 active: registry
                     .worktrees
                     .values()
@@ -526,6 +539,7 @@ impl Daemon {
             worktrees,
             repos,
             cap: self.max_watched,
+            projects,
         }
     }
 }
