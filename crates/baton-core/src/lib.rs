@@ -28,7 +28,7 @@ pub use id::{
 pub use ignore::Case;
 pub use ingest::{Intake, Pool, Verdict, plan as plan_ingest, store as store_ingest};
 pub use paths::{Dirs, HOME_ENV, fnv1a, simplified};
-pub use plugin::{CommandSpec, run_command, run_for_effect};
+pub use plugin::{CommandSpec, run_command, run_command_bytes, run_for_effect};
 pub use plugin_config::{Classifier, Lens, Mode, Notify, Plugins, parse_duration};
 pub use policy::StorePolicy;
 pub use redact::{Redactor, RuleSpec, load_literals};

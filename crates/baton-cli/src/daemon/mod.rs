@@ -5,18 +5,20 @@
 
 mod link;
 mod log;
+mod plugins;
 mod server;
 mod task;
 mod writer;
 
-use crate::adapter::TurnRequest;
 use crate::control::{Reply, Request, WorktreeStatus};
 use anyhow::{Context, Result, anyhow};
 use baton_core::{
-    Dirs, MachineId, ProjectKey, RepoConfig, UserConfig, find_root, project_key, simplified,
+    Dirs, MachineId, Plugins, ProjectKey, RepoConfig, TurnReq, UserConfig, find_root, project_key,
+    run_command_bytes, simplified,
 };
 use link::Link;
 use log::Log;
+use plugins::Runner;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -42,6 +44,7 @@ pub struct Daemon {
     log: Arc<Log>,
     registry: Mutex<Registry>,
     link: Link,
+    plugins: Runner,
     /// Enrolled roots that could not be started (a drive that is not mounted). They stay enrolled on disk.
     unrestored: Mutex<BTreeMap<String, String>>,
     started: Instant,
@@ -69,6 +72,7 @@ pub fn path_key(path: &Path) -> String {
 impl Daemon {
     fn new(dirs: Dirs, log: Arc<Log>, link: Link) -> Self {
         Self {
+            plugins: Runner::start(dirs.clone(), Arc::clone(&log)),
             dirs,
             log,
             registry: Mutex::new(Registry::default()),
@@ -162,6 +166,7 @@ impl Daemon {
             self.dirs.clone(),
             writer,
             Arc::clone(&self.log),
+            self.plugins.clone(),
         )
         .map_err(|e| anyhow!("{e}"))
     }
@@ -212,20 +217,63 @@ impl Daemon {
         Route::Task(tx)
     }
 
-    /// A hook frame: fire and forget. A turn from a directory that is not enrolled is dropped, which is
-    /// what makes enrollment the allowlist.
-    fn on_hook(&self, agent: &str, payload: &[u8]) {
-        let Some(request) = crate::adapter::parse(agent, payload) else {
-            self.log
-                .line(&format!("dropped a {agent} hook frame that did not parse"));
+    /// A hook frame: fire and forget. The work is on its own thread, since a command adapter runs a
+    /// process and the caller is an async handler. A turn from a directory that is not enrolled is
+    /// dropped, which is what makes enrollment the allowlist.
+    fn on_hook(self: &Arc<Self>, agent: &str, payload: &[u8]) {
+        let (this, agent, payload) = (Arc::clone(self), agent.to_owned(), payload.to_vec());
+        let spawned = std::thread::Builder::new()
+            .name("baton-hook".into())
+            .spawn(move || this.hook_turn(&agent, payload));
+        if let Err(e) = spawned {
+            self.log.line(&format!("dropped a hook frame: {e}"));
+        }
+    }
+
+    /// The turn request in a hook payload: from the user's `[agents.<name>]` command when one is
+    /// configured, else from the built-in adapter. A command that prints `null` says the payload was
+    /// not the end of a turn.
+    fn adapt(&self, agent: &str, payload: Vec<u8>) -> Option<TurnReq> {
+        let command = match Plugins::load(&self.dirs.user_config()) {
+            Ok(mut plugins) => plugins.agents.remove(agent),
+            Err(e) => {
+                self.log.line(&format!(
+                    "plug-in config unreadable, using built-in adapters: {e}"
+                ));
+                None
+            }
+        };
+        let Some(spec) = command else {
+            let request = crate::adapter::parse(agent, &payload);
+            if request.is_none() {
+                self.log
+                    .line(&format!("dropped a {agent} hook frame that did not parse"));
+            }
+            return request;
+        };
+        match run_command_bytes::<Option<TurnReq>>(&spec, payload) {
+            Ok(Some(request)) => Some(request),
+            Ok(None) => None,
+            Err(e) => {
+                self.log.line(&format!(
+                    "the {agent} adapter command failed, dropped the hook frame: {e}"
+                ));
+                None
+            }
+        }
+    }
+
+    fn hook_turn(&self, agent: &str, payload: Vec<u8>) {
+        let Some(request) = self.adapt(agent, payload) else {
             return;
         };
-        let TurnRequest {
+        let TurnReq {
             cwd,
             thread,
+            subject,
             agent,
             model,
-            message,
+            checks,
         } = request;
         let tx = match self.route(&cwd) {
             Route::Task(tx) => tx,
@@ -250,8 +298,8 @@ impl Daemon {
                 thread,
                 agent,
                 model,
-                message,
-                checks: Vec::new(),
+                message: subject,
+                checks,
             },
             reply: None,
         };

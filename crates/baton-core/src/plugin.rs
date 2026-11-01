@@ -53,23 +53,29 @@ impl CommandSpec {
 
 /// Runs the command with `input` as JSON on stdin and parses its stdout as JSON.
 pub fn run_command<I: Serialize, O: DeserializeOwned>(spec: &CommandSpec, input: &I) -> Result<O> {
-    let out = run_raw(spec, input)?;
+    let payload = serde_json::to_vec(input).map_err(|e| Error::invalid("plug-in input", e))?;
+    run_command_bytes(spec, payload)
+}
+
+/// Like `run_command`, for a document that is already bytes: an adapter reads the hook payload as it came.
+pub fn run_command_bytes<O: DeserializeOwned>(spec: &CommandSpec, stdin: Vec<u8>) -> Result<O> {
+    let out = run_raw(spec, stdin)?;
     serde_json::from_slice(&out).map_err(|e| Error::invalid("plug-in output", e))
 }
 
 /// Runs the command and returns once it has exited, whatever it printed. For a notifier, whose answer is
 /// ignored: a webhook script that prints nothing, or a progress line, is not a failure.
 pub fn run_for_effect<I: Serialize>(spec: &CommandSpec, input: &I) -> Result<()> {
-    run_raw(spec, input).map(drop)
+    let payload = serde_json::to_vec(input).map_err(|e| Error::invalid("plug-in input", e))?;
+    run_raw(spec, payload).map(drop)
 }
 
 /// The call returns by the deadline whatever the child and its descendants do. A killed child's
 /// grandchild may outlive it and keep the pipe open, so the output is read on a thread and waited for
 /// only until the deadline.
-fn run_raw<I: Serialize>(spec: &CommandSpec, input: &I) -> Result<Vec<u8>> {
+fn run_raw(spec: &CommandSpec, payload: Vec<u8>) -> Result<Vec<u8>> {
     spec.check()?;
     let program = &spec.command[0];
-    let payload = serde_json::to_vec(input).map_err(|e| Error::invalid("plug-in input", e))?;
     let deadline = Instant::now() + Duration::from_millis(spec.timeout_ms);
     let mut child = Command::new(program)
         .args(&spec.command[1..])
