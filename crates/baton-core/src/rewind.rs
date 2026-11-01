@@ -59,10 +59,13 @@ fn parents_are_plain(root: &Path, path: &RelPath) -> bool {
 
 pub fn plan(side: &SideRepo, worktree: &Worktree, turn: TurnRecord) -> Result<RewindPlan> {
     let files = side.flatten(turn.tree)?;
-    let wanted: HashSet<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    let wanted: HashSet<String> = files
+        .iter()
+        .map(|f| worktree.key(f.path.as_str()))
+        .collect();
     let left_alone = worktree
         .tracked_paths()
-        .filter(|p| !wanted.contains(p))
+        .filter(|p| !wanted.contains(&worktree.key(p)))
         .map(str::to_owned)
         .collect();
     let mut out = RewindPlan {

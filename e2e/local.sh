@@ -762,6 +762,7 @@ else
   sleep 0.4
   out=$(cd "$KB" && "$BIN" rewind k3@1 --apply 2>&1)
   contains "rewind refuses a file deleted under another spelling" "$out" "refuse Del.txt: deleted since the last snapshot; take a turn first"
+  lacks "it does not call the renamed file a stray" "$out" "are not in this turn"
   check "and writes nothing" test ! -e "$KB/Del.txt"
   "$BIN" unenroll "$(wp "$KB")" >/dev/null 2>&1
   "$BIN" unenroll "$(wp "$KR")" >/dev/null 2>&1
