@@ -1,0 +1,13 @@
+[workspace]
+resolver = "3"
+members = ["crates/baton-core", "crates/baton-server", "crates/baton-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Medalink/baton"
+
+[profile.release]
+panic = "unwind"
