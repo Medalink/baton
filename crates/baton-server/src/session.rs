@@ -4,7 +4,7 @@
 use crate::Shared;
 use crate::auth::Identity;
 use crate::log::log;
-use crate::project::{Advance, Event, Outcome};
+use crate::project::{Advance, Event, Outcome, Project};
 use anyhow::{Result, bail};
 use baton_core::{
     Assembler, Control, Frame, Head, IDS_PER_MESSAGE, Limits, MAX_FRAME, MAX_OBJECT, PROTO, Pool,
@@ -27,6 +27,12 @@ const HEARTBEAT: Duration = Duration::from_secs(15);
 const SILENCE: Duration = Duration::from_secs(60);
 /// A client that stops reading must not hold a session (and its broadcast queue) forever.
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+/// The goodbye (an error and a close frame) to a client that may have stopped reading.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often a live session checks that its device is still enrolled. A revoked device is cut off
+/// within this long, or at its next request or forwarded event, whichever comes first.
+const REVOKE_CHECK: Duration = Duration::from_secs(2);
+/// Projects one session may name in total, across hello, subscribe, advance and want.
 const MAX_PROJECTS: usize = 256;
 const HEADS_PER_MESSAGE: usize = 1000;
 const POOL_MAX: usize = 512 << 20;
@@ -65,6 +71,7 @@ pub struct Session<S> {
     identity: Identity,
     shared: Arc<Shared>,
     subs: StreamMap<ProjectKey, BroadcastStream<Arc<Event>>>,
+    named: HashSet<ProjectKey>,
     pool: Pool,
     assembler: Assembler,
     xfer: u32,
@@ -83,6 +90,7 @@ where
             identity,
             shared,
             subs: StreamMap::new(),
+            named: HashSet::new(),
             pool: Pool::default(),
             assembler: Assembler::new(MAX_OBJECT),
             xfer: 0,
@@ -120,20 +128,27 @@ where
                 "session {} ({machine}): {}: {}",
                 self.id, v.code, v.message
             ));
-            let _ = self
-                .send(&Control::Error {
+        }
+        let goodbye = async {
+            if let Err(v) = &outcome {
+                let error = Control::Error {
                     code: v.code.into(),
                     message: v.message.clone(),
-                })
+                };
+                let _ = self
+                    .ws
+                    .feed(Message::Binary(Bytes::from(encode_control(&error))))
+                    .await;
+            }
+            let _ = self
+                .ws
+                .send(Message::Close(Some(CloseFrame {
+                    code: CloseCode::Normal,
+                    reason: "".into(),
+                })))
                 .await;
-        }
-        let _ = self
-            .ws
-            .send(Message::Close(Some(CloseFrame {
-                code: CloseCode::Normal,
-                reason: "".into(),
-            })))
-            .await;
+        };
+        let _ = timeout(CLOSE_TIMEOUT, goodbye).await;
         log(&format!("session {} ({machine}): closed", self.id));
     }
 
@@ -149,6 +164,8 @@ where
 
         let mut beat = interval(HEARTBEAT);
         beat.tick().await;
+        let mut enrolled = interval(REVOKE_CHECK);
+        enrolled.tick().await;
         let mut heard = Instant::now();
         loop {
             tokio::select! {
@@ -173,32 +190,51 @@ where
                         return Ok(());
                     };
                     if event.origin != self.id {
+                        self.ensure_enrolled()?;
                         self.forward(&event).await.map_err(Violation::from)?;
                     }
                 }
+                _ = enrolled.tick() => self.ensure_enrolled()?,
                 _ = beat.tick() => {
                     if heard.elapsed() > SILENCE {
                         log(&format!("session {}: silent for {SILENCE:?}", self.id));
                         return Ok(());
                     }
-                    if !self.device_active() {
-                        return Err(violation("unauthorized", "this device was revoked"));
-                    }
-                    self.ws.send(Message::Ping(Bytes::new())).await.map_err(|e| violation("protocol", e))?;
+                    let ws = &mut self.ws;
+                    timeout(SEND_TIMEOUT, ws.send(Message::Ping(Bytes::new())))
+                        .await
+                        .map_err(|_| violation("protocol", "the client did not read a ping"))?
+                        .map_err(|e| violation("protocol", e))?;
                 }
             }
         }
     }
 
-    fn device_active(&self) -> bool {
-        match self.identity.device {
+    fn ensure_enrolled(&self) -> std::result::Result<(), Violation> {
+        let active = match self.identity.device {
             Some(id) => self.shared.db.device_is_active(id).unwrap_or(false),
             None => true,
+        };
+        if active {
+            Ok(())
+        } else {
+            Err(violation("unauthorized", "this device was revoked"))
         }
     }
 
+    /// The project's handle, counting it against what this session may name.
+    fn project(&mut self, key: &ProjectKey) -> std::result::Result<Arc<Project>, Violation> {
+        if !self.named.contains(key) {
+            if self.named.len() >= MAX_PROJECTS {
+                return Err(violation("too_large", "too many projects"));
+            }
+            self.named.insert(key.clone());
+        }
+        Ok(self.shared.projects.get(key))
+    }
+
     async fn on_binary(&mut self, bytes: &[u8]) -> std::result::Result<(), Violation> {
-        if bytes.len() > MAX_FRAME + 64 {
+        if bytes.len() > MAX_FRAME {
             return Err(violation("too_large", "frame over the limit"));
         }
         match decode(bytes)? {
@@ -277,14 +313,10 @@ where
                 expected,
                 new,
             } => {
-                if !self.device_active() {
-                    return Err(violation("unauthorized", "this device was revoked"));
-                }
+                self.ensure_enrolled()?;
                 let started = Instant::now();
                 let outcome = self
-                    .shared
-                    .projects
-                    .get(&project)
+                    .project(&project)?
                     .advance(Advance {
                         machine: self.identity.machine.clone(),
                         thread: thread.clone(),
@@ -338,10 +370,14 @@ where
                 }
                 self.send(&reply).await?;
             }
-            Control::Want { project, ids, .. } => {
+            Control::Want {
+                project, mut ids, ..
+            } => {
                 if ids.len() > IDS_PER_MESSAGE {
                     return Err(violation("too_large", "too many ids in one want"));
                 }
+                let mut seen = HashSet::new();
+                ids.retain(|id| seen.insert(*id));
                 self.serve_want(&project, ids).await?;
             }
             _ => {}
@@ -353,7 +389,8 @@ where
         &mut self,
         project: &ProjectKey,
     ) -> std::result::Result<Vec<Head>, Violation> {
-        let handle = self.shared.projects.get(project);
+        self.ensure_enrolled()?;
+        let handle = self.project(project)?;
         if !self.subs.contains_key(project) {
             self.subs
                 .insert(project.clone(), BroadcastStream::new(handle.subscribe()));
@@ -366,17 +403,15 @@ where
         project: &ProjectKey,
         ids: Vec<baton_core::Oid>,
     ) -> std::result::Result<(), Violation> {
-        let handle = self.shared.projects.get(project);
+        self.ensure_enrolled()?;
+        let handle = self.project(project)?;
         let xfer = self.next_xfer();
         let mut rest = ids.as_slice();
-        let mut seen = HashSet::new();
         while !rest.is_empty() {
             let (objects, used) = handle.read(rest.to_vec(), READ_BUDGET).await?;
             let mut frames = Vec::new();
             for (kind, id, bytes) in &objects {
-                if seen.insert(*id) {
-                    frames.extend(encode_object(xfer, *kind, *id, bytes));
-                }
+                frames.extend(encode_object(xfer, *kind, *id, bytes));
             }
             self.send_frames(frames).await?;
             rest = &rest[used.max(1).min(rest.len())..];

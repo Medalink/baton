@@ -96,8 +96,8 @@ pub async fn open(config: &ServerConfig) -> Result<Ws> {
         HeaderValue::from_static(SUBPROTOCOL),
     );
     let limits = WebSocketConfig::default()
-        .max_message_size(Some(MAX_FRAME + 64))
-        .max_frame_size(Some(MAX_FRAME + 64));
+        .max_message_size(Some(MAX_FRAME))
+        .max_frame_size(Some(MAX_FRAME));
     let (ws, _) = client_async_with_config(request, io, Some(limits))
         .await
         .map_err(describe)?;
