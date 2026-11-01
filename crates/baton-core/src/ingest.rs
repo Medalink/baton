@@ -157,7 +157,9 @@ struct Frame {
 struct Walk<'a> {
     repo: &'a SideRepo,
     pool: &'a Pool,
-    done: HashSet<Oid>,
+    /// Ids met as a tree and ids met as a blob are kept apart, so one id used as both is still caught.
+    walked: HashSet<Oid>,
+    blobbed: HashSet<Oid>,
     checked: HashSet<(Oid, Special)>,
     heights: HashMap<Oid, usize>,
     blobs: Vec<Oid>,
@@ -220,7 +222,7 @@ impl Walk<'_> {
         if Some(id) == old {
             return Ok(None);
         }
-        if !self.done.insert(id) {
+        if !self.walked.insert(id) {
             self.fits(id, depth)?;
             return Ok(None);
         }
@@ -339,7 +341,7 @@ impl Walk<'_> {
     }
 
     fn blob(&mut self, id: Oid, special: Option<Special>) -> std::result::Result<(), String> {
-        if self.done.insert(id) {
+        if self.blobbed.insert(id) {
             match self.pool.get(&id) {
                 Some((ObjectKind::Blob, _)) => self.blobs.push(id),
                 Some(_) => return Err(format!("{id} is not a blob")),
@@ -407,7 +409,8 @@ pub fn plan(repo: &SideRepo, pool: &Pool, tip: TurnId, stop: Option<TurnId>) -> 
     let mut walk = Walk {
         repo,
         pool,
-        done: HashSet::new(),
+        walked: HashSet::new(),
+        blobbed: HashSet::new(),
         checked: HashSet::new(),
         heights: HashMap::new(),
         blobs: Vec::new(),
