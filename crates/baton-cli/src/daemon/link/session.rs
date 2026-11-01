@@ -360,7 +360,11 @@ impl Session<'_> {
             return Ok(());
         };
         let head = self.heads.get(key).cloned();
-        if head.as_ref().is_some_and(|(_, owner)| owner != &self.me) {
+        if let Some((_, owner)) = head.as_ref().filter(|(_, owner)| owner != &self.me) {
+            self.log.line(&format!(
+                "sync: {} belongs to {owner}; its turns recorded here stay on this machine",
+                key.1
+            ));
             return Ok(());
         }
         let known = head.map(|(tip, _)| tip);
