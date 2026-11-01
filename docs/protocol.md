@@ -293,7 +293,7 @@ Payloads the built-in adapters read (the hook argument names the adapter; `claud
 |---|---|---|
 | `claude` | the Stop hook JSON: `session_id`, `cwd`, `transcript_path` | unchanged from the first slice |
 | `codex` | the `Stop` hook JSON on stdin: `session_id`, `cwd`, `hook_event_name`, `model`, `last_assistant_message` | Stop carries no user prompt, so the subject is the first line of the last assistant message, at most 200 characters |
-| `opencode` | `{"type": "session.idle", "properties": {"sessionID": "..."}, "directory": "...", "model"?, "message"?}` | opencode's event has no directory, so the plug-in glue adds `directory` |
+| `opencode` | `{"type": "session.idle", "properties": {"sessionID": "..."}, "directory": "...", "model"?, "message"?}` | opencode's event has no directory, so the plug-in glue adds `directory`. `contrib/opencode/baton.js` sends this payload at the end of every opencode 2 turn |
 | `pi` | `{"type": "agent_settled"?, "session_id": "...", "cwd": "...", "model"?, "message"?}` | the glue fills the fields from the extension context |
 
 Any other event name in these payloads is `null`.
