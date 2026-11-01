@@ -163,7 +163,7 @@ Each plug-in is a command in user config. baton writes one JSON document to its 
 }
 ```
 
-`files` lists at most 2000 paths; `files_truncated` says there were more. The lens is cut to 64 KiB and redacted like the diff. A command verdict is redacted before it is stored, so a classifier that echoes a secret from the diff does not write it to the side repo.
+`files` lists at most 2000 paths; `files_truncated` says there were more. Only paths baton stores appear: one the user excluded, git ignores or that is over `max_file_bytes` is never listed or diffed, whichever commit it was in. An unchanged file is not listed, and a changed binary is `modified` with 0 added and 0 removed and no content lines. The lens is redacted like the diff, then cut to 64 KiB on a UTF-8 boundary. A command verdict is redacted before it is stored, so a classifier that echoes a secret from the diff does not write it to the side repo.
 
 ### `baton.lens.v1`, the optional lens command
 

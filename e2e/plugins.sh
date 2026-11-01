@@ -161,7 +161,7 @@ elif mode == "adapt":  # seen-file
 elif mode == "lens":
     out({"lens": "lens from command for " + json.loads(data)["thread"]})
 elif mode == "lensbig":  # 100000 three-byte characters
-    out({"lens": "€" * 100000})
+    out({"lens": "\u20ac" * 100000})
 EOF
 cat >"$TMP/stubs/endpoint_stub.py" <<'EOF'
 # Stands in for an OpenAI-compatible endpoint and a webhook receiver. Bound to 127.0.0.1 only.
@@ -685,16 +685,17 @@ config "[classify]" "command = $(stubcmd verdict quiet "$SEEN/base-b.json")" "ti
 base_repo baseb
 printf 'one\n' >"$REPO/a.txt"
 yes 'a line of text that makes the file larger than the diff cap' | head -c 1572864 >"$REPO/big.txt"
-yes $'a CRLF line of text that makes the file larger than the diff cap' | head -n 40000 >"$REPO/big-crlf.txt"
-yes $'a short CRLF file' | head -n 3 >"$REPO/small-crlf.txt"
-git -c core.autocrlf=true add -A >/dev/null 2>&1
+yes $'a CRLF line of text that makes the file larger than the diff cap\r' | head -n 40000 >"$REPO/big-crlf.txt"
+yes $'a short CRLF file\r' | head -n 3 >"$REPO/small-crlf.txt"
+git -C "$REPO" -c core.autocrlf=true add -A >/dev/null 2>&1
 git -C "$REPO" commit -q -m initial
 "$BIN" enroll "$(wp "$REPO")" >/dev/null 2>&1
 printf 'two\n' >"$REPO/a.txt"
 printf 'beta\n' >"$REPO/b.txt"
 turn t-base "the first turn" >/dev/null
 wait_verdict t-base
-eq "unchanged files are not listed: over 1 MiB, or checked out with CRLF over a blob with LF"   "a.txt:modified:1:1,b.txt:added:1:0" "$(files_of "$TMP/seen/base-b.json")"
+eq "unchanged files are not listed: over 1 MiB, or checked out with CRLF over a blob with LF" \
+  "a.txt:modified:1:1,b.txt:added:1:0" "$(files_of "$TMP/seen/base-b.json")"
 
 config "[classify]" "command = $(stubcmd verdict quiet "$SEEN/excl.json")" "timeout = \"5s\""
 base_repo excl
@@ -731,16 +732,27 @@ doc="$TMP/seen/lens-cmd.json"
 eq "a command's lens of 100000 three-byte characters is 21845 characters" "21845" "$(jget "$doc" 'len(d["lens"])')"
 eq "and 65535 bytes" "65535" "$(jget "$doc" 'len(d["lens"].encode())')"
 
-"$PY" -I -c 'import sys; open(sys.argv[1], "w", encoding="utf-8", newline="").write("€" * 30000)' "$(wp "$REPO")/docs/long-lens.md"
+"$PY" -I -c 'import sys; open(sys.argv[1], "w", encoding="utf-8", newline="").write("\u20ac" * 30000)' "$(wp "$REPO")/docs/long-lens.md"
 config "[classify]" "command = $(stubcmd verdict check "$SEEN/lens-file.json")" "[lens]" "file = \"docs/long-lens.md\""
 printf 'lens two\n' >>"$REPO/a.txt"
 turn t-lensfile "a long lens file" >/dev/null
 wait_verdict t-lensfile
 doc="$TMP/seen/lens-file.json"
 eq "a lens file cut mid-character is not longer than 64 KiB" "True" "$(jget "$doc" 'len(d["lens"].encode()) <= 65536')"
-eq "and ends on a whole character" "False" "$(jget "$doc" '"�" in d["lens"]')"
+eq "and ends on a whole character" "False" "$(jget "$doc" '"\ufffd" in d["lens"]')"
 eq "and keeps every whole character that fits" "21845" "$(jget "$doc" 'len(d["lens"])')"
 rm -f "$REPO/docs/long-lens.md"
+
+{ head -c 65530 /dev/zero | tr '\0' 'x'; printf ' AKIAIOSFODNN7EXAMPLE tail
+'; } >"$REPO/docs/edge-lens.md"
+config "[classify]" "command = $(stubcmd verdict check "$SEEN/lens-edge.json")" "[lens]" "file = \"docs/edge-lens.md\""
+printf 'lens three
+' >>"$REPO/a.txt"
+turn t-lensedge "a secret on the 64 KiB mark" >/dev/null
+wait_verdict t-lensedge
+lens=$(jget "$TMP/seen/lens-edge.json" 'd["lens"]')
+lacks "a secret on the cut of a lens file leaves no prefix of itself" "$lens" "AKIA"
+rm -f "$REPO/docs/edge-lens.md"
 section_end
 
 section "baton ask passes the thread on"
