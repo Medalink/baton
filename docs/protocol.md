@@ -11,7 +11,7 @@ This file defines everything a third party needs to talk to baton: the WebSocket
 
 ## Transport
 
-One WebSocket per machine. The client sends the subprotocol `baton.v1` and an `Authorization: Bearer <token>` header. The server refuses any other subprotocol.
+One WebSocket per machine. The client sends the subprotocol `baton.v1` and an `Authorization: Bearer <token>` header. The server refuses any other subprotocol with `400`. A request the auth provider does not accept is answered with `401` and the connection is never upgraded, so no `welcome` follows. The server may serve `wss://`; a client then trusts the system roots plus an optional CA file named in its config, and never skips verification.
 
 Every WebSocket message is binary. Byte 0 is the frame kind:
 
@@ -24,6 +24,8 @@ An object larger than 1 MiB is split into frames of at most 1 MiB of payload wit
 
 `xfer` groups the object frames that precede one control message. The client numbers its transfers with odd numbers and the server with even numbers.
 
+The first message after the upgrade must be `hello`. A message before it, a second `hello`, a text message, or a frame over `max_frame` is a violation: the server sends `error` and closes the connection. A message with a tag the receiver does not know is ignored.
+
 ## Control messages
 
 ### Client to server
@@ -31,6 +33,8 @@ An object larger than 1 MiB is split into frames of at most 1 MiB of payload wit
 ```json
 {"t":"hello","proto":1,"machine":"laptop","projects":["github.com/acme/app"],"client":"baton 0.1.0"}
 ```
+
+`hello` subscribes the connection to every project it names, at most 256. `machine` is what the client believes it is. The server logs a difference and uses the machine from auth.
 
 ```json
 {"t":"advance","xfer":7,"project":"github.com/acme/app","thread":"3f2a9c","expected":null,"new":"<commit id>"}
@@ -42,11 +46,13 @@ An object larger than 1 MiB is split into frames of at most 1 MiB of payload wit
 {"t":"want","xfer":9,"project":"github.com/acme/app","ids":["<id>","<id>"]}
 ```
 
-`want` asks the server for objects, after a `moved` whose objects did not all arrive.
+`want` asks the server for objects, after a `moved` whose objects did not all arrive. It carries at most 2,048 ids. The server answers with the object frames and then `objects_sent`.
 
 ```json
 {"t":"subscribe","project":"github.com/acme/app"}
 ```
+
+`subscribe` adds one project after `hello`. The server answers with `heads` for it.
 
 ### Server to client
 
@@ -54,7 +60,7 @@ An object larger than 1 MiB is split into frames of at most 1 MiB of payload wit
 {"t":"welcome","proto":1,"machine":"laptop","limits":{"max_frame":1049600,"max_object":67108864},"heads":[{"project":"github.com/acme/app","thread":"3f2a9c","tip":"<commit id>","owner":"laptop"}]}
 ```
 
-`machine` is the authoritative machine id from auth. `heads` lists every thread tip in the projects the client named, so a reconnecting client knows which local turns the server lacks.
+`machine` is the authoritative machine id from auth, and the client uses it as its own from then on. `heads` lists every thread tip in the projects the client named, so a reconnecting client knows which local turns the server lacks. `owner` is the `Baton-Machine` trailer of the tip. More than 1,000 heads continue in `{"t":"heads","heads":[...]}` messages, which also answer `subscribe`.
 
 ```json
 {"t":"advanced","xfer":7,"thread":"3f2a9c","new":"<commit id>"}
@@ -70,10 +76,12 @@ An object larger than 1 MiB is split into frames of at most 1 MiB of payload wit
 {"t":"refused","xfer":7,"thread":"3f2a9c","reason":"stale","current":"<commit id>"}
 ```
 
-`reason` is one of `stale` (the ref is not at `expected`), `not_owner` (another machine owns the thread), `machine_mismatch` (the tip's `Baton-Machine` trailer is not the authenticated machine), `invalid` (a malformed object or tree). A `stale` refusal whose `current` equals the client's `new` is a success whose answer was lost.
+`reason` is one of `stale` (the ref is not at `expected`), `not_owner` (another machine owns the thread), `machine_mismatch` (a new turn's `Baton-Machine` trailer is not the authenticated machine), `invalid` (a malformed object or tree, or a turn that does not continue the thread). A `stale` refusal whose `current` equals the client's `new` is a success whose answer was lost. `detail` is an optional sentence for a human or a log. A reader must not parse it.
+
+The server checks an `advance` in this order, and the first failure answers: the owner (`not_owner`), the ref against `expected` (`stale`), the closure of `new` (`need`), the objects and each new turn's trailers and sequence number (`machine_mismatch`, `invalid`), then the compare-and-swap, which can still answer `stale`.
 
 ```json
-{"t":"moved","xfer":8,"project":"github.com/acme/app","thread":"3f2a9c","old":"<commit id>","new":"<commit id>","meta":{"turn":12,"subject":"Rename the trap receiver","agent":"claude-code","model":"claude-sonnet-5-5","machine":"laptop","at":1793508000000}}
+{"t":"moved","xfer":8,"project":"github.com/acme/app","thread":"3f2a9c","old":"<commit id, or null for a new thread>","new":"<commit id>","meta":{"turn":12,"subject":"Rename the trap receiver","agent":"claude-code","model":"claude-sonnet-5-5","machine":"laptop","at":1793508000000}}
 ```
 
 The server sends `moved` to every other subscribed machine after a ref moves. Object frames carrying the same `xfer` precede it when the new objects total at most 256 KiB. Otherwise the follower sends `want` for what it lacks.
@@ -82,17 +90,19 @@ The server sends `moved` to every other subscribed machine after a ref moves. Ob
 {"t":"objects_sent","xfer":10}
 ```
 
-The end of a server reply to `want`.
+The end of a server reply to `want`. Its `xfer` is the server's own, the one on the object frames it sends, and not the `xfer` of the `want`. A client pairs the replies with its `want`s by order, since the server answers them in the order it received them.
 
 ```json
 {"t":"error","code":"unsupported_version","message":"..."}
 ```
 
+`error` is followed by a close. `code` is one of `unsupported_version`, `protocol`, `invalid_message`, `too_large`, `unauthorized` (the device was revoked while connected; the server checks at each `advance` and at each heartbeat) and `internal`. The server sends a ping every 15 s and closes a connection that has been silent for 60 s. A client treats 45 s without any message as a dead link.
+
 ## Server invariants
 
 1. An object stored on the server has every object it references stored.
 2. A ref moves only after the new commit's closure is complete, by compare-and-swap.
-3. A thread has one owner machine, set by its first accepted `advance`.
+3. A thread has one owner machine, the one named by the `Baton-Machine` trailer of its tip. The first accepted `advance` sets it, and only an operator editing the ref by hand changes it. An `advance` from any other machine is refused with `not_owner`.
 4. Tree entry names are non-empty, contain no `/` or NUL, are not `.`, `..`, or `.git` in any case, and appear once per tree.
 
 These make every server repo a plain bare repo that `git fetch` reads completely.
@@ -184,9 +194,13 @@ Each plug-in is a command in user config. baton writes one JSON document to its 
 {"schema": "baton.auth.v1", "remote_addr": "100.64.0.7:51234", "headers": {"authorization": "Bearer ..."}, "client_cert_sha256": null}
 ```
 
+`headers` has lowercase names. `client_cert_sha256` is always null in this version, since the server does not ask for client certificates. The server names the command in `<data>/server.toml` under `[auth]` (`provider = "command"`, `command = [...]`, `timeout_ms`).
+
 ```json
 {"ok": true, "machine": "laptop"}
 ```
+
+`machine` is the machine id for the whole connection: the server puts it in `welcome`, compares it with each tip's `Baton-Machine`, and names it in `heads` and `moved`. Anything but `ok: true` with a valid machine id, including a timeout or a non-zero exit, refuses the connection.
 
 ### `baton.turnreq.v1`, the output of an agent adapter
 
