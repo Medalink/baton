@@ -94,6 +94,9 @@ now_ms() { local t=$EPOCHREALTIME; t=${t/./}; echo $((t / 1000)); }
 json() { "$BIN" report "$@" --json 2>&1; }
 text() { "$BIN" report "$@" 2>&1; }
 
+# edit SCRIPT FILE : sed -i, which BSD sed spells differently.
+edit() { sed "$1" "$2" >"$2.t" && mv "$2.t" "$2"; }
+
 git_digest() { (cd "$1/.git" && find . -type f | sort | xargs sha256sum | sha256sum | cut -d' ' -f1); }
 
 turn_in() { # turn_in dir thread message [baton turn args...]
@@ -147,9 +150,9 @@ beta
 gamma
 EOF
 turn_in "$T" thrash1 "add three lines" --agent claude-code --model m-alpha >/dev/null
-sed -i 's/^beta$/beta two/' "$T/src/hot.rs"
+edit 's/^beta$/beta two/' "$T/src/hot.rs"
 turn_in "$T" thrash1 "reword beta" --agent claude-code --model m-alpha >/dev/null
-sed -i '/^gamma$/d' "$T/src/hot.rs"
+edit '/^gamma$/d' "$T/src/hot.rs"
 turn_in "$T" thrash1 "drop gamma" --agent claude-code --model m-alpha >/dev/null
 printf 'delta\n' >>"$T/src/hot.rs"
 turn_in "$T" thrash1 "add delta" --agent claude-code --model m-alpha >/dev/null
@@ -190,8 +193,8 @@ SHIPPED=$(git -C "$R" rev-parse HEAD)
 # reworker: starts after the ship, and changes what author shipped.
 wt reworker
 W="$TMP/wt-reworker"
-sed -i 's/^ship two$/ship two, reworked/' "$W/src/ship.rs"
-sed -i '/^shipped hot line$/d' "$W/src/hot.rs"
+edit 's/^ship two$/ship two, reworked/' "$W/src/ship.rs"
+edit '/^shipped hot line$/d' "$W/src/hot.rs"
 turn_in "$W" reworker "fix what shipped" --agent codex --model m-beta >/dev/null
 
 # clean1 and clean2: at most two turns on a file, never shipped, recent.
@@ -239,7 +242,7 @@ plant lost $((3 * DAY - 3600)) 2 "$SHIPPED" "$SHIPPED" 'printf "lost a\nlost b\n
 # late-a: work from five days ago that the user shipped four days ago.
 plant late-a $((5 * DAY)) 1 "$BASE" "$BASE" 'printf "late one\nlate two\nlate three\n" >src/late.rs'
 # late-b: three hours ago removes a line late-a's work shipped four days ago: past the 48-hour window.
-plant late-b 10800 1 "$LATE" "$LATE" 'sed -i "/^late two$/d" src/late.rs'
+plant late-b 10800 1 "$LATE" "$LATE" 'edit "/^late two$/d" src/late.rs'
 
 out=$(cd "$R" && "$BIN" log lost 2>&1)
 contains "baton log reads a planted turn" "$out" "lost"
@@ -306,9 +309,13 @@ contains "a bad window is refused" "$out" "not a window"
 
 section "read-only"
 eq "the user's repository is byte-identical" "$DIGEST_BEFORE" "$(git_digest "$R")"
-pid_before=$(daemon_pid)
-out=$(text)
-eq "a report leaves the daemon as it was" "$pid_before" "$(daemon_pid)"
+# A daemon that starts writes "daemon starting" to its log, so a log that has not grown means none started.
+kill_pid "$(daemon_pid)"
+sleep 1
+LOG="$BATON_HOME/data/daemon.log"
+log_before=$(wc -c <"$LOG")
+(cd "$R" && "$BIN" report >/dev/null 2>&1; "$BIN" report --json >/dev/null 2>&1)
+eq "a report starts no daemon" "$log_before" "$(wc -c <"$LOG")"
 
 # ---------------------------------------------------------------------------------------------- scale
 section "a large project: cold run against a cached run"
