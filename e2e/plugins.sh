@@ -144,6 +144,10 @@ elif mode == "decide":  # choice | human | outside
     else:
         out({"schema": "baton.answer.v1", "choice": sys.argv[2], "confidence": 0.82,
              "reason": "saw " + ask["question"]})
+elif mode == "decide-seen":  # choice, seen-file
+    with open(sys.argv[3], "wb") as f:
+        f.write(data)
+    out({"schema": "baton.answer.v1", "choice": sys.argv[2], "confidence": 0.8, "reason": "x"})
 elif mode == "adapt":  # seen-file
     with open(sys.argv[2], "wb") as f:
         f.write(data)
@@ -156,6 +160,8 @@ elif mode == "adapt":  # seen-file
              "checks": [{"name": "lint", "exit": 0}]})
 elif mode == "lens":
     out({"lens": "lens from command for " + json.loads(data)["thread"]})
+elif mode == "lensbig":  # 100000 three-byte characters
+    out({"lens": "€" * 100000})
 EOF
 cat >"$TMP/stubs/endpoint_stub.py" <<'EOF'
 # Stands in for an OpenAI-compatible endpoint and a webhook receiver. Bound to 127.0.0.1 only.
@@ -626,6 +632,111 @@ EOF
 eq "the example holds only keys the user config accepts" "ok" "$shape"
 placeholders=$(grep -Ei '([0-9]{1,3}\.){3}[0-9]{1,3}|ghp_|bearer|AKIA' "$example" | grep -vc '0\.0\.0\.0')
 eq "the example holds no address or token" 0 "$placeholders"
+section_end
+
+section "a first turn leaves out what the store policy left out"
+MAIN_REPO=$REPO
+MAIN_SIDE=$SIDE
+base_repo() { # base_repo name : a throwaway repo with a remote of its own; points REPO and SIDE at it
+  REPO="$TMP/$1"
+  mkdir -p "$REPO"
+  git init -q "$REPO"
+  git -C "$REPO" remote add origin "https://github.com/E2E/$1.git"
+  SIDE="$BATON_HOME/data/projects/github.com+e2e+$1.git"
+}
+files_of() { jget "$1" '",".join(f["path"]+":"+f["status"]+":"+str(f["added"])+":"+str(f["removed"]) for f in d["files"])'; }
+
+config "[snapshot]" "exclude = ['secrets/**']" "max_file_bytes = 1000" \
+  "[classify]" "command = $(stubcmd verdict quiet "$SEEN/base-a.json")" "timeout = \"5s\""
+base_repo basea
+mkdir -p "$REPO/secrets"
+printf 'plain-text-of-the-excluded-file\n' >"$REPO/secrets/key.txt"
+for _ in $(seq 100); do echo SIZESKIPPED-CONTENT; done >"$REPO/skipped.txt"
+printf 'unchanged\n' >"$REPO/kept.txt"
+printf 'old\n' >"$REPO/changed.txt"
+printf 'going away\n' >"$REPO/gone.txt"
+printf '\0binary-v1' >"$REPO/bin.dat"
+git -C "$REPO" add -A >/dev/null 2>&1
+git -C "$REPO" commit -q -m initial
+"$BIN" enroll "$(wp "$REPO")" >/dev/null 2>&1
+printf 'edited-excluded-file\n' >"$REPO/secrets/key.txt"
+echo SIZESKIPPED-CONTENT >>"$REPO/skipped.txt"
+printf 'new\n' >"$REPO/changed.txt"
+rm -f "$REPO/gone.txt"
+printf '\0binary-v2' >"$REPO/bin.dat"
+printf 'fresh\n' >"$REPO/new.txt"
+turn t-base "the first turn" >/dev/null
+wait_verdict t-base
+doc="$TMP/seen/base-a.json"
+eq "only the files that changed and that the policy stores are listed" \
+  "bin.dat:modified:0:0,changed.txt:modified:1:1,gone.txt:removed:0:1,new.txt:added:1:0" "$(files_of "$doc")"
+whole=$(cat "$doc")
+lacks "an excluded file's text is not in the document" "$whole" "plain-text-of-the-excluded-file"
+lacks "an excluded file's new text is not in the document" "$whole" "edited-excluded-file"
+lacks "a size-skipped file's text is not in the document" "$whole" "SIZESKIPPED-CONTENT"
+lacks "an excluded path is not listed" "$(jget "$doc" '[f["path"] for f in d["files"]]')" "secrets"
+lacks "an unchanged file is not listed" "$(jget "$doc" '[f["path"] for f in d["files"]]')" "kept.txt"
+contains "a deleted file still shows its lines" "$(jget "$doc" 'd["diff"]')" "-going away"
+contains "a changed binary is reported as differing" "$(jget "$doc" 'd["diff"]')" "Binary files a/bin.dat b/bin.dat differ"
+lacks "a binary's bytes are not in the document (v1)" "$whole" "binary-v1"
+lacks "a binary's bytes are not in the document (v2)" "$whole" "binary-v2"
+
+config "[classify]" "command = $(stubcmd verdict quiet "$SEEN/base-b.json")" "timeout = \"5s\""
+base_repo baseb
+printf 'one\n' >"$REPO/a.txt"
+yes 'a line of text that makes the file larger than the diff cap' | head -c 1572864 >"$REPO/big.txt"
+git -C "$REPO" add -A >/dev/null 2>&1
+git -C "$REPO" commit -q -m initial
+"$BIN" enroll "$(wp "$REPO")" >/dev/null 2>&1
+printf 'two\n' >"$REPO/a.txt"
+printf 'beta\n' >"$REPO/b.txt"
+turn t-base "the first turn" >/dev/null
+wait_verdict t-base
+eq "an unchanged file over 1 MiB is not listed" "a.txt:modified:1:1,b.txt:added:1:0" "$(files_of "$TMP/seen/base-b.json")"
+
+REPO=$MAIN_REPO
+SIDE=$MAIN_SIDE
+section_end
+
+section "a lens is cut at 64 KiB on a character boundary"
+config "[classify]" "command = $(stubcmd verdict check "$SEEN/lens-cmd.json")" "[lens]" "command = $(stubcmd lensbig)"
+printf 'lens one\n' >>"$REPO/a.txt"
+turn t-lenscmd "a long lens from a command" >/dev/null
+wait_verdict t-lenscmd
+doc="$TMP/seen/lens-cmd.json"
+eq "a command's lens of 100000 three-byte characters is 21845 characters" "21845" "$(jget "$doc" 'len(d["lens"])')"
+eq "and 65535 bytes" "65535" "$(jget "$doc" 'len(d["lens"].encode())')"
+
+"$PY" -I -c 'import sys; open(sys.argv[1], "w", encoding="utf-8", newline="").write("€" * 30000)' "$(wp "$REPO")/docs/long-lens.md"
+config "[classify]" "command = $(stubcmd verdict check "$SEEN/lens-file.json")" "[lens]" "file = \"docs/long-lens.md\""
+printf 'lens two\n' >>"$REPO/a.txt"
+turn t-lensfile "a long lens file" >/dev/null
+wait_verdict t-lensfile
+doc="$TMP/seen/lens-file.json"
+eq "a lens file cut mid-character is not longer than 64 KiB" "True" "$(jget "$doc" 'len(d["lens"].encode()) <= 65536')"
+eq "and ends on a whole character" "False" "$(jget "$doc" '"�" in d["lens"]')"
+eq "and keeps every whole character that fits" "21845" "$(jget "$doc" 'len(d["lens"])')"
+rm -f "$REPO/docs/long-lens.md"
+section_end
+
+section "baton ask passes the thread on"
+config "[decide]" "command = $(stubcmd decide-seen remove "$SEEN/ask.json")"
+ask_thread() { # ask_thread [VAR=value ...] -- [baton ask args] : what the decider received as "thread"
+  rm -f "$TMP/seen/ask.json"
+  local envs=()
+  while [[ $1 != -- ]]; do envs+=("$1"); shift; done
+  shift
+  (cd "$REPO" && env -u BATON_THREAD ${envs[@]+"${envs[@]}"} "$BIN" ask "Keep the endpoint?" --option keep --option remove "$@" >/dev/null 2>&1)
+  jget "$TMP/seen/ask.json" 'd["thread"]'
+}
+eq "without a thread the decider is given null" "None" "$(ask_thread --)"
+eq "--thread is passed on" "sess-42" "$(ask_thread -- --thread sess-42)"
+eq "BATON_THREAD is passed on" "sess-env" "$(ask_thread BATON_THREAD=sess-env --)"
+eq "--thread wins over BATON_THREAD" "sess-flag" "$(ask_thread BATON_THREAD=sess-env -- --thread sess-flag)"
+eq "an empty BATON_THREAD is no thread" "None" "$(ask_thread BATON_THREAD= --)"
+help=$("$BIN" ask --help 2>&1)
+contains "the command help names --thread" "$help" "--thread"
+contains "the command help names BATON_THREAD" "$help" "BATON_THREAD"
 section_end
 
 section "the side repo"
