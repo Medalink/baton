@@ -4,6 +4,7 @@
 
 use crate::error::{Error, Result};
 use gix::bstr::ByteSlice;
+use gix::config::Source;
 use gix::dir::walk::{Action, Delegate, EmissionMode};
 use gix::dir::{EntryRef, entry};
 use gix::index::entry::Mode;
@@ -67,6 +68,27 @@ impl IgnoreRules {
         }
         if let Some(workdir) = self.repo.workdir() {
             files.push(workdir.join(".gitignore"));
+        }
+        // `core.excludesFile` can come from any of these, and from a file they include. The ones that do
+        // not exist yet are listed too, so creating one is noticed.
+        let snapshot = self.repo.config_snapshot();
+        let mut env = |var: &str| std::env::var_os(var);
+        let locations = [
+            Source::GitInstallation,
+            Source::System,
+            Source::Git,
+            Source::User,
+        ]
+        .into_iter()
+        .filter_map(|source| source.storage_location(&mut env));
+        let loaded = snapshot
+            .plumbing()
+            .sections()
+            .filter_map(|section| section.meta().path.clone());
+        for file in locations.chain(loaded) {
+            if !files.contains(&file) {
+                files.push(file);
+            }
         }
         let configured = self
             .repo

@@ -638,6 +638,42 @@ eq "and so is the next" "app-v3" "$(blob_of h2 dist/app.js)"
 "$BIN" unenroll "$(wp "$H")" >/dev/null 2>&1
 section_end
 
+section "I. a global core.excludesFile set or edited after enrollment is honoured"
+GX="$TMP/globx"
+mkmin "$GX" globx
+mkdir -p "$GX/vendor"
+printf 'lib1\n' >"$GX/vendor/lib.js"
+"$BIN" enroll "$(wp "$GX")" >/dev/null 2>&1
+SIDE=$(side_of globx)
+DPID=$(daemon_pid)
+turn_in "$GX" i1 "nothing ignores it yet" >/dev/null
+contains "an untracked directory is stored while nothing ignores it" "$(tree_of i1)" "vendor/lib.js"
+printf 'vendor/\n' >"$TMP/globalignore"
+printf 'vendor/\n' >"$TMP/globalignore2"
+git config --file "$GIT_CONFIG_GLOBAL" core.excludesFile "$(wp "$TMP")/globalignore"
+printf 'lib2\n' >"$GX/vendor/lib.js"
+sleep 0.4
+turn_in "$GX" i1 "key added to the global gitconfig" >/dev/null
+lacks "the key added to the global gitconfig takes effect" "$(tree_of i1)" "vendor/"
+: >"$TMP/globalignore"
+printf 'lib3\n' >"$GX/vendor/lib.js"
+sleep 0.4
+turn_in "$GX" i1 "excludes file emptied" >/dev/null
+eq "an edit to the excludes file it names takes effect" "lib3" "$(blob_of i1 vendor/lib.js)"
+git config --file "$GIT_CONFIG_GLOBAL" core.excludesFile "$(wp "$TMP")/globalignore2"
+printf 'lib4\n' >"$GX/vendor/lib.js"
+sleep 0.4
+turn_in "$GX" i1 "key points at another file" >/dev/null
+lacks "pointing the key at another file takes effect" "$(tree_of i1)" "vendor/"
+git config --file "$GIT_CONFIG_GLOBAL" --unset core.excludesFile
+printf 'lib5\n' >"$GX/vendor/lib.js"
+sleep 0.4
+turn_in "$GX" i1 "key removed" >/dev/null
+eq "removing the key takes effect" "lib5" "$(blob_of i1 vendor/lib.js)"
+eq "all of it without a daemon restart" "$DPID" "$(daemon_pid)"
+"$BIN" unenroll "$(wp "$GX")" >/dev/null 2>&1
+section_end
+
 SIDE=$(side_of widgets)
 
 section "the user's repo is untouched"
