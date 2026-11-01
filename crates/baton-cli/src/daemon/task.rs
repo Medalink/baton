@@ -2,6 +2,7 @@
 //! thread. It talks to its project's writer by message and to nobody else.
 
 use super::log::Log;
+use super::plugins::{Runner, Work};
 use super::writer::Writer;
 use crate::control::TurnArgs;
 use baton_core::{
@@ -91,6 +92,7 @@ struct Task {
     wt: Worktree,
     writer: Writer,
     log: Arc<Log>,
+    plugins: Runner,
     label: String,
     dirty: DirtySet,
     rx: Receiver<Cmd>,
@@ -98,8 +100,21 @@ struct Task {
     status: Arc<std::sync::Mutex<Snapshot>>,
 }
 
+/// What a worktree task talks to besides its own watcher.
+struct Services {
+    writer: Writer,
+    log: Arc<Log>,
+    plugins: Runner,
+}
+
 /// Starts the task and waits until its first sync is done, so an enroll answer means the baseline exists.
-pub fn spawn(root: PathBuf, dirs: Dirs, writer: Writer, log: Arc<Log>) -> Result<(Handle, Ready)> {
+pub fn spawn(
+    root: PathBuf,
+    dirs: Dirs,
+    writer: Writer,
+    log: Arc<Log>,
+    plugins: Runner,
+) -> Result<(Handle, Ready)> {
     let (tx, rx) = channel::<Cmd>();
     let (ready_tx, ready_rx) = sync_channel::<Result<Ready>>(1);
     let status = Arc::new(std::sync::Mutex::new(Snapshot::default()));
@@ -109,15 +124,12 @@ pub fn spawn(root: PathBuf, dirs: Dirs, writer: Writer, log: Arc<Log>) -> Result
     std::thread::Builder::new()
         .name("baton-worktree".into())
         .spawn(move || {
-            let started = start(
-                &thread_root,
-                &dirs,
+            let services = Services {
                 writer,
                 log,
-                rx,
-                event_tx,
-                thread_status,
-            );
+                plugins,
+            };
+            let started = start(&thread_root, &dirs, services, rx, event_tx, thread_status);
             match started {
                 Ok((mut task, watcher, ready)) => {
                     let _ = ready_tx.send(Ok(ready));
@@ -145,18 +157,23 @@ pub fn spawn(root: PathBuf, dirs: Dirs, writer: Writer, log: Arc<Log>) -> Result
 fn start(
     root: &Path,
     dirs: &Dirs,
-    writer: Writer,
-    log: Arc<Log>,
+    services: Services,
     rx: Receiver<Cmd>,
     event_tx: Sender<Cmd>,
     status: Arc<std::sync::Mutex<Snapshot>>,
 ) -> Result<(Task, notify::RecommendedWatcher, Ready)> {
+    let Services {
+        writer,
+        log,
+        plugins,
+    } = services;
     let wt = Worktree::open(root, dirs, &|tree| writer.has_tree(tree))?;
     let mut task = Task {
         label: root.display().to_string(),
         wt,
         writer,
         log,
+        plugins,
         dirty: DirtySet::default(),
         rx,
         backlog: VecDeque::new(),
@@ -448,12 +465,20 @@ impl Task {
             ms(done),
             ms(saved)
         ));
-        Ok(Done {
+        let done = Done {
             thread: record.turn.draft.thread.to_string(),
             seq: record.turn.seq.get(),
             id: record.id.to_string(),
             changed,
-        })
+        };
+        // After the ref has moved and the state is saved: a plug-in can only come after the turn.
+        self.plugins.submit(Work {
+            root: self.wt.root().to_owned(),
+            project: self.wt.project().clone(),
+            record,
+            writer: self.writer.clone(),
+        });
+        Ok(done)
     }
 
     /// Built after the sync, so the policy is today's and `Baton-Skipped` lists what this sync skipped.

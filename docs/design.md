@@ -20,11 +20,12 @@ baton daemon                      # per-user process; other commands start it wh
 baton enroll [path]               # start watching a worktree
 baton unenroll [path]             # stop watching; its history stays
 baton status
-baton log [thread]
+baton log [thread] [--verdicts]
+baton verdict <turn> [--thread T] [--json]   # the verdict stored for a turn
 baton rewind <turn> [--thread T] [--apply]
 baton pull <thread> [--into dir]  # a new worktree at the thread's latest turn
 baton follow <thread> [--into dir]  # print each new turn; with --into, apply it there too
-baton ask <question> --option a --option b
+baton ask <question> --option a --option b [--context text] [--thread id]   # exit 0 chose, 2 ask a human
 baton serve [--data dir] [--listen addr] [--tls-cert pem --tls-key pem] [--trace]
 baton admin [--data dir] device add <name>     # prints a token once
 baton admin [--data dir] device list|revoke ...
@@ -175,7 +176,7 @@ command = ["/usr/local/bin/baton-auth"]
 timeout_ms = 2000
 ```
 
-Without `server.toml` the built-in token provider runs. A `server.toml` the server cannot read stops it at start. A command that fails or times out, a token that matches no active device, and a missing `Authorization` header all answer the WebSocket upgrade with `401`, so no `welcome` is sent. The machine id that auth returns is the machine for the whole session: it is the `machine` in `welcome`, the only value the server compares against the tip owner, and the client's `me` from then on. The id in the client's config only picks what the `hello` claims. Tailscale and mTLS are meant to ship as example commands under `contrib/`; this slice ships none.
+Without `server.toml` the built-in token provider runs. A `server.toml` the server cannot read stops it at start. A command that fails or times out, a token that matches no active device, and a missing `Authorization` header all answer the WebSocket upgrade with `401`, so no `welcome` is sent. The machine id that auth returns is the machine for the whole session: it is the `machine` in `welcome`, the only value the server compares against the tip owner, and the client's `me` from then on. The id in the client's config only picks what the `hello` claims. `contrib/examples/tailscale-selfhost.toml` shows a server on a tailnet with a Tailscale certificate and device tokens; no mTLS example is shipped.
 
 Operators: `baton admin device add <name>` creates a device and prints its token once, `device list` shows every device with its state, and `device revoke <name>` revokes all of a machine's active devices. A revoked device cannot connect again. Its open session gets an `error` with code `unauthorized` and is closed within 2 s. `admin threads` lists what the server holds and `admin reindex` rebuilds `projects` and `threads` from the refs.
 
@@ -199,17 +200,77 @@ Pushes and follows share the one connection and the daemon's own writer tasks, s
 
 ## Plug-ins
 
-Every plug-in is a `CommandSpec { command: Vec<String>, timeout }`, called with one JSON document on stdin and read as one JSON document from stdout. Timeout, non-zero exit, or unreadable output means fail open for classify, decide, and notify, and fail closed for auth. The timeout covers the whole call, from spawn until the output is read, not only until the command exits. The command runs in its own process group (unix) or Job Object (Windows), and the whole tree is killed when the call ends, so a grandchild that keeps stdout open cannot hold the caller past the deadline or outlive the call.
+Every plug-in is a `CommandSpec { command: Vec<String>, timeout }`, called with one JSON document on stdin and read as one JSON document from stdout. Timeout, non-zero exit, or unreadable output means fail open for classify, decide, and notify, and fail closed for auth. `plugin.rs` in `baton-core` is the only code that runs one. The timeout covers the whole call, from spawn until the output is read, not only until the command exits. The command runs in its own process group (unix) or Job Object (Windows), and the whole tree is killed when the call ends, so a grandchild that keeps stdout open cannot hold the caller past the deadline or outlive the call. No plug-in runs on the hook's path: the hook writes a frame, and a turn is classified on a worker thread of the daemon after the turn is committed.
 
 | Slot | Input | Output | Default |
 |---|---|---|---|
-| `classify` | `baton.turn.v1` | `baton.verdict.v1` | built-in rules from config globs and diff patterns |
+| `classify` | `baton.turn.v1` | `baton.verdict.v1` | built-in rules (below) |
 | `decide` | `baton.ask.v1` | `baton.answer.v1` | none, answer is "ask a human" |
-| `notify` | `baton.verdict.v1` plus turn | ignored | none |
+| `notify` | `{"verdict": ..., "turn": ...}` | ignored | none |
+| `lens` | a file path, or `baton.lens.v1` | text, or `{"lens": text}` | none |
 | `auth` | `baton.auth.v1` | `{ok, machine}` | built-in token |
-| `agents.<name>` | raw hook payload | `baton.turnreq.v1` | built-in adapters for Claude Code, Codex, opencode, Pi |
+| `agents.<name>` | raw hook payload | `baton.turnreq.v1` or `null` | built-in adapters for Claude Code, Codex, opencode, Pi |
 
-Verdicts never rewrite a turn commit. They are stored on `refs/baton-verdict/<turn>`.
+Verdicts never rewrite a turn commit. They are stored on `refs/baton-verdict/<turn commit>`, outside `refs/baton/`, so a verdict is never a thread tip and the sync link never sees it. Verdicts stay on the machine that made them.
+
+### Config
+
+Plug-ins are named in the user config (`config.toml` in baton's config directory) and nowhere else. A repo's `.baton/config.toml` that sets `[classify]`, `[decide]`, `[[notify]]`, `[lens]` or `[agents]` is ignored with a notice in the daemon log, because a cloned repo must not be able to run a command on the machine. The repo config type has no field that could carry one.
+
+```toml
+[classify]
+mode = "shadow"            # off | shadow (default) | live
+command = ["python3", "/path/to/classifier"]   # omit to use the built-in rules
+timeout = "10s"            # default 10s
+defaults = true            # built-in rules only: false drops the default rule set
+
+[[classify.rule]]          # built-in rules only; added to the defaults
+class = "react"
+kind = "billing_changed"
+paths = ["billing/**"]
+diff = "(?i)refund"        # a regex over the added lines
+
+[decide]
+command = ["python3", "/path/to/decider"]
+timeout = "30s"
+
+[[notify]]
+on = ["react", "check"]
+command = ["python3", "/path/to/notifier"]
+timeout = "5s"
+
+[lens]
+file = "docs/review-lens.md"   # inside the repo; or command = [...] with timeout = "5s"
+
+[agents.my-agent]
+command = ["/path/to/adapter"]
+timeout = "2s"
+```
+
+`shadow` stores verdicts and runs no notifier, so a classifier can be watched before it can interrupt anyone. `live` also runs every `[[notify]]` whose `on` includes the verdict's class. `off` skips classification. Plug-in config is read by its own loader for each turn, so a typo in it logs a line and costs the turn its verdict, never its capture. A rule needs `paths`, `diff`, or both; one with neither would match every turn and is refused. The lens file is read through its real path and must stay inside the repo, since a clone can carry a symlink.
+
+Any failure of a classifier, notifier or lens logs a line and leaves the turn recorded (`no verdict for <turn>: <why>`). A secret the redaction policy knows is redacted from a command's verdict before it is stored.
+
+### Default rules
+
+With no `[classify] command`, the built-in classifier runs these generic rules. The class of the verdict is the most urgent among the findings (`react`, `check`, `log`, `quiet`); a turn that matches nothing is `quiet`.
+
+| Class | Kind | Matches |
+|---|---|---|
+| `react` | `dropped_table_or_column` | a file under `migrations/` or `migrate/`, or any `.sql` file, whose added lines contain `DROP TABLE`, `DROP COLUMN`, `DROP SCHEMA`, `DROP DATABASE`, `TRUNCATE TABLE`, `drop_table`, `drop_column` or `remove_column` |
+| `check` | `lockfile_changed` | `Cargo.lock`, `package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock`, `pnpm-lock.yaml`, `bun.lockb`, `composer.lock`, `Gemfile.lock`, `poetry.lock`, `uv.lock`, `go.sum` |
+| `check` | `env_template_changed` | `.env.example`, `.env.sample`, `.env.dist` |
+| `check` | `auth_code_changed` | any file under an `auth`, `authn`, `authz`, `authentication`, `authorization`, `permissions` or `policies` directory |
+
+These read added lines and file names only. They do not parse SQL, so a drop written some other way, or in a file outside these paths, is missed. `[[classify.rule]]` and a command classifier exist for that. The defaults are a floor for a project with nothing configured, not a review.
+
+### Agent adapters
+
+`claude`, `codex`, `opencode` and `pi` are built in, and `docs/protocol.md` lists the payload each reads. Codex runs a command hook with the payload on stdin, so it needs only `baton hook codex` in its hook config. opencode and Pi have no command hooks, only in-process plug-ins, so each needs a few lines of glue that pipes its event to `baton hook <name>`. The glue is not shipped, because it could not be run against the real tools here. The field names come from the vendors' current documentation (linked in the pull request that added the adapters). The opencode `session.idle` shape is checked against the installed `@opencode-ai/sdk` types and the Pi context fields (`ctx.cwd`, `ctx.sessionManager.getSessionId()`) against its extension docs. `ctx.model.id` in Pi is not confirmed, so `model` is optional there. A `[agents.<name>]` command replaces the built-in adapter of that name. It runs on a thread of its own under its timeout, so a slow adapter never holds up the daemon.
+
+### Windows
+
+The daemon is a detached process with no console. A plug-in child started with the default flags, or with `CREATE_NO_WINDOW`, was given a console of its own, and about one launch in five died with a Ctrl+C status (`0xc000013a`). Children are started with `DETACHED_PROCESS`, which gave no failure in 80 launches of a repro. A plug-in that itself starts a console program may see a window flash.
 
 ## Verification
 
@@ -284,7 +345,6 @@ A burst of 30 threads, one turn each at 100 ms spacing, takes a median 11.6 ms a
 ### Differences from the sections above
 
 - Control commands share the hook's endpoint through a second frame type, `BTC1`, rather than listening on another.
-- `ask` is not in this slice, nor are the other agent adapters. Only `claude` is.
 - The state of each worktree's stat cache and current tree is saved to `<data>/worktrees/<hash>.json` after each turn and after the baseline. It is a mirror of the side repo, so a lost or unreadable file costs one rescan, not data.
 
 ### Differences from the sections above, sync slice
@@ -294,7 +354,16 @@ A burst of 30 threads, one turn each at 100 ms spacing, takes a median 11.6 ms a
 - `objects_sent` carries the server's own transfer number, not the client's `want` number. A client pairs replies with `want`s by order. `protocol.md` says so.
 - `refused` has an optional `detail`.
 - The `[server]` section of the user config is read when the daemon starts. A change needs a restart.
-- Tailscale and mTLS auth examples under `contrib/` are not in this slice.
+- Tailscale ships as a config example. No mTLS example is shipped, and the server does not ask for client certificates.
+
+### Differences from the sections above, plug-ins slice
+
+- Verdicts are local only. They are not pushed to the server and not followed from it. A verdict is a judgment one machine made with its own classifier and config, and `refs/baton-verdict/` sits outside the refs the sync link tracks.
+- `mode = off` was added beside `shadow` and `live`, so classification can be turned off without removing config.
+- `notify` receives the turn document and the verdict together as `{"verdict": ..., "turn": ...}`.
+- `[lens]` may name a command as well as a file, with `baton.lens.v1` in and `{"lens": text}` out.
+- `files_truncated` was added to `baton.turn.v1`, `lines` in verdict evidence is optional, and a command adapter may print `null` for a payload that is not the end of a turn.
+- Plug-in children are started detached on Windows (see Plug-ins, Windows).
 
 ### Known limits
 

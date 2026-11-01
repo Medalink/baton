@@ -7,6 +7,7 @@
 use crate::error::{Error, IoContext, Result};
 use crate::id::{BlobId, FileKind, Oid, RelPath, ThreadId, TreeId, TurnId, TurnSeq, UnixMillis};
 use crate::names::MAX_TREE_DEPTH;
+use crate::schema::TurnVerdict;
 use crate::turn::{Turn, TurnDraft};
 use crate::wire::ObjectKind;
 use gix::objs::{Exists as _, Find as _, Write as _};
@@ -19,6 +20,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const REF_PREFIX: &str = "refs/baton/";
+const VERDICT_PREFIX: &str = "refs/baton-verdict/";
+const VERDICT_FILE: &str = "verdict.json";
 
 pub struct BlobPayload {
     pub id: BlobId,
@@ -332,6 +335,86 @@ impl SideRepo {
         }
         out.sort();
         Ok(out)
+    }
+
+    /// Stores a verdict as a commit holding `verdict.json`, on `refs/baton-verdict/<turn>`. The turn commit
+    /// is never touched, and the ref is outside `refs/baton/`, so nothing that lists or sends turns sees it.
+    /// A turn that already has a verdict gets the new one.
+    pub fn store_verdict(&self, turn: TurnId, verdict: &TurnVerdict, source: &str) -> Result<()> {
+        let json = serde_json::to_vec_pretty(verdict).map_err(|e| Error::invalid("verdict", e))?;
+        let blob = self.repo.write_blob(&json).map_err(Error::git)?.detach();
+        let tree = self
+            .repo
+            .write_object(gix::objs::Tree {
+                entries: vec![gix::objs::tree::Entry {
+                    mode: gix::objs::tree::EntryKind::Blob.into(),
+                    filename: VERDICT_FILE.into(),
+                    oid: blob,
+                }],
+            })
+            .map_err(Error::git)?
+            .detach();
+        let at = UnixMillis::now();
+        let commit = gix::objs::Commit {
+            tree,
+            parents: Default::default(),
+            author: signature(at),
+            committer: signature(at),
+            encoding: None,
+            message: format!(
+                "verdict {}
+
+Baton-Verdict-For: {turn}
+Baton-Verdict-Source: {source}
+",
+                verdict.class
+            )
+            .into(),
+            extra_headers: Vec::new(),
+        };
+        let id = self
+            .repo
+            .write_object(&commit)
+            .map_err(Error::git)?
+            .detach();
+        self.repo
+            .reference(
+                format!("{VERDICT_PREFIX}{turn}"),
+                id,
+                PreviousValue::Any,
+                "baton verdict",
+            )
+            .map_err(Error::git)?;
+        Ok(())
+    }
+
+    /// The verdict stored for a turn, if there is one.
+    pub fn verdict(&self, turn: TurnId) -> Result<Option<TurnVerdict>> {
+        let name = format!("{VERDICT_PREFIX}{turn}");
+        let Some(reference) = self
+            .repo
+            .try_find_reference(name.as_str())
+            .map_err(Error::git)?
+        else {
+            return Ok(None);
+        };
+        let target = reference.target();
+        let Some(commit) = target.try_id() else {
+            return Ok(None);
+        };
+        let tree = self
+            .repo
+            .find_commit(commit.to_owned())
+            .map_err(Error::git)?
+            .tree()
+            .map_err(Error::git)?;
+        let Some(entry) = tree.find_entry(VERDICT_FILE) else {
+            return Ok(None);
+        };
+        let blob = self.repo.find_blob(entry.oid()).map_err(Error::git)?;
+        serde_json::from_slice(&blob.data)
+            .map(Some)
+            .map_err(|e| Error::invalid("stored verdict", e))
     }
 
     /// `thread@seq`, or a hex prefix of at least 7 digits of any turn in the repo.

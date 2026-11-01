@@ -252,6 +252,11 @@ fn fingerprint(root: &Path, dirs: &Dirs, settings: &Settings, policy: &StorePoli
         .map_or_else(|_| String::new(), |id| id.to_string())
 }
 
+/// A second policy for `root`, for a reader that must treat content the way a snapshot does.
+pub fn open_policy(root: &Path, dirs: &Dirs) -> Result<StorePolicy> {
+    StorePolicy::open(root, &load_settings(root, dirs)?)
+}
+
 fn load_settings(root: &Path, dirs: &Dirs) -> Result<Settings> {
     let user = UserConfig::load(&dirs.user_config())?;
     let repo = RepoConfig::load(root)?;
