@@ -196,11 +196,13 @@ fn start(
         let _ = event_tx.send(Cmd::Event(event));
     })
     .map_err(|e| Error::Refused(format!("starting the watcher: {}", watch_failure(&e))))?;
-    watcher
-        .watch(root, RecursiveMode::Recursive)
-        .map_err(|e| {
-            Error::Refused(format!("watching {}: {}", root.display(), watch_failure(&e)))
-        })?;
+    watcher.watch(root, RecursiveMode::Recursive).map_err(|e| {
+        Error::Refused(format!(
+            "watching {}: {}",
+            root.display(),
+            watch_failure(&e)
+        ))
+    })?;
 
     let began = Instant::now();
     task.dirty.overflow();
