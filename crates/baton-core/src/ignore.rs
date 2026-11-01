@@ -3,15 +3,21 @@
 //! nested repos). The user's `.git/index` is never opened.
 
 use crate::error::{Error, Result};
+use gix::bstr::ByteSlice;
 use gix::dir::walk::{Action, Delegate, EmissionMode};
 use gix::dir::{EntryRef, entry};
 use gix::index::entry::Mode;
-use std::path::Path;
+use std::cell::RefCell;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 pub(crate) struct IgnoreRules {
     repo: gix::Repository,
     index: gix::index::State,
+    /// The files in HEAD's tree, keyed by the commit they were read from.
+    tracked: RefCell<Option<(gix::ObjectId, Arc<BTreeSet<String>>)>>,
 }
 
 #[derive(Default)]
@@ -41,7 +47,75 @@ impl IgnoreRules {
             )));
         }
         let index = gix::index::State::new(repo.object_hash());
-        Ok(Self { repo, index })
+        Ok(Self {
+            repo,
+            index,
+            tracked: RefCell::new(None),
+        })
+    }
+
+    /// Files whose contents decide ignore verdicts, outside the worktree's own `.gitignore` tree: the
+    /// caller hashes them so a change is noticed without waiting for a watcher event.
+    pub(crate) fn input_files(&self) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        for dir in [self.repo.git_dir(), self.repo.common_dir()] {
+            for file in [dir.join("info").join("exclude"), dir.join("config")] {
+                if !files.contains(&file) {
+                    files.push(file);
+                }
+            }
+        }
+        if let Some(workdir) = self.repo.workdir() {
+            files.push(workdir.join(".gitignore"));
+        }
+        let configured = self
+            .repo
+            .config_snapshot()
+            .trusted_path("core.excludesFile")
+            .ok()
+            .flatten();
+        let home = |var| std::env::var_os(var).map(PathBuf::from);
+        let global = configured.or_else(|| {
+            home("XDG_CONFIG_HOME")
+                .or_else(|| {
+                    home("HOME")
+                        .or_else(|| home("USERPROFILE"))
+                        .map(|h| h.join(".config"))
+                })
+                .map(|dir| dir.join("git").join("ignore"))
+        });
+        files.extend(global);
+        files
+    }
+
+    /// The files git tracks at HEAD, read straight from the object database. Git does not apply ignore
+    /// rules to a tracked file, so neither does baton. The user's `.git/index` is not opened, which means a
+    /// file that is staged but not yet committed is still subject to the ignore rules.
+    pub(crate) fn tracked(&self) -> Arc<BTreeSet<String>> {
+        let Ok(head) = self.repo.head_id() else {
+            return Arc::default();
+        };
+        let head = head.detach();
+        if let Some((cached, files)) = &*self.tracked.borrow()
+            && *cached == head
+        {
+            return Arc::clone(files);
+        }
+        let files: Arc<BTreeSet<String>> = Arc::new(self.read_tree(head).unwrap_or_default());
+        *self.tracked.borrow_mut() = Some((head, Arc::clone(&files)));
+        files
+    }
+
+    fn read_tree(&self, commit: gix::ObjectId) -> Option<BTreeSet<String>> {
+        let tree = self.repo.find_commit(commit).ok()?.tree().ok()?;
+        let entries = tree.traverse().breadthfirst.files().ok()?;
+        Some(
+            entries
+                .into_iter()
+                .filter(|e| !e.mode.is_tree() && !e.mode.is_commit())
+                .filter_map(|e| e.filepath.to_str().ok().map(str::to_owned))
+                .collect(),
+        )
     }
 
     pub(crate) fn head(&self) -> Option<crate::id::GitSha> {

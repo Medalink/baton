@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 /// A value of fewer characters than this is too likely to be ordinary text to redact as a literal.
 const MIN_LITERAL_LEN: usize = 8;
 
-const BUILTIN: &[(&str, &str)] = &[
+pub(crate) const BUILTIN: &[(&str, &str)] = &[
     (
         "private-key",
         r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",

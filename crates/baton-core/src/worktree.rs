@@ -13,15 +13,17 @@ use crate::policy::StorePolicy;
 use crate::store::{BlobPayload, TreeEdit};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 /// Beyond this many dirty paths the set stops tracking them and the next drain does a full rescan.
 const DIRTY_CAP: usize = 50_000;
 /// A file modified this recently when it was hashed may be modified again within the same timestamp tick.
 const RACY_WINDOW_NS: i64 = 2_000_000_000;
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 
 #[derive(Debug, Default)]
 pub struct DirtySet {
@@ -60,14 +62,10 @@ impl DirtySet {
         self.paths.len()
     }
 
-    pub fn merge(&mut self, other: DirtySet) {
-        if other.overflow {
-            self.overflow();
-        }
-        for path in other.paths {
-            let structural = other.structural.contains(&path);
-            self.mark(path, structural);
-        }
+    /// Takes in what a full rescan found. A rescan is bounded by the worktree, so unlike `mark` it never
+    /// overflows; otherwise a worktree over the cap would rescan forever and record nothing.
+    fn absorb(&mut self, found: Vec<String>) {
+        self.paths.extend(found);
     }
 }
 
@@ -124,6 +122,8 @@ struct SavedState {
     tree: TreeId,
     entries: Vec<SavedEntry>,
     skipped: Vec<String>,
+    /// What the store policy was when `entries` were read; a different policy re-reads every file.
+    policy: String,
 }
 
 enum Update {
@@ -164,15 +164,15 @@ impl Default for ChunkLimits {
     }
 }
 
-type Stamp = Vec<Option<(u64, i64)>>;
-
 pub struct Worktree {
     root: PathBuf,
     dirs: Dirs,
     project: ProjectKey,
     settings: Settings,
-    stamp: Stamp,
     policy: StorePolicy,
+    policy_fingerprint: String,
+    /// The files in HEAD as of the last `prepare`, to notice which ones HEAD started or stopped tracking.
+    head_files: Arc<BTreeSet<String>>,
     tracked: BTreeMap<String, Tracked>,
     skipped: BTreeSet<String>,
     tree: TreeId,
@@ -192,17 +192,31 @@ fn mtime_ns(meta: &Metadata) -> i64 {
         .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
 }
 
-fn stamp_of(paths: &[PathBuf]) -> Stamp {
-    paths
-        .iter()
-        .map(|p| std::fs::metadata(p).ok().map(|m| (m.len(), mtime_ns(&m))))
-        .collect()
-}
-
-fn watched_config(root: &Path, dirs: &Dirs, settings: &Settings) -> Vec<PathBuf> {
-    let mut paths = vec![root.join(".baton").join("config.toml"), dirs.user_config()];
-    paths.extend(settings.value_files.iter().cloned());
-    paths
+/// Everything a stored blob depends on besides the file's own bytes: the built-in redaction rules, the
+/// merged settings, and the contents of every file that feeds them. The value files and the user's
+/// ignore files live outside the worktree, so no watcher sees them change; they are read on every call.
+fn fingerprint(root: &Path, dirs: &Dirs, settings: &Settings, policy: &StorePolicy) -> String {
+    let mut bytes = Vec::new();
+    for (name, pattern) in crate::redact::BUILTIN {
+        bytes.extend_from_slice(format!("{name}={pattern}\n").as_bytes());
+    }
+    bytes.extend_from_slice(format!("{settings:?}\n").as_bytes());
+    let mut files = vec![root.join(".baton").join("config.toml"), dirs.user_config()];
+    files.extend(settings.value_files.iter().cloned());
+    files.extend(policy.rules().input_files());
+    for file in files {
+        bytes.extend_from_slice(file.as_os_str().as_encoded_bytes());
+        match std::fs::read(&file) {
+            Ok(content) => {
+                bytes.extend_from_slice(format!(":{}:", content.len()).as_bytes());
+                bytes.extend_from_slice(&content);
+            }
+            Err(_) => bytes.extend_from_slice(b":missing:"),
+        }
+        bytes.push(b'\n');
+    }
+    gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, &bytes)
+        .map_or_else(|_| String::new(), |id| id.to_string())
 }
 
 fn load_settings(root: &Path, dirs: &Dirs) -> Result<Settings> {
@@ -266,16 +280,17 @@ impl Worktree {
         let settings = load_settings(root, dirs)?;
         let repo_config = RepoConfig::load(root)?;
         let project = project_key(root, &repo_config)?;
-        let stamp = stamp_of(&watched_config(root, dirs, &settings));
         let policy = StorePolicy::open(root, &settings)?;
+        let policy_fingerprint = fingerprint(root, dirs, &settings, &policy);
         let state_file = dirs.worktree_state_file(root);
         let mut worktree = Self {
             root: root.to_owned(),
             dirs: dirs.clone(),
             project,
+            head_files: policy.rules().tracked(),
             settings,
-            stamp,
             policy,
+            policy_fingerprint,
             tracked: BTreeMap::new(),
             skipped: BTreeSet::new(),
             tree: TreeId::empty(),
@@ -350,6 +365,17 @@ impl Worktree {
             })
             .collect();
         self.skipped = saved.skipped.into_iter().collect();
+        if saved.policy != self.policy_fingerprint {
+            self.invalidate();
+        }
+    }
+
+    /// The stat cache says a file is unchanged, not that it was stored under today's policy. Marking every
+    /// entry racy makes the next rescan read it again.
+    fn invalidate(&mut self) {
+        for tracked in self.tracked.values_mut() {
+            tracked.racy = true;
+        }
     }
 
     /// Writes the mirror next to the side repo, atomically, so a crash leaves the old state or the new one.
@@ -371,6 +397,7 @@ impl Worktree {
                 })
                 .collect(),
             skipped: self.skipped.iter().cloned().collect(),
+            policy: self.policy_fingerprint.clone(),
         };
         let bytes = serde_json::to_vec(&saved).map_err(|e| Error::Git(e.to_string()))?;
         let dir = self.state_file.parent().unwrap_or(Path::new("."));
@@ -381,22 +408,26 @@ impl Worktree {
             .ctx(|| format!("replacing {}", self.state_file.display()))
     }
 
-    /// Rebuilds the policy when a config file or a redaction value file changed on disk.
-    fn refresh_policy(&mut self) -> Result<()> {
-        let stamp = stamp_of(&watched_config(&self.root, &self.dirs, &self.settings));
-        if stamp == self.stamp {
-            return Ok(());
+    /// Rebuilds the policy when any file it is built from changed, and says so: every stored file must then
+    /// be read again, and the set of files that belong in the tree may differ.
+    fn refresh_policy(&mut self) -> Result<bool> {
+        let now = fingerprint(&self.root, &self.dirs, &self.settings, &self.policy);
+        if now == self.policy_fingerprint {
+            return Ok(false);
         }
         let settings = load_settings(&self.root, &self.dirs)?;
-        self.policy = StorePolicy::open(&self.root, &settings)?;
-        self.stamp = stamp_of(&watched_config(&self.root, &self.dirs, &settings));
+        let policy = StorePolicy::open(&self.root, &settings)?;
+        self.policy_fingerprint = fingerprint(&self.root, &self.dirs, &settings, &policy);
         self.settings = settings;
-        Ok(())
+        self.policy = policy;
+        self.invalidate();
+        Ok(true)
     }
 
-    /// Whether `path` (a path relative to the root, `/`-separated) should be tracked: not under `.git`,
-    /// not ignored by git or the config.
-    pub fn classify(&self, candidates: &[(&str, bool)]) -> Result<Vec<bool>> {
+    /// Whether baton stores each `(path relative to the root, is a directory)`: not under `.git`, not
+    /// ignored by git unless git tracks it, not excluded by the config. This is the one answer, asked again
+    /// whenever a path is read, so a stale watcher event or stat cache never overrides it.
+    pub fn admits(&self, candidates: &[(&str, bool)]) -> Result<Vec<bool>> {
         let mut out = vec![false; candidates.len()];
         let mut asked: Vec<(&str, bool)> = Vec::new();
         let mut slots = Vec::new();
@@ -408,8 +439,8 @@ impl Worktree {
             asked.push((*path, *is_dir));
             slots.push(i);
         }
-        for (slot, ignored) in slots.into_iter().zip(self.policy.ignored(&asked)?) {
-            out[slot] = !ignored;
+        for (slot, admitted) in slots.into_iter().zip(self.policy.admits(&asked)?) {
+            out[slot] = admitted;
         }
         Ok(out)
     }
@@ -428,33 +459,60 @@ impl Worktree {
             }
             prefix.push_str(part);
             if self.policy.ignored(&[(prefix.as_str(), true)])?[0] {
-                return Ok(Some(prefix));
+                // Events under a directory that holds files git tracks must not be dropped unseen.
+                let below = format!("{prefix}/");
+                let holds_tracked = self
+                    .policy
+                    .rules()
+                    .tracked()
+                    .range(below.clone()..)
+                    .next()
+                    .is_some_and(|p| p.starts_with(&below));
+                return Ok((!holds_tracked).then_some(prefix));
             }
         }
         Ok(None)
     }
 
-    /// Every path whose state on disk differs from the mirror: new files, vanished files, and files whose
-    /// size or timestamp changed or that were too recent to trust when last hashed.
-    pub fn rescan(&self) -> Result<DirtySet> {
-        let mut dirty = DirtySet::default();
-        let mut found: HashSet<String> = HashSet::new();
-        for path in self.policy.rules().walk(None)? {
-            if self.policy.excluded_by_config(&path) || RelPath::parse(&path).is_err() {
+    /// The files that belong in the tree under `prefix` (or everywhere), spelled as they are on disk: the
+    /// directory walk, plus the files HEAD tracks that the walk skipped because an ignore rule matched.
+    fn scan(&self, prefix: Option<&str>) -> Result<Vec<String>> {
+        let mut found = self.policy.rules().walk(prefix)?;
+        let walked: HashSet<String> = found.iter().cloned().collect();
+        let below = prefix.map(|p| format!("{p}/"));
+        for path in self.policy.rules().tracked().iter() {
+            if walked.contains(path) || below.as_ref().is_some_and(|b| !path.starts_with(b)) {
                 continue;
             }
+            let on_disk = std::fs::symlink_metadata(self.root.join(path))
+                .ok()
+                .and_then(|m| file_kind(&m));
+            if on_disk.is_some() {
+                found.push(path.clone());
+            }
+        }
+        found.retain(|p| !self.policy.excluded_by_config(p) && RelPath::parse(p).is_ok());
+        Ok(found)
+    }
+
+    /// Every path whose state on disk differs from the mirror: new files, vanished files, and files whose
+    /// size or timestamp changed or that were too recent to trust when last hashed.
+    pub fn rescan(&self) -> Result<Vec<String>> {
+        let mut dirty = Vec::new();
+        let mut found: HashSet<String> = HashSet::new();
+        for path in self.scan(None)? {
             let unchanged = self
                 .tracked
                 .get(&path)
                 .is_some_and(|t| self.fresh(&path, t));
             if !unchanged {
-                dirty.mark(path.clone(), false);
+                dirty.push(path.clone());
             }
             found.insert(path);
         }
         for path in self.tracked.keys().chain(self.skipped.iter()) {
             if !found.contains(path) {
-                dirty.mark(path.clone(), false);
+                dirty.push(path.clone());
             }
         }
         Ok(dirty)
@@ -470,13 +528,27 @@ impl Worktree {
 
     /// Takes up to `limits` paths out of `dirty` and works out what to store for them.
     pub fn prepare(&mut self, dirty: &mut DirtySet, limits: ChunkLimits) -> Result<Plan> {
-        self.refresh_policy()?;
+        if self.refresh_policy()? {
+            dirty.overflow();
+        }
+        self.follow_head(dirty);
         if dirty.overflow {
             let found = self.rescan()?;
             dirty.overflow = false;
-            dirty.merge(found);
+            dirty.absorb(found);
         }
         self.expand_directories(dirty)?;
+
+        let mut batch: Vec<String> = Vec::new();
+        while batch.len() < limits.files {
+            let Some(path) = dirty.paths.pop_first() else {
+                break;
+            };
+            dirty.structural.remove(&path);
+            batch.push(path);
+        }
+        let asked: Vec<(&str, bool)> = batch.iter().map(|p| (p.as_str(), false)).collect();
+        let admitted = self.admits(&asked)?;
 
         let mut plan = Plan {
             blobs: Vec::new(),
@@ -487,15 +559,35 @@ impl Worktree {
         let mut queued: HashSet<BlobId> = HashSet::new();
         let mut bytes = 0u64;
         let mut nested: HashMap<String, bool> = HashMap::new();
-        while plan.taken.len() < limits.files && bytes < limits.bytes {
-            let Some(path) = dirty.paths.pop_first() else {
-                break;
-            };
-            dirty.structural.remove(&path);
+        let mut listings: Listings = HashMap::new();
+        let mut rest = batch.into_iter().zip(admitted);
+        for (path, admitted) in rest.by_ref() {
             plan.taken.push(path.clone());
-            bytes += self.inspect(&path, &mut nested, &mut queued, &mut plan)?;
+            let ctx = Inspect {
+                admitted,
+                nested: &mut nested,
+                listings: &mut listings,
+            };
+            bytes += self.inspect(&path, ctx, &mut queued, &mut plan)?;
+            if bytes >= limits.bytes {
+                break;
+            }
         }
+        dirty.paths.extend(rest.map(|(path, _)| path));
         Ok(plan)
+    }
+
+    /// HEAD moved: a file it started tracking is no longer subject to ignore rules, and one it stopped
+    /// tracking is again. Neither changed on disk, so no watcher event says so.
+    fn follow_head(&mut self, dirty: &mut DirtySet) {
+        let now = self.policy.rules().tracked();
+        if Arc::ptr_eq(&now, &self.head_files) {
+            return;
+        }
+        for path in now.symmetric_difference(&self.head_files) {
+            dirty.mark(path.clone(), false);
+        }
+        self.head_files = now;
     }
 
     /// A created, removed or renamed directory is a whole subtree of changes: file events inside it may
@@ -511,8 +603,7 @@ impl Worktree {
                 }
                 continue;
             }
-            let found: HashSet<String> =
-                self.policy.rules().walk(Some(&dir))?.into_iter().collect();
+            let found: HashSet<String> = self.scan(Some(&dir))?.into_iter().collect();
             for gone in self
                 .tracked_under(&dir)
                 .into_iter()
@@ -520,11 +611,7 @@ impl Worktree {
             {
                 dirty.paths.insert(gone);
             }
-            for path in found {
-                if !self.policy.excluded_by_config(&path) {
-                    dirty.paths.insert(path);
-                }
-            }
+            dirty.paths.extend(found);
         }
         Ok(())
     }
@@ -561,17 +648,56 @@ impl Worktree {
         false
     }
 
+    /// Whether every component of `path` is spelled on disk exactly as given. On a case-insensitive
+    /// filesystem a stat of `Foo.txt` succeeds when the file is now `foo.txt`; only a directory listing
+    /// says which name it really has.
+    fn spelled_exactly(&self, path: &str, listings: &mut Listings) -> bool {
+        if !cfg!(any(windows, target_os = "macos")) {
+            return true;
+        }
+        let mut dir = String::new();
+        for part in path.split('/') {
+            let names = listings.entry(dir.clone()).or_insert_with(|| {
+                std::fs::read_dir(self.root.join(&dir)).ok().map(|entries| {
+                    entries
+                        .filter_map(|e| e.ok().map(|e| e.file_name()))
+                        .collect()
+                })
+            });
+            if !names
+                .as_ref()
+                .is_some_and(|names| names.contains(std::ffi::OsStr::new(part)))
+            {
+                return false;
+            }
+            if !dir.is_empty() {
+                dir.push('/');
+            }
+            dir.push_str(part);
+        }
+        true
+    }
+
     /// Decides one path. Returns the number of bytes it queued.
     fn inspect(
         &self,
         path: &str,
-        nested: &mut HashMap<String, bool>,
+        ctx: Inspect<'_>,
         queued: &mut HashSet<BlobId>,
         plan: &mut Plan,
     ) -> Result<u64> {
+        let Inspect {
+            admitted,
+            nested,
+            listings,
+        } = ctx;
         let Ok(rel) = RelPath::parse(path) else {
             return Ok(0);
         };
+        if !admitted {
+            self.forget(path, &rel, plan);
+            return Ok(0);
+        }
         let tracked = self.tracked.get(path);
         let meta = std::fs::symlink_metadata(self.root.join(path)).ok();
         let kind = meta.as_ref().and_then(file_kind);
@@ -580,7 +706,7 @@ impl Worktree {
             self.forget(path, &rel, plan);
             return Ok(0);
         };
-        if self.inside_nested_repo(path, nested) {
+        if !self.spelled_exactly(path, listings) || self.inside_nested_repo(path, nested) {
             self.forget(path, &rel, plan);
             return Ok(0);
         }
@@ -703,6 +829,15 @@ pub enum Current {
     Content(Vec<u8>),
     /// A directory, a special file, or something that cannot be read.
     Blocked,
+}
+
+type Listings = HashMap<String, Option<HashSet<OsString>>>;
+
+/// What `prepare` learned about a path before `inspect` reads it.
+struct Inspect<'a> {
+    admitted: bool,
+    nested: &'a mut HashMap<String, bool>,
+    listings: &'a mut Listings,
 }
 
 fn file_kind(meta: &Metadata) -> Option<FileKind> {

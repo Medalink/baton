@@ -170,16 +170,14 @@ fn start(
         .map_err(|e| Error::Refused(format!("watching {}: {e}", root.display())))?;
 
     let began = Instant::now();
-    task.dirty.merge(task.wt.rescan()?);
-    let scanned = began.elapsed();
+    task.dirty.overflow();
     let (_, changed) = task.sync()?;
     task.save();
     task.log.line(&format!(
-        "{} enrolled project={} files={} changed={changed} scan={}ms total={}ms",
+        "{} enrolled project={} files={} changed={changed} total={}ms",
         task.label,
         task.wt.project(),
         task.wt.tracked_files(),
-        scanned.as_millis(),
         began.elapsed().as_millis()
     ));
     let ready = Ready {
@@ -311,12 +309,17 @@ impl Task {
                 }
             }
             let first = rel.split('/').next().unwrap_or("");
+            if first.eq_ignore_ascii_case(".git") {
+                // HEAD or the ref may have moved, which changes which ignored directories hold tracked files.
+                self.ignored_dirs.clear();
+                continue;
+            }
             let below_ignored = self.ignored_dirs.iter().any(|d| {
                 rel.len() > d.len()
                     && rel.starts_with(d.as_str())
                     && rel.as_bytes()[d.len()] == b'/'
             });
-            if first.eq_ignore_ascii_case(".git") || below_ignored {
+            if below_ignored {
                 continue;
             }
             candidates.push((rel, structural));
@@ -328,7 +331,7 @@ impl Task {
             .iter()
             .map(|(p, _)| (p.as_str(), false))
             .collect();
-        let verdicts = match self.wt.classify(&asked) {
+        let verdicts = match self.wt.admits(&asked) {
             Ok(v) => v,
             Err(e) => {
                 self.log.line(&format!(
