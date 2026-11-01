@@ -293,17 +293,33 @@ pub fn project_key(root: &Path, config: &RepoConfig) -> Result<ProjectKey> {
         return Ok(key.clone());
     }
     let repo = gix::open(root).map_err(Error::git)?;
-    let origin = repo
-        .config_snapshot()
-        .string("remote.origin.url")
-        .map(|v| v.to_string())
+    let config = repo.config_snapshot();
+    let url = |name: &str| {
+        config
+            .string(format!("remote.{name}.url").as_str())
+            .map(|v| v.to_string())
+    };
+    // Without `origin`, a repo whose only remote is named otherwise (`github`, `upstream`) still has
+    // one obvious key. With several and no `origin` there is none to pick.
+    let remote = url("origin")
+        .or_else(|| {
+            let mut urls = repo
+                .remote_names()
+                .into_iter()
+                .filter_map(|n| url(&n.to_string()));
+            match (urls.next(), urls.next()) {
+                (Some(only), None) => Some(only),
+                _ => None,
+            }
+        })
         .ok_or_else(|| {
             Error::Refused(
-                "no project key: set `project` in .baton/config.toml or add an `origin` remote"
+                "no project key: set `project` in .baton/config.toml, or add an `origin` remote \
+                 (with several remotes and none named `origin`, baton does not pick one)"
                     .into(),
             )
         })?;
-    ProjectKey::parse(&normalize_remote(&origin))
+    ProjectKey::parse(&normalize_remote(&remote))
 }
 
 impl Worktree {
