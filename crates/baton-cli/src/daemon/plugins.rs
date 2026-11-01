@@ -20,6 +20,8 @@ const WORKERS: usize = 4;
 const QUEUE: usize = 64;
 /// A lens is read into every classifier call, so it is kept small.
 const LENS_MAX_BYTES: u64 = 64 * 1024;
+/// A lens file is read this far before redaction and the cut, so a secret on the 64 KiB mark is seen whole.
+const LENS_READ_BYTES: u64 = 1 << 20;
 
 pub struct Work {
     pub root: PathBuf,
@@ -217,7 +219,7 @@ fn read_capped(path: &Path) -> std::result::Result<String, String> {
     use std::io::Read;
     let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut bytes = Vec::new();
-    file.take(LENS_MAX_BYTES)
+    file.take(LENS_READ_BYTES)
         .read_to_end(&mut bytes)
         .map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
