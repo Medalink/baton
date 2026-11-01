@@ -610,6 +610,8 @@ await "the next turn reaches B" 10000 everywhere t1 "$T4_A" b
 file_has() { grep -q -- "$2" "$1"; }
 await "follow applies a path nobody touched here" 10000 file_has "$TMP/pulled/a.txt" "next from a"
 await "follow prints the turn" 10000 log_has "$TMP/follow.out" "fourth turn from a"
+# The turn is printed before its files are written, so wait for the report that ends the apply.
+await "follow reports what it applied" 10000 log_has "$TMP/follow.out" "kept b.txt"
 check "follow added the new file" test -f "$TMP/pulled/src/new.rs"
 eq "follow kept the locally edited path" "edited here" "$(cat "$TMP/pulled/b.txt")"
 contains "follow says it kept b.txt and why" "$(cat "$TMP/follow.out")" "kept b.txt"
