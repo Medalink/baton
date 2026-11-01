@@ -9,11 +9,7 @@ use std::time::{Duration, Instant};
 const RUNS: usize = 100;
 const PAYLOAD_BYTES: usize = 2048;
 const WATCHDOG: Duration = Duration::from_millis(50);
-const FRAME_BYTES: usize = 8
-    + "claude
-"
-    .len()
-    + PAYLOAD_BYTES;
+const FRAME_BYTES: usize = 8 + "claude\n".len() + PAYLOAD_BYTES;
 
 /// What the real hook does, as the first thing `main` runs: read stdin on a helper thread, write one
 /// frame to the endpoint, exit 0 whatever happens. `--noop` exits at once, to price process creation alone.
