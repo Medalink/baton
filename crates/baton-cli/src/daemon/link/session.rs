@@ -91,6 +91,9 @@ async fn read_loop(mut stream: SplitStream<Ws>, tx: UnboundedSender<In>) {
             Ok(Message::Binary(bytes)) => match decode(&bytes) {
                 Ok(Frame::Control(control)) => In::Control(control),
                 Ok(Frame::Object(chunk)) => match assembler.push(chunk) {
+                    Ok(_) if assembler.announced() > POOL_MAX as u64 => {
+                        break "too many unfinished objects from the server".to_owned();
+                    }
                     Ok(Some(object)) => In::Object(object),
                     Ok(None) => continue,
                     Err(e) => break e.to_string(),

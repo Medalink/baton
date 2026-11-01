@@ -51,7 +51,7 @@ baton admin [--data dir] reindex|threads
 `ThreadId`, `MachineId`, `ProjectKey`, `TurnId`, `TreeId`, `BlobId` are newtypes with private fields and a `parse` constructor. A value that exists is valid. Ref names are derived from them in one function, `turn_ref(thread) -> refs/baton/<thread>`, and the wire carries ids, never ref names, so a peer cannot name an arbitrary ref.
 
 - `ThreadId` is the agent's session id, matching `^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$`.
-- `ProjectKey` comes from `.baton/config.toml` `project`, else the normalized `origin` URL. With neither, enrollment is refused.
+- `ProjectKey` comes from `.baton/config.toml` `project`, else the normalized URL of `origin`, else of the repo's only remote. Only remotes named in the repo's own config (`.git/config`, `config.worktree`) count, so the user's global git config cannot change a key. With no such remote, or several and none named `origin`, enrollment is refused.
 - `MachineId` comes from user config, defaulting to the hostname. The server takes the authoritative value from auth.
 
 ## Where turns live
@@ -148,21 +148,42 @@ Worktrees that came in through a repository are not written to `enrolled.json`. 
 server.sqlite
 server.toml                    optional, the auth provider
 server.lock                    one server per data dir
+empty.git                      an empty bare repo, read only, that an advance for a new project is checked against
 projects/<ProjectKey>.git      plain bare repo, refs/baton/<thread>, gc.auto = 0
 ```
 
-A project's directory name is its key with `/` replaced by `+`, plus `.git` (`github.com+acme+app.git`). Each project has one writer task. It takes the advance requests of every session in arrival order, so a compare-and-swap never races another one in the same process.
+A project's directory name is its key with `/` replaced by `+`, plus `.git` (`github.com+acme+app.git`). Each project has one writer thread. It takes the advance requests of every session in arrival order, so a compare-and-swap never races another one in the same process.
+
+A project key costs a map entry while a session holds it and nothing after. The repo and the writer thread are created when the first `advance` for the project is accepted: until then the advance is judged against `empty.git`, so a `need`, a refusal, a `subscribe` or a `want` on a project the server has never stored leaves no directory and no thread. A writer with no work for 30 s ends, its project is forgotten once no session holds it, and the next request starts a writer again from the repo. A session may name 256 distinct projects in all (hello, subscribe, advance and want together), so one session cannot make the server remember more than that.
 
 Invariants:
 
 1. **Present means complete.** An object stored on the server has every object it references stored. Objects are written blobs first, then trees deepest first, then commits, and every received object is re-hashed before it is stored.
 2. **Refs move last.** A ref moves only after the new commit's closure is complete, by compare-and-swap against the expected old value.
 3. **One writer per thread.** The owner of a thread is the `Baton-Machine` trailer of its current tip, so the repo alone says who owns what and `threads.owner` is only an index of it. An advance is checked in this order. The authenticated machine must equal the current tip's owner (`not_owner`). The ref must be at `expected` (`stale`). Then every new turn must name the authenticated machine (`machine_mismatch`) and continue the thread by sequence number (`invalid`). The ref moves last.
-4. **Received trees are validated.** Entry names are non-empty, contain no `/` or NUL, are not `.`, `..`, or `.git` in any case, and appear once.
+4. **Received trees are validated as git validates them.** `names.rs` ports git v2.54.0's rules (`fsck_tree`, `verify_path_internal`, `is_ntfs_dotgit`, `is_hfs_dotgit`, `fsck_gitmodules_fn`, the submodule name and url checks, the null id and dotfile symlink checks), so a tree baton accepts passes `git fsck --strict` and cannot name a `.git` directory on NTFS, HFS+ or ext4. `docs/protocol.md` lists the rules. The same functions guard `RelPath::parse`, which every client write path goes through (apply, rewind, capture, diff and flatten), so a path is either safe to write or never written. Capture also asks `check_file` before it stores a file, so a turn never carries a name or a `.gitmodules` the server would refuse.
+5. **Object kinds match, even for stored objects.** A tree entry or a commit field that names an id already stored as another kind is refused, because a stored id proves only that some object has that hash.
+6. **Walks are iterative and capped.** Trees nest at most 512 levels. Every walk of a received tree (intake, closure, flatten, diff, apply) keeps its stack on the heap, because a stack overflow aborts the process and `catch_unwind` cannot stop it. A panic in a project writer is caught: it is logged, the advance is refused with `invalid`, and that project's writer restarts.
 
 SQLite is authoritative only for devices. `projects` and `threads` are an index rebuilt from refs by `baton admin reindex`.
 
 Fan-out: one broadcast channel per project. A session whose queue fills is closed and resyncs on reconnect, so a slow client never costs server memory or other clients' latency.
+
+Limits per connection, each driven by a scenario in `e2e/sync.sh`:
+
+| Limit | Value | When it is hit |
+|---|---|---|
+| Handshake (TLS and upgrade, auth included) | 10 s, at most 128 at once | the connection is closed without a reply |
+| `hello` after the upgrade | 5 s | `error`, close |
+| Frame | `max_frame` exactly, enforced by the WebSocket reader | `error`, close |
+| Session pool, finished bytes plus announced `total` of unfinished objects | 512 MiB | `too_large`, close |
+| Projects one session names | 256 | `too_large`, close |
+| Ids in one `want` | 2,048, duplicates read once | `too_large`, close |
+| A send that makes no progress | 30 s, then 5 s for the goodbye | the session is dropped |
+| Silence from the client | 60 s | the session is closed |
+| A revoked device | 2 s, and at the next request or forwarded event | `unauthorized`, close |
+
+A revoked device is cut off by a timer in its own session, not by the operator's command, so `baton admin device revoke` never needs to reach the server process. The delay is the 2 s timer plus the time a database read takes. A `command` auth provider is asked at the upgrade only; revoking in its own system takes effect when the device next connects.
 
 Auth providers: `token` (built in, per-device token, stored as SHA-256), or `command` (`baton.auth.v1` in, `{ok, machine}` out). The provider is named in `<data>/server.toml`:
 
@@ -175,7 +196,7 @@ timeout_ms = 2000
 
 Without `server.toml` the built-in token provider runs. A `server.toml` the server cannot read stops it at start. A command that fails or times out, a token that matches no active device, and a missing `Authorization` header all answer the WebSocket upgrade with `401`, so no `welcome` is sent. The machine id that auth returns is the machine for the whole session: it is the `machine` in `welcome`, the only value the server compares against the tip owner, and the client's `me` from then on. The id in the client's config only picks what the `hello` claims. `contrib/examples/tailscale-selfhost.toml` shows a server on a tailnet with a Tailscale certificate and device tokens; no mTLS example is shipped.
 
-Operators: `baton admin device add <name>` creates a device and prints its token once, `device list` shows every device with its state, and `device revoke <name>` revokes all of a machine's active devices. A revoked device cannot connect again. Its open session gets an `error` with code `unauthorized` and is closed at its next `advance` or heartbeat, whichever comes first. `admin threads` lists what the server holds and `admin reindex` rebuilds `projects` and `threads` from the refs.
+Operators: `baton admin device add <name>` creates a device and prints its token once, `device list` shows every device with its state, and `device revoke <name>` revokes all of a machine's active devices. A revoked device cannot connect again. Its open session gets an `error` with code `unauthorized` and is closed within 2 s. `admin threads` lists what the server holds and `admin reindex` rebuilds `projects` and `threads` from the refs.
 
 ## Wire
 
@@ -197,7 +218,7 @@ Pushes and follows share the one connection and the daemon's own writer tasks, s
 
 ## Plug-ins
 
-Every plug-in is a `CommandSpec { command: Vec<String>, timeout }`, called with one JSON document on stdin and read as one JSON document from stdout. Timeout, non-zero exit, or unreadable output means fail open for classify, decide, and notify, and fail closed for auth. `plugin.rs` in `baton-core` is the only code that runs one. No plug-in runs on the hook's path: the hook writes a frame, and a turn is classified on a worker thread of the daemon after the turn is committed.
+Every plug-in is a `CommandSpec { command: Vec<String>, timeout }`, called with one JSON document on stdin and read as one JSON document from stdout. Timeout, non-zero exit, or unreadable output means fail open for classify, decide, and notify, and fail closed for auth. `plugin.rs` in `baton-core` is the only code that runs one. The timeout covers the whole call, from spawn until the output is read, not only until the command exits. The command runs in its own process group (unix) or Job Object (Windows), and the whole tree is killed when the call ends, so a grandchild that keeps stdout open cannot hold the caller past the deadline or outlive the call. No plug-in runs on the hook's path: the hook writes a frame, and a turn is classified on a worker thread of the daemon after the turn is committed.
 
 | Slot | Input | Output | Default |
 |---|---|---|---|
@@ -333,7 +354,7 @@ A burst of 30 threads, one turn each at 100 ms spacing, takes a median 11.6 ms a
 ### Behavior fixed by the sync slice
 
 - `pull` makes a worktree with `git worktree add --detach <dir> <Baton-Base of the tip>` and fills it with the tip's tree. It fails and says to run `git fetch` when the base commit is not in the repository, and when the thread began in a repository with no commit. The default directory is next to the repository, named `<repo>-<first 8 characters of the thread>`. Files over the size limit (`Baton-Skipped`) keep the git version. A path that `apply_tree` refuses to overwrite is kept and listed, and the command exits 1.
-- `follow <thread>` prints each new turn of a thread as it arrives. With `--into <worktree>` it also applies the turn there. A path is changed or removed only when it still equals the previous turn's content, so an edit made in that worktree is kept and reported, never overwritten. A history that was replaced (the new tip does not descend from the last one seen) is announced and applied as one step from what the directory holds.
+- `follow <thread>` prints each new turn of a thread as it arrives. With `--into <worktree>` it also applies the turn there, but only into a worktree `baton pull` created on this machine (recorded in `pulled.json` in the data dir, by resolved path); any other directory, a path under `.git` included, is refused before anything is read or written. A path is changed or removed only when it still equals the previous turn's content, so an edit made in that worktree is kept and reported, never overwritten. A history that was replaced (the new tip does not descend from the last one seen) is announced and applied as one step from what the directory holds.
 - Both read the local side repo. The daemon's link keeps it current, so `pull` and `follow` need no connection of their own. `follow` polls the thread's ref every 50 ms.
 - The server derives a thread's owner from its tip, and a daemon never pushes a thread another machine owns (see Server and Daemon link).
 - A server `refused` carries an optional `detail`, a short sentence that the daemon puts in its log.
@@ -369,3 +390,13 @@ A burst of 30 threads, one turn each at 100 ms spacing, takes a median 11.6 ms a
 - `find_root` and the new `repo_of` in `baton-core` are the only code that asks git where a path sits. `repo_of` returns the worktree root and the common git dir, both real paths. Neither writes.
 - A second caller for a worktree that is being enrolled now waits for the first. It used to get "is already being enrolled", which would have dropped the second hook's turn.
 - `baton turn` and a hook route through one delivery function. It resolves the worktree, enrolls it through its repository when needed, and queues the turn under the registry lock.
+
+### Known limits
+
+These are chosen limits, not open bugs. Each says what is not covered and what bounds it.
+
+- The 128-connection handshake pool is global. A host that opens 128 silent sockets holds every place for up to 10 s, and a new connection in that window is dropped at accept. There is no per-address limit, so an operator who needs one puts a firewall or a proxy in front.
+- A session authenticated by a command provider is not asked again. Revoking such an identity is the provider's job and takes effect at the identity's next connect. Token auth is checked every 2 s.
+- The send timeout cuts a client that reads nothing for 30 s. A client that reads a few bytes a second keeps its session.
+- The command provider's tree is killed through the process group (unix) or the Job Object (windows). A descendant that leaves the group with `setsid`, or breaks away from the job, outlives the kill. It no longer delays or changes the verdict.
+- A directory named `pwn/` that holds files named `HEAD`, `config` and `hooks` is an ordinary tree to git and to baton. It is stored and written as files. It acts like a repository only if the user enters it and runs git there, as with any repository's contents.

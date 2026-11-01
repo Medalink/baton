@@ -320,17 +320,44 @@ pub fn project_key(root: &Path, config: &RepoConfig) -> Result<ProjectKey> {
         return Ok(key.clone());
     }
     let repo = gix::open(root).map_err(Error::git)?;
-    let origin = repo
-        .config_snapshot()
-        .string("remote.origin.url")
-        .map(|v| v.to_string())
-        .ok_or_else(|| {
-            Error::Refused(
-                "no project key: set `project` in .baton/config.toml or add an `origin` remote"
-                    .into(),
+    let config = repo.config_snapshot();
+    let url = |name: &str| {
+        config
+            .string(format!("remote.{name}.url").as_str())
+            .map(|v| v.to_string())
+    };
+    // Only remotes the repo's own config names count: one in the user's global config would key the
+    // same repo differently, or not at all, on another machine. `origin` wins; without it, a repo whose
+    // only remote is named otherwise (`github`, `upstream`) still has one obvious key.
+    let local: std::collections::BTreeSet<String> = config
+        .plumbing()
+        .sections_by_name_and_filter("remote", |meta| {
+            matches!(
+                meta.source,
+                gix::config::Source::Local | gix::config::Source::Worktree
             )
-        })?;
-    ProjectKey::parse(&normalize_remote(&origin))
+        })
+        .into_iter()
+        .flatten()
+        .filter_map(|section| section.header().subsection_name().map(|n| n.to_string()))
+        .collect();
+    if local.contains("origin")
+        && let Some(origin) = url("origin")
+    {
+        return ProjectKey::parse(&normalize_remote(&origin));
+    }
+    let urls: Vec<String> = local.iter().filter_map(|name| url(name)).collect();
+    match urls.as_slice() {
+        [only] => ProjectKey::parse(&normalize_remote(only)),
+        [] => Err(Error::Refused(
+            "no project key: set `project` in .baton/config.toml or add an `origin` remote".into(),
+        )),
+        _ => Err(Error::Refused(format!(
+            "no project key: {} remotes and none named `origin`; set `project` in .baton/config.toml \
+             or name one of them `origin`",
+            urls.len()
+        ))),
+    }
 }
 
 impl Worktree {
@@ -874,6 +901,13 @@ impl Worktree {
                     return Ok(0);
                 };
                 let content = self.policy.prepare(&rel, raw);
+                let name = spelling.rsplit('/').next().unwrap_or_default();
+                if crate::names::check_file(name.as_bytes(), kind.entry_kind() as u32, &content)
+                    .is_err()
+                {
+                    self.forget(key, plan);
+                    return Ok(0);
+                }
                 let racy = now_ns().saturating_sub(mtime) < RACY_WINDOW_NS;
                 (hash_blob(&content), Some(content), racy)
             }
