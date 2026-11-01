@@ -110,7 +110,8 @@ lacks() {
   if [[ $2 != *"$3"* ]]; then ok "$1"; else bad "$1" "found [$3]"; fi
 }
 
-sgit() { git --git-dir="$SIDE" "$@"; }
+# MSYS rewrites an argument like `refs/baton/t:.env` as a path list unless told not to.
+sgit() { MSYS_NO_PATHCONV=1 git --git-dir="$SIDE" "$@"; }
 
 side_of() { echo "$BATON_HOME/data/projects/github.com+e2e+$1.git"; }
 
@@ -154,6 +155,46 @@ mkrepo() { # mkrepo dir name
   git -C "$dir" commit -q -m "initial"
 }
 
+mkmin() { # mkmin dir name : one committed file and no ignore rules
+  git init -q "$1"
+  git -C "$1" remote add origin "https://github.com/E2E/$2.git"
+  printf 'a\n' >"$1/a.txt"
+  git -C "$1" add -A >/dev/null 2>&1
+  git -C "$1" commit -q -m initial
+}
+
+mkfiles() { # mkfiles dir count prefix : count small files, 501 to a directory named prefixNNN
+  awk -v dir="$1" -v n="$2" -v pre="$3" 'BEGIN {
+    for (i = 0; i < n; i++) {
+      d = sprintf("%s/%s%03d", dir, pre, int(i / 501))
+      if (i % 501 == 0) system("mkdir -p \"" d "\"")
+      f = sprintf("%s/f%04d.txt", d, i % 501)
+      print i > f
+      close(f)
+    }
+  }'
+}
+
+turn_in() { # turn_in dir thread message [baton turn args...]
+  local dir=$1 thread=$2 msg=$3
+  shift 3
+  (cd "$dir" && "$BIN" turn --thread "$thread" --message "$msg" "$@" 2>&1)
+}
+
+tree_of() { sgit ls-tree -r --name-only "refs/baton/$1"; } # needs SIDE
+blob_of() { sgit cat-file -p "refs/baton/$1:$2" 2>&1; }
+
+user_config() { # user_config [toml lines...] : the value_files stanza, then whatever follows
+  {
+    printf '[redact]\nvalue_files = ["%s"]\n' "$(wp "$TMP")/values.json"
+    printf '%s\n' "$@"
+  } >"$TMP/home/config/config.toml"
+}
+
+values_json() { # values_json [extra members, with a leading comma]
+  printf '{"db":{"password":"%s","short":"abc"}%s}' "$SECRET_LITERAL" "${1:-}" >"$TMP/values.json"
+}
+
 git_digest() { (cd "$1/.git" && find . -type f | sort | xargs sha256sum | sha256sum | cut -d' ' -f1); }
 
 percentile() { # percentile file p   (values in microseconds, printed in ms)
@@ -176,9 +217,11 @@ REPO="$TMP/repo"
 mkrepo "$REPO" widgets
 SECRET_KEY="AKIAIOSFODNN7EXAMPLE"
 SECRET_LITERAL="hunter2-literal-secret-value"
-printf '{"db":{"password":"%s","short":"abc"}}' "$SECRET_LITERAL" >"$TMP/values.json"
+LATE_LITERAL="LATE-literal-secret-9"
+MACHINE_SECRET="ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
+values_json ""
 mkdir -p "$TMP/home/config"
-printf '[redact]\nvalue_files = ["%s"]\n' "$(wp "$TMP")/values.json" >"$TMP/home/config/config.toml"
+user_config
 HEAD_SHA=$(git -C "$REPO" rev-parse HEAD)
 DIGEST_BEFORE=$(git_digest "$REPO")
 payload "$TMP/payload-widgets.json" "$REPO" sess-1 "$TMP/transcript.jsonl"
@@ -329,6 +372,222 @@ eq "an edit no snapshot has seen blocks the rewind" "uncaptured" "$(cat "$REPO/a
 if [[ $rc != 0 ]]; then ok "and the command fails"; else bad "and the command fails" "rc=0"; fi
 contains "the refusal says why" "$out" "take a turn first"
 (cd "$REPO" && "$BIN" turn --thread rw --message "captured" >/dev/null 2>&1)
+section_end
+
+section "A. the walk and today's policy beat the stat cache"
+A="$TMP/policya"
+mkmin "$A" policya
+mkdir -p "$A/vendor"
+printf 'scratch 1\n' >"$A/scratch.txt"
+printf 'v1\n' >"$A/vendor/lib.js"
+printf 'Case\n' >"$A/Case.txt"
+printf 'prefix RULESECRET-abc suffix\n' >"$A/rule.txt"
+printf 'uses %s here\n' "$LATE_LITERAL" >"$A/lit.txt"
+"$BIN" enroll "$(wp "$A")" >/dev/null 2>&1
+SIDE=$(side_of policya)
+turn_in "$A" a1 "baseline" >/dev/null
+contains "an untracked, unignored file is stored" "$(tree_of a1)" "scratch.txt"
+sleep 2.3 # past the 2 s racy window: from here only the stat cache vouches for a file
+printf 'scratch.txt\n' >"$A/.gitignore"
+turn_in "$A" a2 "ignore it" >/dev/null
+lacks "a path that becomes ignored leaves the tree" "$(tree_of a2)" "scratch.txt"
+printf 'scratch 2\n' >"$A/scratch.txt"
+turn_in "$A" a3 "edit it" >/dev/null
+lacks "a later edit to it is never stored" "$(tree_of a3)" "scratch.txt"
+user_config '[snapshot]' 'exclude = ["vendor/"]'
+turn_in "$A" a4 "exclude vendor" >/dev/null
+lacks "a path the user config starts excluding leaves the tree" "$(tree_of a4)" "vendor/lib.js"
+mkdir -p "$A/nest"
+printf 'ignored later\n' >"$A/nest/ign.txt"
+printf 'kept\n' >"$A/nest/kept.txt"
+sleep 0.4
+printf 'ign.txt\n' >"$A/nest/.gitignore"
+sleep 0.4
+turn_in "$A" a5 "nested ignore arrives late" >/dev/null
+tree=$(tree_of a5)
+lacks "a file is not stored when its nested .gitignore arrives in a later batch" "$tree" "nest/ign.txt"
+contains "its sibling is" "$tree" "nest/kept.txt"
+mv "$A/Case.txt" "$A/case.txt"
+sleep 0.3
+turn_in "$A" a6 "case-only rename" >/dev/null
+tree=$(tree_of a6)
+contains "a case-only rename stores the new spelling" "$tree" "case.txt"
+lacks "and drops the old one" "$tree" "Case.txt"
+mkdir -p "$A/.baton"
+printf '[[redact.rule]]\nname = "rule-secret"\nregex = "RULESECRET-[a-z]+"\n' >"$A/.baton/config.toml"
+values_json ",\"late\":\"$LATE_LITERAL\""
+turn_in "$A" a7 "new rule and new literal" >/dev/null
+rule_blob=$(blob_of a7 rule.txt)
+lit_blob=$(blob_of a7 lit.txt)
+lacks "a project rule added later reaches a file that has not changed since" "$rule_blob" "RULESECRET-abc"
+contains "and leaves its marker" "$rule_blob" "[baton:redacted:rule-secret]"
+lacks "a literal added later reaches a file that has not changed since" "$lit_blob" "$LATE_LITERAL"
+user_config
+values_json ""
+section_end
+
+section "B. a file git tracks is stored even when an ignore rule matches it"
+B="$TMP/trackedb"
+mkmin "$B" trackedb
+mkdir -p "$B/build"
+printf 'build/\n' >"$B/.gitignore"
+printf 'forced 1\n' >"$B/build/forced.o"
+printf 'obj\n' >"$B/build/x.o"
+git -C "$B" add -f .gitignore build/forced.o >/dev/null 2>&1
+git -C "$B" commit -q -m "track a file the ignore rule matches"
+"$BIN" enroll "$(wp "$B")" >/dev/null 2>&1
+SIDE=$(side_of trackedb)
+turn_in "$B" b1 "baseline" >/dev/null
+tree=$(tree_of b1)
+contains "the tracked file under an ignored directory is stored" "$tree" "build/forced.o"
+lacks "an untracked file beside it is not" "$tree" "build/x.o"
+printf 'forced 2\n' >"$B/build/forced.o"
+turn_in "$B" b2 "edit it" >/dev/null
+eq "an edit to it is stored" "forced 2" "$(blob_of b2 build/forced.o)"
+section_end
+
+section "C. a worktree beyond the dirty-path cap falls back to a full tree build"
+C="$TMP/capc"
+mkmin "$C" capc
+mkfiles "$C" 50100 w1
+out=$("$BIN" enroll "$(wp "$C")" 2>&1)
+contains "enroll counts every file" "$out" "(50101 files)"
+SIDE=$(side_of capc)
+turn_in "$C" c1 "baseline" >/dev/null
+eq "the baseline tree holds every file" 50101 "$(tree_of c1 | wc -l | tr -d ' ')"
+mkfiles "$C" 50100 w2
+turn_in "$C" c2 "a second wave while watched" >/dev/null
+eq "a second wave beyond the cap is all in the next turn" 100201 "$(tree_of c2 | wc -l | tr -d ' ')"
+check "the side repo passes fsck" sgit fsck --strict --no-dangling
+"$BIN" unenroll "$(wp "$C")" >/dev/null 2>&1
+section_end
+
+section "D. redaction holes"
+D="$TMP/redd"
+mkmin "$D" redd
+mkdir -p "$D/.baton"
+printf '[snapshot]\nstore_whole = ["*"]\n[[redact.rule]]\nname = "oops"\nregex = "z*"\n' >"$D/.baton/config.toml"
+printf 'DB=%s\nAWS=%s\n' "$SECRET_LITERAL" "$SECRET_KEY" >"$D/notes.txt"
+cat >"$D/.env" <<EOT
+DB_PASSWORD=p4ssw0rd-very-long-secret-value-1
+API_KEY=key-very-long-secret-value-0123456789
+password=unquoted-very-long-secret-value-1
+DB_PASSWORD="prefixed-quoted-very-long-secret"
+DATABASE_URL=postgres://user:pa/ss+word=longer@db.example.com/app
+aws_secret_access_key = "AbcdEfghIjklMnopQrstUvwxYz0123456789/+=="
+EOT
+printf 'x\n' >"$D/$SECRET_KEY.txt"
+printf 'x\n' >"$D/fine.txt"
+git -C "$D" add -A >/dev/null 2>&1
+git -C "$D" commit -q -m "secrets"
+"$BIN" enroll "$(wp "$D")" >/dev/null 2>&1
+SIDE=$(side_of redd)
+user_config '[machine]' "id = \"$MACHINE_SECRET\""
+out=$(turn_in "$D" d1 "work on $SECRET_KEY" --check "$SECRET_KEY=0" --check lint=0)
+contains "the turn is recorded despite a repo rule that matches the empty string" "$out" "d1@1"
+user_config
+daemon_log=$(cat "$BATON_HOME/data/daemon.log")
+contains "the empty-matching rule is dropped with a log line" "$daemon_log" "rule oops matches the empty string"
+contains "a repo store_whole is ignored with a log line" "$daemon_log" "sets store_whole"
+notes=$(blob_of d1 notes.txt)
+lacks "a repo store_whole does not keep a value_files literal in a file" "$notes" "$SECRET_LITERAL"
+lacks "or the AWS key" "$notes" "$SECRET_KEY"
+env_blob=$(blob_of d1 .env)
+for secret in "p4ssw0rd-very-long" "key-very-long-secret" "unquoted-very-long" "prefixed-quoted-very" "pa/ss+word" "Yz0123456789/+"; do
+  lacks "the built-in patterns cut out $secret" "$env_blob" "$secret"
+done
+contains "the URL keeps its host" "$env_blob" "@db.example.com/app"
+contains "the AWS secret ending in = is one match" "$env_blob" "\"[baton:redacted:aws-secret-key]\""
+tree=$(tree_of d1)
+lacks "a file named after a secret is not in the tree" "$tree" "$SECRET_KEY"
+contains "other files still are" "$tree" "fine.txt"
+msg=$(sgit cat-file commit refs/baton/d1)
+contains "Baton-Skipped names it with the secret cut out" "$msg" "Baton-Skipped: [baton:redacted:aws-access-key].txt"
+contains "a machine id holding a secret gives way to the host name" "$msg" "Baton-Machine: "
+lacks "so the machine id is not in the commit" "$msg" "$MACHINE_SECRET"
+lacks "a check name holding a secret is dropped" "$msg" "Baton-Check: $SECRET_KEY"
+contains "other checks stay" "$msg" "Baton-Check: lint=0"
+lacks "the subject is redacted" "$msg" "$SECRET_KEY"
+out=$(cd "$D" && "$BIN" log d1 2>&1)
+contains "baton log reads a turn that skipped a secret-named file" "$out" "d1@1"
+out=$(cd "$D" && "$BIN" rewind d1@1 2>&1)
+contains "rewind plans against such a turn" "$out" "rewind to d1@1"
+sgit cat-file --batch-all-objects --batch >"$TMP/objects.dump"
+for secret in "$SECRET_KEY" "$SECRET_LITERAL" "pa/ss+word" "$MACHINE_SECRET"; do
+  check "no object in the side repo holds $secret" bash -c '! grep -aq -e "$0" "$1"' "$secret" "$TMP/objects.dump"
+done
+rm -f "$TMP/objects.dump"
+check "the side repo passes fsck" sgit fsck --strict --no-dangling
+section_end
+
+section "E. a hook from a cwd spelled through a link"
+E="$TMP/linke"
+mkmin "$E" linke
+"$BIN" enroll "$(wp "$E")" >/dev/null 2>&1
+SIDE=$(side_of linke)
+case ${OSTYPE:-} in
+  msys* | cygwin*) cmd //c mklink //J "$(cygpath -w "$TMP/link")" "$(cygpath -w "$E")" >/dev/null ;;
+  *) ln -s "$E" "$TMP/link" ;;
+esac
+printf 'via link\n' >"$E/new.txt"
+payload "$TMP/payload-link.json" "$TMP/link" viaj
+"$BIN" hook claude <"$TMP/payload-link.json"
+if wait_ref_change "$SIDE/refs/baton/viaj" "" 5000; then ok "the turn from a junction or symlink cwd is recorded"; else bad "the turn from a link cwd was dropped"; fi
+contains "and holds the file written through the real path" "$(tree_of viaj)" "new.txt"
+case ${OSTYPE:-} in
+  msys* | cygwin*) cmd //c rmdir "$(cygpath -w "$TMP/link")" >/dev/null 2>&1 ;;
+  *) rm -f "$TMP/link" ;;
+esac
+section_end
+
+section "F. rewind --apply refuses what it would trample"
+F="$TMP/rewf"
+mkmin "$F" rewf
+printf 'keep me\n' >"$F/del.txt"
+printf 'i am a file\n' >"$F/swap"
+printf 'b1\n' >"$F/b.txt"
+"$BIN" enroll "$(wp "$F")" >/dev/null 2>&1
+SIDE=$(side_of rewf)
+turn_in "$F" f1 "v1" >/dev/null
+printf 'b2\n' >"$F/b.txt"
+turn_in "$F" f1 "v2" >/dev/null
+printf 'b1\n' >"$F/b.txt"
+rm "$F/del.txt" "$F/swap"
+mkdir "$F/swap"
+printf 'inner\n' >"$F/swap/inner.txt"
+sleep 0.3
+out=$(cd "$F" && "$BIN" rewind f1@1 2>&1)
+contains "the plan refuses a path deleted since the last snapshot" "$out" "refuse del.txt: deleted since the last snapshot; take a turn first"
+contains "the plan refuses a file that is now a directory" "$out" "refuse swap: a directory or an unreadable file is in the way"
+out=$(cd "$F" && "$BIN" rewind f1@1 --apply 2>&1)
+rc=$?
+if [[ $rc != 0 ]]; then ok "--apply fails"; else bad "--apply fails" "rc=0"; fi
+check "the deleted file was not brought back" test ! -e "$F/del.txt"
+check "the directory is still a directory" test -f "$F/swap/inner.txt"
+eq "no rewind temp file is left behind" "" "$(find "$F" -name '.baton-rewind-*' -not -path '*/.git/*')"
+section_end
+
+section "G. a hook from a nested repo that is not enrolled"
+G="$TMP/outerg"
+mkmin "$G" outerg
+mkdir -p "$G/inner"
+git init -q "$G/inner"
+printf 'i\n' >"$G/inner/i.txt"
+git -C "$G/inner" add -A >/dev/null 2>&1
+git -C "$G/inner" commit -q -m inner
+"$BIN" enroll "$(wp "$G")" >/dev/null 2>&1
+SIDE=$(side_of outerg)
+payload "$TMP/payload-outer.json" "$G" outer
+"$BIN" hook claude <"$TMP/payload-outer.json"
+if wait_ref_change "$SIDE/refs/baton/outer" "" 5000; then ok "a hook from the enrolled root is recorded"; else bad "a hook from the enrolled root was dropped"; fi
+payload "$TMP/payload-inner.json" "$G/inner" nested
+"$BIN" hook claude <"$TMP/payload-inner.json"
+sleep 0.8
+check "a hook from the nested repo is not recorded on the outer project" test ! -e "$SIDE/refs/baton/nested"
+contains "the daemon says why" "$(cat "$BATON_HOME/data/daemon.log")" "inside the nested repo"
+out=$(cd "$G/inner" && "$BIN" turn --thread nested2 --message x 2>&1)
+contains "baton turn from there says to enroll it" "$out" "run \`baton enroll\` there"
+SIDE=$(side_of widgets)
 section_end
 
 section "the user's repo is untouched"
