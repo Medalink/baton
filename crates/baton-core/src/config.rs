@@ -51,9 +51,22 @@ struct RawServer {
     ca_file: Option<String>,
 }
 
+/// The plug-in tables of the user config. `plugin_config` reads them; `UserConfig` only has to let them
+/// pass, so a mistake in one never stops capture.
+type PluginTable = Option<toml::Value>;
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(
+    dead_code,
+    reason = "parsed so the file loads; `Plugins` reads these tables"
+)]
 struct RawUser {
+    classify: PluginTable,
+    decide: PluginTable,
+    notify: PluginTable,
+    lens: PluginTable,
+    agents: PluginTable,
     #[serde(default)]
     machine: RawMachine,
     server: Option<RawServer>,
@@ -74,6 +87,14 @@ struct RawRepoRedact {
 #[serde(deny_unknown_fields)]
 struct RawRepo {
     project: Option<String>,
+    // Tables only the user config may hold. They parse, so a clone that carries one still records, and
+    // they are never read: `RepoConfig` has no field for a command, a rule or a lens, and so cannot
+    // hand one on.
+    classify: PluginTable,
+    decide: PluginTable,
+    notify: PluginTable,
+    lens: PluginTable,
+    agents: PluginTable,
     #[serde(default)]
     snapshot: RawSnapshot,
     #[serde(default)]
@@ -240,6 +261,8 @@ pub struct RepoConfig {
     pub project: Option<ProjectKey>,
     pub snapshot: SnapshotConfig,
     pub rules: Vec<RuleSpec>,
+    /// What the file held that only the user config may hold; the daemon logs it.
+    pub notices: Vec<String>,
 }
 
 fn read_optional(path: &Path) -> Result<Option<String>> {
@@ -300,7 +323,21 @@ impl RepoConfig {
             return Ok(Self::default());
         };
         let raw: RawRepo = toml::from_str(&text).map_err(|e| config_error(&path, e))?;
+        let notices = [
+            ("classify", &raw.classify),
+            ("decide", &raw.decide),
+            ("notify", &raw.notify),
+            ("lens", &raw.lens),
+            ("agents", &raw.agents),
+        ]
+        .into_iter()
+        .filter(|(_, table)| table.is_some())
+        .map(|(name, _)| {
+            format!(".baton/config.toml sets [{name}], which only the user config may; ignored")
+        })
+        .collect();
         Ok(Self {
+            notices,
             project: raw.project.as_deref().map(ProjectKey::parse).transpose()?,
             snapshot: raw.snapshot.into(),
             rules: raw.redact.rule,
@@ -332,7 +369,7 @@ impl Settings {
             .map(|s| (*s).to_owned())
             .collect();
         store_whole.extend(user.snapshot.store_whole.iter().cloned());
-        let mut notices = Vec::new();
+        let mut notices = repo.notices.clone();
         if !repo.snapshot.store_whole.is_empty() {
             notices.push(
                 ".baton/config.toml sets store_whole, which only the user config may; ignored"

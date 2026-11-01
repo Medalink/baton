@@ -10,7 +10,11 @@ use std::path::Path;
 
 const BINARY_PROBE_BYTES: usize = 8 * 1024;
 
-fn globs(patterns: &[String], what: &'static str, include_below: bool) -> Result<GlobSet> {
+pub(crate) fn globs(
+    patterns: &[String],
+    what: &'static str,
+    include_below: bool,
+) -> Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     for raw in patterns {
         let pattern = raw.trim_start_matches('/');
