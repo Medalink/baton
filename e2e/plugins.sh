@@ -677,7 +677,7 @@ lacks "a size-skipped file's text is not in the document" "$whole" "SIZESKIPPED-
 lacks "an excluded path is not listed" "$(jget "$doc" '[f["path"] for f in d["files"]]')" "secrets"
 lacks "an unchanged file is not listed" "$(jget "$doc" '[f["path"] for f in d["files"]]')" "kept.txt"
 contains "a deleted file still shows its lines" "$(jget "$doc" 'd["diff"]')" "-going away"
-contains "a changed binary is reported as differing" "$(jget "$doc" 'd["diff"]')" "Binary files a/bin.dat b/bin.dat differ"
+contains "a changed binary is reported as differing" "$(jget "$doc" 'd["diff"]')" "Binary files a/bin.dat and b/bin.dat differ"
 lacks "a binary's bytes are not in the document (v1)" "$whole" "binary-v1"
 lacks "a binary's bytes are not in the document (v2)" "$whole" "binary-v2"
 

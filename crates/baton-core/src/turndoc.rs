@@ -12,7 +12,7 @@ use crate::store::{SideRepo, TurnRecord};
 use gix::bstr::ByteSlice;
 use similar::{ChangeTag, TextDiff};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const DIFF_MAX_BYTES: usize = 256 * 1024;
 const FILES_MAX: usize = 2000;
@@ -45,6 +45,7 @@ impl Side {
 /// The commit a thread's first turn started from, read straight from the user's object database.
 struct GitBase {
     repo: gix::Repository,
+    root: PathBuf,
     files: BTreeMap<String, gix::ObjectId>,
 }
 
@@ -71,7 +72,23 @@ impl GitBase {
                 }
             }
         }
-        Ok(Self { repo, files })
+        Ok(Self {
+            repo,
+            root: root.to_owned(),
+            files,
+        })
+    }
+
+    fn prepared(&self, path: &str, id: gix::ObjectId, policy: &StorePolicy) -> Result<Vec<u8>> {
+        Ok(prepare(path, self.blob(id)?, policy))
+    }
+
+    /// Whether the store would have skipped the file for its size: in the base commit, or on disk now,
+    /// where a file that grew past the limit after the base is skipped too.
+    fn over_limit(&self, path: &str, base_len: usize, policy: &StorePolicy) -> bool {
+        policy.exceeds_size_limit(base_len as u64)
+            || std::fs::symlink_metadata(self.root.join(path))
+                .is_ok_and(|meta| policy.exceeds_size_limit(meta.len()))
     }
 
     fn blob(&self, id: gix::ObjectId) -> Result<Vec<u8>> {
@@ -120,6 +137,10 @@ fn changes_since_parent(
     Ok(out)
 }
 
+/// The first turn against the commit the thread started from. Only paths the side repo could hold are
+/// compared: a base file that is missing from the turn's tree is a deletion only if the store policy
+/// would have stored it, and an unchanged file never appears. The git side goes through the same
+/// `StorePolicy::prepare` a snapshot does.
 fn changes_since_base(
     side: &SideRepo,
     record: &TurnRecord,
@@ -132,29 +153,39 @@ fn changes_since_base(
         .into_iter()
         .map(|e| (e.path.as_str().to_owned(), e.blob))
         .collect();
-    for (path, git_blob) in &base.files {
-        let prepared = |bytes: Vec<u8>| match RelPath::parse(path) {
-            Ok(rel) => policy.prepare(&rel, bytes),
-            Err(_) => bytes,
+    let mut missing = Vec::new();
+    for (path, &git_blob) in &base.files {
+        let Some(blob) = now.remove(path) else {
+            missing.push((path.as_str(), git_blob));
+            continue;
         };
-        match now.remove(path) {
-            None => out.push(Changed {
-                path: path.clone(),
-                old: Side::from_bytes(&prepared(base.blob(*git_blob)?)),
-                new: Side::Absent,
-            }),
-            Some(blob) => {
-                let old = Side::from_bytes(&prepared(base.blob(*git_blob)?));
-                let new = blob_side(side, blob)?;
-                if !same(&old, &new) {
-                    out.push(Changed {
-                        path: path.clone(),
-                        old,
-                        new,
-                    });
-                }
-            }
+        if blob.oid() == git_blob {
+            continue;
         }
+        let old = Side::from_bytes(&base.prepared(path, git_blob, policy)?);
+        let new = blob_side(side, blob)?;
+        if !matches!((&old, &new), (Side::Text(a), Side::Text(b)) if a == b) {
+            out.push(Changed {
+                path: path.clone(),
+                old,
+                new,
+            });
+        }
+    }
+    let asked: Vec<(&str, bool)> = missing.iter().map(|&(path, _)| (path, false)).collect();
+    for ((path, git_blob), admitted) in missing.into_iter().zip(policy.admits(&asked)?) {
+        if !admitted || policy.holds_secret(path) {
+            continue;
+        }
+        let raw = base.blob(git_blob)?;
+        if base.over_limit(path, raw.len(), policy) {
+            continue;
+        }
+        out.push(Changed {
+            path: path.to_owned(),
+            old: Side::from_bytes(&prepare(path, raw, policy)),
+            new: Side::Absent,
+        });
     }
     for (path, blob) in now {
         out.push(Changed {
@@ -167,11 +198,10 @@ fn changes_since_base(
     Ok(out)
 }
 
-fn same(a: &Side, b: &Side) -> bool {
-    match (a, b) {
-        (Side::Text(a), Side::Text(b)) => a == b,
-        (Side::Absent, Side::Absent) | (Side::Binary, Side::Binary) => true,
-        _ => false,
+fn prepare(path: &str, bytes: Vec<u8>, policy: &StorePolicy) -> Vec<u8> {
+    match RelPath::parse(path) {
+        Ok(rel) => policy.prepare(&rel, bytes),
+        Err(_) => bytes,
     }
 }
 
