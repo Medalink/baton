@@ -52,6 +52,13 @@ struct RawWatch {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawEnroll {
+    #[serde(default)]
+    projects: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawServer {
     url: Option<String>,
     token: Option<String>,
@@ -84,6 +91,8 @@ struct RawUser {
     redact: RawUserRedact,
     #[serde(default)]
     watch: RawWatch,
+    #[serde(default)]
+    enroll: RawEnroll,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -105,6 +114,7 @@ struct RawRepo {
     notify: PluginTable,
     lens: PluginTable,
     agents: PluginTable,
+    enroll: PluginTable,
     #[serde(default)]
     snapshot: RawSnapshot,
     #[serde(default)]
@@ -140,6 +150,31 @@ pub struct UserConfig {
     pub value_files: Vec<PathBuf>,
     /// At most this many worktrees of enrolled repositories are watched at once.
     pub max_repo_worktrees: usize,
+    pub enroll: EnrollConfig,
+}
+
+/// `[enroll] projects`: the project keys whose repositories the daemon enrolls by itself. Only the user
+/// config may name them, since a cloned repo must not be able to get itself recorded.
+#[derive(Clone, Debug, Default)]
+pub struct EnrollConfig {
+    pub projects: Vec<ProjectKey>,
+    /// Entries that are not project keys. They are skipped, never an error: one typo in a list that is
+    /// synced to every machine must not stop capture on all of them.
+    pub skipped: Vec<String>,
+}
+
+impl EnrollConfig {
+    fn from_raw(raw: RawEnroll) -> Self {
+        let mut config = Self::default();
+        for entry in raw.projects {
+            match ProjectKey::parse(&entry.trim().to_lowercase()) {
+                Ok(key) if !config.projects.contains(&key) => config.projects.push(key),
+                Ok(_) => {}
+                Err(e) => config.skipped.push(format!("{entry:?}: {e}")),
+            }
+        }
+        config
+    }
 }
 
 /// Default for `[watch] max_repo_worktrees`. The design target is 30 active agents, so the cap sits well
@@ -313,6 +348,7 @@ impl Default for UserConfig {
             snapshot: SnapshotConfig::default(),
             value_files: Vec::new(),
             max_repo_worktrees: DEFAULT_MAX_REPO_WORKTREES,
+            enroll: EnrollConfig::default(),
         }
     }
 }
@@ -347,6 +383,7 @@ impl UserConfig {
                 .max_repo_worktrees
                 .unwrap_or(DEFAULT_MAX_REPO_WORKTREES)
                 .max(1),
+            enroll: EnrollConfig::from_raw(raw.enroll),
         })
     }
 }
@@ -364,6 +401,7 @@ impl RepoConfig {
             ("notify", &raw.notify),
             ("lens", &raw.lens),
             ("agents", &raw.agents),
+            ("enroll", &raw.enroll),
         ]
         .into_iter()
         .filter(|(_, table)| table.is_some())

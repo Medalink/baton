@@ -23,7 +23,7 @@ mod wire;
 mod worktree;
 
 pub use apply::{Applied, Guard, apply_tree};
-pub use config::{RepoConfig, ServerConfig, ServerUrl, Settings, Token, UserConfig};
+pub use config::{EnrollConfig, RepoConfig, ServerConfig, ServerUrl, Settings, Token, UserConfig};
 pub use error::{Error, Result};
 pub use history::{
     BLAME_SCHEMA, BlameCommit, BlameDoc, BlameLine, BlameTurn, CommitFacts, Found, GitView,
