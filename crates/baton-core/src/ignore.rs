@@ -9,16 +9,85 @@ use gix::dir::walk::{Action, Delegate, EmissionMode};
 use gix::dir::{EntryRef, entry};
 use gix::index::entry::Mode;
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+/// How a repository tells two paths apart, from its `core.ignorecase`, which git sets when it finds the
+/// file system folds case (Windows, default macOS). Only ASCII folds, as in git itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Case {
+    Exact,
+    Fold,
+}
+
+impl Case {
+    pub fn same(self, a: &str, b: &str) -> bool {
+        match self {
+            Self::Exact => a == b,
+            Self::Fold => a.eq_ignore_ascii_case(b),
+        }
+    }
+
+    /// What identifies `path`: two paths are the same file exactly when their keys are equal.
+    pub(crate) fn key(self, path: &str) -> String {
+        match self {
+            Self::Exact => path.to_owned(),
+            Self::Fold => path.to_ascii_lowercase(),
+        }
+    }
+}
+
+/// The files in HEAD's tree, each with its key, so a lookup or a scan never folds a path twice.
+pub(crate) struct TrackedSet {
+    case: Case,
+    /// `(spelling git recorded, key)`, in spelling order.
+    files: Vec<(String, String)>,
+    keys: HashSet<String>,
+}
+
+impl TrackedSet {
+    fn new(case: Case, mut spellings: Vec<String>) -> Self {
+        spellings.sort();
+        let files: Vec<(String, String)> = spellings
+            .into_iter()
+            .map(|spelling| {
+                let key = case.key(&spelling);
+                (spelling, key)
+            })
+            .collect();
+        let keys = files.iter().map(|(_, key)| key.clone()).collect();
+        Self { case, files, keys }
+    }
+
+    pub(crate) fn contains(&self, path: &str) -> bool {
+        match self.case {
+            Case::Exact => self.keys.contains(path),
+            Case::Fold => self.keys.contains(&path.to_ascii_lowercase()),
+        }
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.files.iter().map(|(s, k)| (s.as_str(), k.as_str()))
+    }
+
+    /// The spellings that are in one set and not the other.
+    pub(crate) fn differing<'a>(&'a self, other: &'a Self) -> impl Iterator<Item = &'a str> {
+        let mine: HashSet<&str> = self.iter().map(|(s, _)| s).collect();
+        let theirs: HashSet<&str> = other.iter().map(|(s, _)| s).collect();
+        let gone: Vec<&str> = mine.difference(&theirs).copied().collect();
+        let new: Vec<&str> = theirs.difference(&mine).copied().collect();
+        gone.into_iter().chain(new)
+    }
+}
+
 pub(crate) struct IgnoreRules {
     repo: gix::Repository,
     index: gix::index::State,
+    case: Case,
     /// The files in HEAD's tree, keyed by the commit they were read from.
-    tracked: RefCell<Option<(gix::ObjectId, Arc<BTreeSet<String>>)>>,
+    tracked: RefCell<Option<(gix::ObjectId, Arc<TrackedSet>)>>,
 }
 
 #[derive(Default)]
@@ -48,11 +117,25 @@ impl IgnoreRules {
             )));
         }
         let index = gix::index::State::new(repo.object_hash());
+        let case = if repo
+            .config_snapshot()
+            .boolean("core.ignoreCase")
+            .unwrap_or(false)
+        {
+            Case::Fold
+        } else {
+            Case::Exact
+        };
         Ok(Self {
             repo,
             index,
+            case,
             tracked: RefCell::new(None),
         })
+    }
+
+    pub(crate) fn case(&self) -> Case {
+        self.case
     }
 
     /// Files whose contents decide ignore verdicts, outside the worktree's own `.gitignore` tree: the
@@ -113,9 +196,9 @@ impl IgnoreRules {
     /// The files git tracks at HEAD, read straight from the object database. Git does not apply ignore
     /// rules to a tracked file, so neither does baton. The user's `.git/index` is not opened, which means a
     /// file that is staged but not yet committed is still subject to the ignore rules.
-    pub(crate) fn tracked(&self) -> Arc<BTreeSet<String>> {
+    pub(crate) fn tracked(&self) -> Arc<TrackedSet> {
         let Ok(head) = self.repo.head_id() else {
-            return Arc::default();
+            return Arc::new(TrackedSet::new(self.case, Vec::new()));
         };
         let head = head.detach();
         if let Some((cached, files)) = &*self.tracked.borrow()
@@ -123,12 +206,15 @@ impl IgnoreRules {
         {
             return Arc::clone(files);
         }
-        let files: Arc<BTreeSet<String>> = Arc::new(self.read_tree(head).unwrap_or_default());
+        let files = Arc::new(TrackedSet::new(
+            self.case,
+            self.read_tree(head).unwrap_or_default(),
+        ));
         *self.tracked.borrow_mut() = Some((head, Arc::clone(&files)));
         files
     }
 
-    fn read_tree(&self, commit: gix::ObjectId) -> Option<BTreeSet<String>> {
+    fn read_tree(&self, commit: gix::ObjectId) -> Option<Vec<String>> {
         let tree = self.repo.find_commit(commit).ok()?.tree().ok()?;
         let entries = tree.traverse().breadthfirst.files().ok()?;
         Some(

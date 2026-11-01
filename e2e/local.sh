@@ -702,6 +702,26 @@ rm -f "$TMP/objects.dump"
 "$BIN" unenroll "$(wp "$J")" >/dev/null 2>&1
 section_end
 
+section "K. on a case-insensitive file system a path is the same file in any case"
+KR="$TMP/casek"
+mkmin "$KR" casek
+if [[ $(git -C "$KR" config core.ignorecase) != true ]]; then
+  echo "  skipped: this file system is case sensitive (git did not set core.ignorecase)"
+else
+  mkdir -p "$KR/sub2"
+  printf 'x\n' >"$KR/sub2/f.txt"
+  "$BIN" enroll "$(wp "$KR")" >/dev/null 2>&1
+  SIDE=$(side_of casek)
+  turn_in "$KR" k1 "baseline" >/dev/null
+  contains "a file in a plain directory is stored" "$(tree_of k1)" "sub2/f.txt"
+  printf 'f.txt\n' >"$KR/sub2/.GitIgnore"
+  sleep 0.4
+  turn_in "$KR" k1 "an ignore file spelled .GitIgnore" >/dev/null
+  lacks "an ignore file in another case drops the file it names" "$(tree_of k1)" "sub2/f.txt"
+  "$BIN" unenroll "$(wp "$KR")" >/dev/null 2>&1
+fi
+section_end
+
 SIDE=$(side_of widgets)
 
 section "the user's repo is untouched"

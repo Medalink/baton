@@ -308,16 +308,17 @@ impl Task {
             return 0;
         }
 
+        let case = self.wt.case();
         let mut candidates: Vec<(String, bool)> = Vec::new();
         for (rel, structural) in seen {
-            if rel == ".git/info/exclude" || rel == ".baton/config.toml" {
+            let (dir, name) = rel.rsplit_once('/').unwrap_or(("", &rel));
+            if case.same(&rel, ".git/info/exclude") || case.same(&rel, ".baton/config.toml") {
                 self.dirty.overflow();
-            } else if rel.ends_with(".gitignore") {
-                let dir = rel.rsplit_once('/').map_or("", |(dir, _)| dir).to_owned();
+            } else if case.same(name, ".gitignore") {
                 if dir.is_empty() {
                     self.dirty.overflow();
                 } else {
-                    self.dirty.mark(dir, true);
+                    self.dirty.mark(dir.to_owned(), true);
                 }
             }
             if rel

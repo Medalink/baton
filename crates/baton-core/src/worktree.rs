@@ -8,6 +8,7 @@
 use crate::config::{RepoConfig, Settings, UserConfig};
 use crate::error::{Error, IoContext, Result};
 use crate::id::{BlobId, FileKind, GitSha, ProjectKey, RelPath, TreeId};
+use crate::ignore::{Case, TrackedSet};
 use crate::paths::Dirs;
 use crate::policy::StorePolicy;
 use crate::store::{BlobPayload, TreeEdit};
@@ -182,7 +183,7 @@ pub struct Worktree {
     policy: StorePolicy,
     policy_fingerprint: String,
     /// The files in HEAD as of the last `prepare`, to notice which ones HEAD started or stopped tracking.
-    head_files: Arc<BTreeSet<String>>,
+    head_files: Arc<TrackedSet>,
     tracked: BTreeMap<String, Tracked>,
     skipped: BTreeMap<String, SkipKind>,
     /// What loading the policy ignored, until `take_notices` hands it to the log.
@@ -332,6 +333,10 @@ impl Worktree {
 
     pub fn tree(&self) -> TreeId {
         self.tree
+    }
+
+    pub fn case(&self) -> Case {
+        self.policy.case()
     }
 
     /// The paths the last `prepare` left out, as a turn names them: a path with a secret in it by its
@@ -492,7 +497,7 @@ impl Worktree {
         let mut found = self.policy.rules().walk(prefix)?;
         let walked: HashSet<String> = found.iter().cloned().collect();
         let below = prefix.map(|p| format!("{p}/"));
-        for path in self.policy.rules().tracked().iter() {
+        for (path, _) in self.policy.rules().tracked().iter() {
             if walked.contains(path) || below.as_ref().is_some_and(|b| !path.starts_with(b)) {
                 continue;
             }
@@ -500,7 +505,7 @@ impl Worktree {
                 .ok()
                 .and_then(|m| file_kind(&m));
             if on_disk.is_some() {
-                found.push(path.clone());
+                found.push(path.to_owned());
             }
         }
         found.retain(|p| !self.policy.excluded_by_config(p) && RelPath::parse(p).is_ok());
@@ -596,8 +601,8 @@ impl Worktree {
         if Arc::ptr_eq(&now, &self.head_files) {
             return;
         }
-        for path in now.symmetric_difference(&self.head_files) {
-            dirty.mark(path.clone(), false);
+        for path in now.differing(&self.head_files) {
+            dirty.mark(path.to_owned(), false);
         }
         self.head_files = now;
     }

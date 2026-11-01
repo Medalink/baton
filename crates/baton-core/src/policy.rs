@@ -76,13 +76,17 @@ impl StorePolicy {
         &self.ignore
     }
 
+    pub fn case(&self) -> crate::ignore::Case {
+        self.ignore.case()
+    }
+
     /// True for the paths baton stores: not ignored by git unless git tracks them, and not excluded by the
     /// config. `entries` are `(path, is a directory)`.
     pub(crate) fn admits(&self, entries: &[(&str, bool)]) -> Result<Vec<bool>> {
         let tracked = self.ignore.tracked();
         let mut verdicts = self.ignore.verdicts(entries)?;
         for ((path, is_dir), verdict) in entries.iter().zip(&mut verdicts) {
-            let by_git = *verdict && (*is_dir || !tracked.contains(*path));
+            let by_git = *verdict && (*is_dir || !tracked.contains(path));
             *verdict = !(by_git || self.exclude.is_match(*path));
         }
         Ok(verdicts)
