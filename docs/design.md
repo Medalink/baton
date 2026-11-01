@@ -180,7 +180,7 @@ Latency from `e2e/local.sh`, 100 turns of three edited files on the 7,384-file I
 | of which the hook process, spawn to exit | 33.2 ms | 47.9 ms |
 | of which hook exit to ref moved | 21.9 ms | 31.2 ms |
 
-Inside the daemon the median turn takes 3.5 ms to sync, 0.3 ms to commit, 0.2 ms to move the ref, and 3.9 ms in all. The rest of hook exit to ref moved is the 5 ms quiescence wait and the script's own polling of the ref file. A target of 50 ms from hook call to the ref visible on a second machine cannot be judged from this run: p50 on one machine is already 58 ms, and about 33 ms of it is the hook process as Git Bash starts it, and the rest is the 5 ms quiescence wait, the daemon's 4 ms, and the script's polling of the ref file. This slice has no network, so the second-machine figure belongs to the sync slice.
+Inside the daemon the median turn takes 3.5 ms to sync, 0.3 ms to commit, 0.2 ms to move the ref, and 3.9 ms in all. A target of 50 ms from hook call to the ref visible on a second machine cannot be judged from this run: p50 on one machine is already 58 ms, and about 33 ms of it is the hook process as Git Bash starts it, and the rest is the 5 ms quiescence wait, the daemon's 4 ms, and the script's polling of the ref file. This slice has no network, so the second-machine figure belongs to the sync slice.
 
 ### Behavior fixed by this slice
 
