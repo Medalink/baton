@@ -305,6 +305,12 @@ impl Assembler {
         }
     }
 
+    /// What unfinished objects announced they will hold. A buffer grows only as bytes arrive, so a peer
+    /// that announces a lot and sends little costs little; callers count this against their own limit.
+    pub fn announced(&self) -> u64 {
+        self.partial.values().map(|p| p.total).sum()
+    }
+
     pub fn push(&mut self, chunk: ObjectChunk<'_>) -> Result<Option<Object>> {
         let ObjectChunk {
             xfer,
@@ -339,7 +345,7 @@ impl Assembler {
                     Partial {
                         kind,
                         total,
-                        bytes: Vec::with_capacity(usize::try_from(total).unwrap_or(0)),
+                        bytes: Vec::new(),
                     },
                 );
             }
