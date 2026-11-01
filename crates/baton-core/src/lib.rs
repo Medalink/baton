@@ -56,4 +56,7 @@ pub use wire::{
     MAX_OBJECT, Meta, Object, ObjectChunk, ObjectKind, PROTO, RefuseReason, SUBPROTOCOL, decode,
     encode_control, encode_object, hash_object,
 };
-pub use worktree::{ChunkLimits, DirtySet, Plan, Worktree, find_root, open_policy, project_key};
+pub use worktree::{
+    ChunkLimits, DirtySet, Plan, RepoLocation, Worktree, find_root, open_policy, project_key,
+    repo_of,
+};

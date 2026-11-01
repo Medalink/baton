@@ -79,6 +79,11 @@ pub struct Handle {
     pub project: ProjectKey,
     pub tx: Sender<Cmd>,
     pub status: Arc<std::sync::Mutex<Snapshot>>,
+    /// The key of the enrolled repository that brought this worktree in. None for a worktree enrolled by
+    /// itself, which is never reaped or evicted.
+    pub via: Option<String>,
+    /// When a turn was last sent to it; the least recently used repository worktree is unwatched at the cap.
+    pub used: Instant,
 }
 
 /// What `status` shows, updated by the task after each sync.
@@ -150,6 +155,8 @@ pub fn spawn(
         project: ready.project.clone(),
         tx,
         status,
+        via: None,
+        used: Instant::now(),
     };
     Ok((handle, ready))
 }
@@ -219,6 +226,13 @@ impl Task {
             match cmd {
                 Cmd::Event(first) => {
                     let batch = self.gather(first);
+                    if self.suggests_gone(&batch) && self.gone() {
+                        self.log.line(&format!(
+                            "{} is gone; the task ended and the watcher is closed",
+                            self.label
+                        ));
+                        return;
+                    }
                     self.ingest(batch);
                 }
                 Cmd::Turn(job) => {
@@ -255,6 +269,23 @@ impl Task {
             }
         }
         batch
+    }
+
+    /// Whether a batch holds an error or an event on the root or its `.git`, which is what deleting a
+    /// worktree reports. Everything else is a file change and is not worth a look at the disk.
+    fn suggests_gone(&self, batch: &[notify::Result<notify::Event>]) -> bool {
+        batch.iter().any(|event| match event {
+            Err(_) => true,
+            Ok(event) => event.paths.iter().any(|path| {
+                self.relative(path)
+                    .is_none_or(|rel| rel.eq_ignore_ascii_case(".git"))
+            }),
+        })
+    }
+
+    /// A removed worktree has no `.git`: `git worktree remove` takes it out with the rest.
+    fn gone(&self) -> bool {
+        !self.wt.root().join(".git").exists()
     }
 
     /// Waits until no tracked path has changed for `QUIET`, or `MAX_WAIT` has passed.
