@@ -998,7 +998,7 @@ else
   wire depth
   check "the server repo passes fsck --strict after the deep trees" gitd "$(wire_repo depth)" fsck --strict --no-dangling
   wire partial
-  wire frames
+  wire frames "$(wp "$WIRE_LOG")"
   wire want
   wire flood
   eq "no project directory exists for a key that was only named" "" "$(ls "$WIRE_DATA/projects" | grep -E '^wire\+(sub|adv|flood)-' || true)"

@@ -447,7 +447,7 @@ def case_quiet(c):
 
 
 def case_frames(c):
-    """Finding 11: max_frame, as the welcome announces it, is exact."""
+    """Finding 11: max_frame, as the welcome announces it, is exact. extra = [the server's log file]."""
     def padded(size):
         msg = {"t": "want", "xfer": 1, "project": "wire/frames", "ids": [], "pad": ""}
         msg["pad"] = "x" * (size - len(control(msg)))
@@ -461,13 +461,26 @@ def case_frames(c):
     reply = ws.control(timeout=10)
     check(f"a frame of exactly max_frame ({limit}) bytes is served", reply and reply.get("t") == "objects_sent", str(reply))
     ws.close()
+    def refusals():
+        text = open(c.extra[0], encoding="utf-8", errors="replace").read()
+        return sum(1 for line in text.splitlines() if "): protocol: " in line and "Message too long" in line)
+
+    before = refusals()
     for extra in (1, 64, 65):
         ws = c.session()
-        ws.send(padded(limit + extra))
+        try:
+            ws.send(padded(limit + extra))
+        except OSError:
+            # The server closes on the frame header, before the client has written the whole frame. Linux then
+            # resets the socket mid-send (EPIPE); Windows buffers the rest. The error frame was queued first.
+            pass
         reply = ws.control(timeout=10)
         check(f"a frame of max_frame + {extra} bytes ends the session with protocol",
               reply is not None and reply.get("code") == "protocol", str(reply))
         ws.close()
+    time.sleep(0.5)
+    check("the server logged each oversize frame as a protocol violation", refusals() - before == 3,
+          f"{refusals() - before} of 3")
 
 
 def case_want(c):
