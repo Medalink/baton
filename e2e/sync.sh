@@ -234,6 +234,7 @@ dlog() { echo "$TMP/home-$1/data/daemon.log"; }
 
 bt() { local n=$1; shift; BATON_HOME=$(home_of "$n") "$BIN" "$@"; } # baton as machine n, from here
 btr() { local n=$1; shift; (cd "$(repo_of "$n")" && BATON_HOME=$(home_of "$n") "$BIN" "$@" 2>&1); }
+btr_within() { local n=$1 secs=$2; shift 2; (cd "$(repo_of "$n")" && BATON_HOME=$(home_of "$n") timeout "$secs" "$BIN" "$@" 2>&1); } # a follow that does not refuse runs for ever
 turn_as() { # turn_as machine thread message [baton turn args...]
   local n=$1 t=$2 m=$3
   shift 3
@@ -630,11 +631,11 @@ section_end
 section "baton follow --into"
 mkdir -p "$TMP/plain"
 printf 'mine\n' >"$TMP/plain/keep.txt"
-out=$(btr b follow t1 --into "$TMPW/plain")
+out=$(btr_within b 20 follow t1 --into "$TMPW/plain")
 contains "follow refuses a directory that baton pull did not make" "$out" "is not a worktree \`baton pull\` made"
 eq "and writes nothing into it" "keep.txt" "$(ls "$TMP/plain")"
 HOOKS_BEFORE=$(ls -A "$(repo_of b)/.git/hooks" | sort)
-out=$(btr b follow t1 --into "$(wp "$(repo_of b)")/.git/hooks")
+out=$(btr_within b 20 follow t1 --into "$(wp "$(repo_of b)")/.git/hooks")
 contains "follow refuses a path under .git" "$out" "is not a worktree \`baton pull\` made"
 eq "and the hooks directory is unchanged" "$HOOKS_BEFORE" "$(ls -A "$(repo_of b)/.git/hooks" | sort)"
 cd "$(repo_of b)" || exit 2
