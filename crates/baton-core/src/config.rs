@@ -44,6 +44,12 @@ struct RawUserRedact {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawWatch {
+    max_repo_worktrees: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawServer {
     url: Option<String>,
     token: Option<String>,
@@ -74,6 +80,8 @@ struct RawUser {
     snapshot: RawSnapshot,
     #[serde(default)]
     redact: RawUserRedact,
+    #[serde(default)]
+    watch: RawWatch,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -120,13 +128,19 @@ impl From<RawSnapshot> for SnapshotConfig {
 
 /// `~/.config/baton/config.toml`. Only this file can name `value_files`: literal secrets differ per
 /// machine, so blob ids of a file containing one can differ between machines.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct UserConfig {
     pub machine: Option<MachineId>,
     pub server: Option<ServerConfig>,
     pub snapshot: SnapshotConfig,
     pub value_files: Vec<PathBuf>,
+    /// At most this many worktrees of enrolled repositories are watched at once.
+    pub max_repo_worktrees: usize,
 }
+
+/// Default for `[watch] max_repo_worktrees`. The design target is 30 active agents, so the cap sits well
+/// above that; each watched worktree costs one watcher handle (a kernel watch per directory on Linux).
+pub const DEFAULT_MAX_REPO_WORKTREES: usize = 64;
 
 /// `ws://host:port/path` or `wss://host:port/path`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -287,6 +301,18 @@ fn expand_home(raw: &str) -> PathBuf {
     }
 }
 
+impl Default for UserConfig {
+    fn default() -> Self {
+        Self {
+            machine: None,
+            server: None,
+            snapshot: SnapshotConfig::default(),
+            value_files: Vec::new(),
+            max_repo_worktrees: DEFAULT_MAX_REPO_WORKTREES,
+        }
+    }
+}
+
 impl UserConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let Some(text) = read_optional(path)? else {
@@ -312,6 +338,11 @@ impl UserConfig {
                 .iter()
                 .map(|p| expand_home(p))
                 .collect(),
+            max_repo_worktrees: raw
+                .watch
+                .max_repo_worktrees
+                .unwrap_or(DEFAULT_MAX_REPO_WORKTREES)
+                .max(1),
         })
     }
 }

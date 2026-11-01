@@ -268,9 +268,31 @@ pub fn find_root(path: &Path) -> Result<PathBuf> {
     let root = repo.workdir().ok_or_else(|| {
         Error::Refused(format!("{} is not inside a git worktree", path.display()))
     })?;
-    root.canonicalize()
+    real(root)
+}
+
+/// Where a path sits in git: the worktree it is in (none inside a bare repository) and the repository's
+/// common git dir, which every linked worktree of one repository shares.
+#[derive(Clone, Debug)]
+pub struct RepoLocation {
+    pub workdir: Option<PathBuf>,
+    pub common_dir: PathBuf,
+}
+
+/// Reads only. Both paths are real paths without the Windows verbatim prefix, so they compare equal to
+/// the spellings agents report.
+pub fn repo_of(path: &Path) -> Result<RepoLocation> {
+    let repo = gix::discover(path).map_err(Error::git)?;
+    Ok(RepoLocation {
+        workdir: repo.workdir().map(real).transpose()?,
+        common_dir: real(repo.common_dir())?,
+    })
+}
+
+fn real(path: &Path) -> Result<PathBuf> {
+    path.canonicalize()
         .map(|p| crate::paths::simplified(&p))
-        .ctx(|| format!("resolving {}", root.display()))
+        .ctx(|| format!("resolving {}", path.display()))
 }
 
 /// `https://Host/Owner/Repo.git`, `git@host:Owner/Repo` and `ssh://git@host:22/Owner/Repo` all become `host/owner/repo`.

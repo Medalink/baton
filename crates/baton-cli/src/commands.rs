@@ -153,6 +153,54 @@ pub fn unenroll(path: Option<&Path>) -> Result<()> {
     }
 }
 
+pub fn enroll_repo(path: Option<&Path>) -> Result<()> {
+    let path = absolute(path)?;
+    ensure_daemon()?;
+    match send(&Request::EnrollRepo {
+        path: path.to_string_lossy().into_owned(),
+    })? {
+        Reply::EnrolledRepo {
+            dir,
+            project,
+            already,
+            cap,
+        } => {
+            let verb = if already {
+                "already enrolled"
+            } else {
+                "enrolled"
+            };
+            println!(
+                "{verb} repository {dir} as {project}; each worktree is recorded from its first turn, up to {cap} watched at once"
+            );
+            Ok(())
+        }
+        other => bail!("unexpected reply: {other:?}"),
+    }
+}
+
+pub fn unenroll_repo(path: Option<&Path>) -> Result<()> {
+    let path = absolute(path)?;
+    ensure_daemon()?;
+    match send(&Request::UnenrollRepo {
+        path: path.to_string_lossy().into_owned(),
+    })? {
+        Reply::UnenrolledRepo {
+            dir,
+            was_enrolled,
+            stopped,
+        } => {
+            if was_enrolled {
+                println!("unenrolled repository {dir} ({stopped} worktrees stopped)");
+            } else {
+                println!("repository was not enrolled: {dir}");
+            }
+            Ok(())
+        }
+        other => bail!("unexpected reply: {other:?}"),
+    }
+}
+
 pub struct TurnOptions {
     pub thread: String,
     pub message: String,
@@ -193,6 +241,8 @@ pub fn status() -> Result<()> {
             pid,
             up_secs,
             worktrees,
+            repos,
+            cap,
         } => {
             println!(
                 "daemon pid {pid}, up {up_secs}s, {} enrolled",
@@ -200,11 +250,18 @@ pub fn status() -> Result<()> {
             );
             for w in worktrees {
                 println!(
-                    "{}  {}  {} files  tree {}",
+                    "{}  {}  {} files  tree {}{}",
                     w.root,
                     w.project,
                     w.files,
-                    w.tree.get(..8).unwrap_or("")
+                    w.tree.get(..8).unwrap_or(""),
+                    w.repo.map_or_else(String::new, |r| format!("  via {r}"))
+                );
+            }
+            for r in repos {
+                println!(
+                    "repository {}  {} of at most {cap} worktrees watched",
+                    r.dir, r.active
                 );
             }
             Ok(())

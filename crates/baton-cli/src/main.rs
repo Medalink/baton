@@ -29,10 +29,20 @@ enum Command {
     Hook { agent: Option<String> },
     /// Run the per-user daemon. Other commands start it when it is absent.
     Daemon,
-    /// Start recording a worktree.
-    Enroll { path: Option<PathBuf> },
-    /// Stop recording a worktree. Its history stays.
-    Unenroll { path: Option<PathBuf> },
+    /// Start recording a worktree, or with --repo every worktree of a repository, from its first turn.
+    Enroll {
+        path: Option<PathBuf>,
+        /// Enroll the repository the path is in, so any of its worktrees, existing or created later, is
+        /// recorded from its first turn.
+        #[arg(long)]
+        repo: bool,
+    },
+    /// Stop recording a worktree, or with --repo a repository. Its history stays.
+    Unenroll {
+        path: Option<PathBuf>,
+        #[arg(long)]
+        repo: bool,
+    },
     /// Record a turn now.
     Turn {
         #[arg(long)]
@@ -169,8 +179,10 @@ fn main() {
     let result = match cli.command {
         Command::Hook { .. } => Ok(()),
         Command::Daemon => daemon::run(),
-        Command::Enroll { path } => commands::enroll(path.as_deref()),
-        Command::Unenroll { path } => commands::unenroll(path.as_deref()),
+        Command::Enroll { path, repo: false } => commands::enroll(path.as_deref()),
+        Command::Enroll { path, repo: true } => commands::enroll_repo(path.as_deref()),
+        Command::Unenroll { path, repo: false } => commands::unenroll(path.as_deref()),
+        Command::Unenroll { path, repo: true } => commands::unenroll_repo(path.as_deref()),
         Command::Turn {
             thread,
             message,

@@ -769,6 +769,225 @@ else
 fi
 section_end
 
+section "L. enrolling a repository covers its worktrees, made before or after"
+dir_digest() { (cd "$1" && find . -type f | sort | xargs sha256sum | sha256sum | cut -d' ' -f1); }
+admin_dir() { git -C "$1" rev-parse --absolute-git-dir; }
+base_of() { sgit show -s --format=%B "refs/baton/$1" | sed -n 's/^Baton-Base: //p'; }
+turn_lands() { # turn_lands name cwd session : the hook's turn moves refs/baton/<session>
+  local old
+  old=$(ref_sha "$SIDE/refs/baton/$3")
+  payload "$TMP/payload-$1.json" "$2" "$3"
+  "$BIN" hook claude <"$TMP/payload-$1.json"
+  wait_ref_change "$SIDE/refs/baton/$3" "$old" 15000
+}
+log_has() { grep -qF -- "$1" "$BATON_HOME/data/daemon.log"; }
+wait_log() { # wait_log text timeout_ms
+  local deadline=$(($(now_us) + $2 * 1000))
+  while ! log_has "$1"; do
+    (($(now_us) > deadline)) && return 1
+    sleep 0.1
+  done
+}
+
+L="$TMP/repol"
+mkmin "$L" repol
+SIDE=$(side_of repol)
+LOG_FROM=$(($(wc -l <"$BATON_HOME/data/daemon.log") + 1))
+git -C "$L" worktree add -q -b early "$TMP/wt-early"
+printf 'e
+' >"$TMP/wt-early/base-e.txt"
+git -C "$TMP/wt-early" add -A >/dev/null 2>&1
+git -C "$TMP/wt-early" commit -q -m "branch early"
+
+out=$(cd "$L" && "$BIN" enroll --repo 2>&1)
+contains "enroll --repo says what it enrolled" "$out" "enrolled repository"
+contains "and that each worktree is recorded from its first turn" "$out" "first turn"
+out=$("$BIN" enroll --repo "$(wp "$TMP/wt-early")" 2>&1)
+contains "enrolling again, from a linked worktree, finds the same repository" "$out" "already enrolled repository"
+check "no worktree was enrolled or watched by that" test ! -e "$SIDE/refs/baton"
+
+git -C "$L" worktree add -q -b b1 "$TMP/wt1"
+git -C "$L" worktree add -q -b b2 "$TMP/wt2"
+for w in 1 2; do
+  printf 'w%s\n' "$w" >"$TMP/wt$w/base$w.txt"
+  git -C "$TMP/wt$w" add -A >/dev/null 2>&1
+  git -C "$TMP/wt$w" commit -q -m "branch $w"
+done
+HEAD_MAIN=$(git -C "$L" rev-parse HEAD)
+HEAD_1=$(git -C "$TMP/wt1" rev-parse HEAD)
+HEAD_2=$(git -C "$TMP/wt2" rev-parse HEAD)
+HEAD_E=$(git -C "$TMP/wt-early" rev-parse HEAD)
+check "the three heads differ" test "$HEAD_MAIN" != "$HEAD_1" -a "$HEAD_1" != "$HEAD_2" -a "$HEAD_MAIN" != "$HEAD_E"
+D_MAIN=$(dir_digest "$L/.git")
+D_E=$(dir_digest "$(admin_dir "$TMP/wt-early")")
+D_1=$(dir_digest "$(admin_dir "$TMP/wt1")")
+D_2=$(dir_digest "$(admin_dir "$TMP/wt2")")
+
+printf 'main\n' >"$L/m.txt"
+if turn_lands main "$L" lm; then ok "a hook from the main worktree is recorded"; else bad "main worktree hook dropped"; fi
+contains "its tree holds the main worktree's file" "$(tree_of lm)" "m.txt"
+eq "its Baton-Base is the main worktree's HEAD" "$HEAD_MAIN" "$(base_of lm)"
+
+printf 'one\n' >"$TMP/wt1/one.txt"
+if turn_lands w1 "$TMP/wt1" l1; then ok "a hook from a worktree made after enrollment is recorded"; else bad "wt1 hook dropped"; fi
+printf 'two\n' >"$TMP/wt2/two.txt"
+mkdir -p "$TMP/wt2/sub"
+if turn_lands w2 "$TMP/wt2/sub" l2; then ok "a hook from a subdirectory of a second new worktree is recorded"; else bad "wt2 hook dropped"; fi
+printf 'early\n' >"$TMP/wt-early/early.txt"
+if turn_lands e "$TMP/wt-early" le; then ok "a hook from a worktree that existed before enrollment is recorded"; else bad "wt-early hook dropped"; fi
+
+t1=$(tree_of l1)
+t2=$(tree_of l2)
+te=$(tree_of le)
+contains "wt1's turn holds its own new file" "$t1" "one.txt"
+contains "and its branch's file" "$t1" "base1.txt"
+lacks "and not wt2's file" "$t1" "two.txt"
+lacks "and not the main worktree's file" "$t1" "m.txt"
+contains "wt2's turn holds its own new file" "$t2" "two.txt"
+lacks "and not wt1's file" "$t2" "one.txt"
+lacks "nor wt1's branch file" "$t2" "base1.txt"
+contains "the early worktree's turn holds its file" "$te" "early.txt"
+lacks "and none of the others" "$te" "one.txt"
+eq "wt1's Baton-Base is its own HEAD" "$HEAD_1" "$(base_of l1)"
+eq "wt2's Baton-Base is its own HEAD" "$HEAD_2" "$(base_of l2)"
+eq "the early worktree's Baton-Base is its own HEAD" "$HEAD_E" "$(base_of le)"
+
+printf 'one again\n' >"$TMP/wt1/one.txt"
+if turn_lands w1b "$TMP/wt1" l1; then ok "a second turn in the same worktree is recorded"; else bad "second wt1 turn dropped"; fi
+eq "it chains to the first (turn 2)" "2" "$(sgit show -s --format=%B refs/baton/l1 | sed -n 's/^Baton-Turn: //p')"
+eq "and holds the new content" "one again" "$(blob_of l1 one.txt)"
+
+out=$("$BIN" status 2>&1)
+contains "status lists the enrolled repository" "$out" "repository "
+contains "and its watched worktree wt1" "$out" "wt1"
+contains "and wt2" "$out" "wt2"
+contains "and says it came in through the repository" "$out" "via "
+
+eq "the main .git is byte-identical after the turns" "$D_MAIN" "$(dir_digest "$L/.git")"
+eq "the early worktree's admin dir is byte-identical" "$D_E" "$(dir_digest "$(admin_dir "$TMP/wt-early")")"
+eq "wt1's admin dir is byte-identical" "$D_1" "$(dir_digest "$(admin_dir "$TMP/wt1")")"
+eq "wt2's admin dir is byte-identical" "$D_2" "$(dir_digest "$(admin_dir "$TMP/wt2")")"
+
+O="$TMP/repoo"
+mkmin "$O" repoo
+git -C "$O" worktree add -q -b ob "$TMP/wt-other"
+printf 'x\n' >"$O/x.txt"
+printf 'y\n' >"$TMP/wt-other/y.txt"
+SIDE_O=$(side_of repoo)
+D_O=$(dir_digest "$O/.git")
+payload "$TMP/payload-o1.json" "$O" other1
+payload "$TMP/payload-o2.json" "$TMP/wt-other" other2
+"$BIN" hook claude <"$TMP/payload-o1.json"
+"$BIN" hook claude <"$TMP/payload-o2.json"
+wait_log "wt-other" 5000 >/dev/null
+check "a hook from a repository that is not enrolled is ignored" test ! -e "$SIDE_O/refs/baton/other1"
+check "and so is one from its linked worktree" test ! -e "$SIDE_O/refs/baton/other2"
+check "no side repo was made for it" test ! -d "$SIDE_O"
+contains "the daemon logs the main one as not enrolled" "$(cat "$BATON_HOME/data/daemon.log")" "not an enrolled worktree"
+eq "and its .git is untouched" "$D_O" "$(dir_digest "$O/.git")"
+
+W3="$TMP/wt3"
+git -C "$L" worktree add -q -b b3 "$W3"
+printf 'three\n' >"$W3/three.txt"
+out=$(turn_in "$W3" l3 "from a new worktree")
+contains "baton turn in a new worktree of the enrolled repository enrolls it" "$out" "l3@1"
+contains "and stores the file" "$(tree_of l3)" "three.txt"
+
+W4="$TMP/wt4"
+git -C "$L" worktree add -q -b b4 "$W4"
+printf 'par
+' >"$W4/par.txt"
+payload "$TMP/payload-p1.json" "$W4" par1
+payload "$TMP/payload-p2.json" "$W4" par2
+"$BIN" hook claude <"$TMP/payload-p1.json" &
+hook1=$!
+"$BIN" hook claude <"$TMP/payload-p2.json" &
+hook2=$!
+wait "$hook1" "$hook2"
+if wait_ref_change "$SIDE/refs/baton/par1" "" 15000 && wait_ref_change "$SIDE/refs/baton/par2" "" 15000; then ok "two hooks racing for one new worktree are both recorded"; else bad "one of two racing first hooks was dropped"; fi
+contains "and both hold its file" "$(tree_of par1)$(tree_of par2)" "par.txt"
+
+git -C "$L" worktree add -q -b b5 "$L/.wt-nested"
+printf 'inner
+' >"$L/.wt-nested/inner.txt"
+if turn_lands n1 "$L/.wt-nested" lnest; then ok "a linked worktree inside the enrolled checkout is its own worktree"; else bad "nested linked worktree hook dropped"; fi
+contains "its turn holds its own file" "$(tree_of lnest)" "inner.txt"
+lacks "and not the main worktree's untracked file" "$(tree_of lnest)" "m.txt"
+
+n_state=$(ls "$BATON_HOME/data/worktrees" | wc -l | tr -d ' ')
+w2_dir=$(admin_dir "$TMP/wt2")
+git -C "$L" worktree remove --force "$TMP/wt2"
+rm_rc=$?
+eq "git worktree remove succeeds with a watcher on the worktree" 0 "$rm_rc"
+check "and the directory is gone at once" test ! -e "$TMP/wt2"
+check "and its admin dir with it" test ! -e "$w2_dir"
+D_MAIN=$(dir_digest "$L/.git")
+if wait_log "wt2 is gone" 10000; then ok "the daemon logs that wt2 is gone"; else bad "no log line for the removed wt2"; fi
+wait_status_lacks() {
+  local deadline=$(($(now_us) + 10000000))
+  while "$BIN" status 2>&1 | grep -qF "wt2"; do
+    (($(now_us) > deadline)) && return 1
+    sleep 0.2
+  done
+}
+if wait_status_lacks; then ok "status no longer lists wt2"; else bad "wt2 is still in status"; fi
+printf 'one more\n' >"$TMP/wt1/one.txt"
+if turn_lands w1c "$TMP/wt1" l1; then ok "the daemon still records turns after a worktree was removed"; else bad "turn after removal dropped"; fi
+printf 'four\n' >"$TMP/wt-early/four.txt"
+if turn_lands e2 "$TMP/wt-early" le; then ok "and in the other worktrees"; else bad "turn in wt-early after removal dropped"; fi
+payload "$TMP/payload-gone.json" "$TMP/wt2" l2
+"$BIN" hook claude <"$TMP/payload-gone.json"
+sleep 0.3
+eq "a late hook from the removed directory records nothing" "1" "$(sgit show -s --format=%B refs/baton/l2 | sed -n 's/^Baton-Turn: //p')"
+since=$(tail -n +"$LOG_FROM" "$BATON_HOME/data/daemon.log")
+eq "no turn failed and the log holds no panic" 0 "$(grep -cE 'turn failed|panicked' <<<"$since")"
+echo "  daemon log lines about the removed worktree:"
+grep -F "wt2" <<<"$since" | grep -v ' turn ' | sed 's/^/    /' | tail -5
+eq "the main .git is still byte-identical after the removal and later turns" "$D_MAIN" "$(dir_digest "$L/.git")"
+deadline=$(($(now_us) + 10000000))
+while [[ $(ls "$BATON_HOME/data/worktrees" | wc -l | tr -d ' ') -ge $n_state ]] && (($(now_us) < deadline)); do sleep 0.2; done
+eq "the removed worktree's mirror file is deleted" "$((n_state - 1))" "$(ls "$BATON_HOME/data/worktrees" | wc -l | tr -d ' ')"
+
+# The cap: two watched worktrees at most. The daemon reads it at start.
+pid=$(daemon_pid)
+kill_pid "$pid"
+sleep 0.5
+user_config '[watch]' 'max_repo_worktrees = 2'
+status_out=$("$BIN" status 2>&1)
+contains "a restarted daemon still has the repository enrolled" "$status_out" "repository "
+contains "and reports the cap" "$status_out" "at most 2"
+printf 'a\n' >"$TMP/wt-early/a.txt"
+turn_lands c1 "$TMP/wt-early" le >/dev/null
+turn_lands c2 "$TMP/wt1" l1 >/dev/null
+turn_lands c3 "$L" lm >/dev/null
+lacks "the main worktree's turn does not hold the linked worktree inside it" "$(tree_of lm)" "inner.txt"
+if wait_log "wt-early unwatched" 5000; then ok "at the cap the least recently used worktree is unwatched"; else bad "nothing was unwatched at the cap"; fi
+printf 'written while unwatched\n' >"$TMP/wt-early/late.txt"
+if turn_lands c4 "$TMP/wt-early" le; then ok "a turn in the unwatched worktree is recorded"; else bad "turn in the unwatched worktree dropped"; fi
+eq "and holds the file written while it was unwatched" "written while unwatched" "$(blob_of le late.txt)"
+watched=$("$BIN" status 2>&1 | grep -c ' via ')
+check "never more than the cap are watched" test "$watched" -le 2
+user_config
+
+# Enrolling a worktree by itself makes it permanent.
+out=$("$BIN" enroll "$(wp "$L")" 2>&1)
+contains "enrolling a worktree that came in through the repository keeps it" "$out" "enrolled"
+out=$(cd "$L" && "$BIN" unenroll --repo 2>&1)
+contains "unenroll --repo says what it stopped" "$out" "unenrolled repository"
+status_out=$("$BIN" status 2>&1)
+lacks "status no longer lists the repository" "$status_out" "repository "
+printf 'after\n' >"$TMP/wt1/after.txt"
+payload "$TMP/payload-after.json" "$TMP/wt1" l1after
+"$BIN" hook claude <"$TMP/payload-after.json"
+sleep 0.5
+check "a hook from a worktree of the unenrolled repository is ignored" test ! -e "$SIDE/refs/baton/l1after"
+printf 'main after\n' >"$L/m2.txt"
+if turn_lands m2 "$L" lm; then ok "the worktree that was enrolled by itself is still recorded"; else bad "explicitly enrolled worktree stopped"; fi
+out=$("$BIN" unenroll --repo "$L" 2>&1)
+contains "unenrolling again says it was not enrolled" "$out" "was not enrolled"
+"$BIN" unenroll "$(wp "$L")" >/dev/null 2>&1
+section_end
+
 SIDE=$(side_of widgets)
 
 section "the user's repo is untouched"

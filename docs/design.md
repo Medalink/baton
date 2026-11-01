@@ -18,8 +18,10 @@ baton hook claude                 # agent end-of-turn hook; raw payload on stdin
 baton turn --thread T --message M [--agent A] [--model X] [--check name=code]...
 baton daemon                      # per-user process; other commands start it when absent
 baton enroll [path]               # start watching a worktree
+baton enroll --repo [path]        # enroll the repository; any of its worktrees is recorded from its first turn
 baton unenroll [path]             # stop watching; its history stays
-baton status
+baton unenroll --repo [path]
+baton status                      # worktrees, enrolled repositories and their watched worktrees
 baton log [thread] [--verdicts]
 baton verdict <turn> [--thread T] [--json]   # the verdict stored for a turn
 baton rewind <turn> [--thread T] [--apply]
@@ -103,7 +105,7 @@ One daemon per user. Single owners, no shared locks:
 
 Turn path: the hook writes one frame to the local pipe and exits. The daemon's IPC task parses it through the agent adapter into a `TurnRequest`, routes it to the worktree task, which drains its dirty set and calls `snapshot_from_dirty` on the project writer. The writer writes blobs, edits the previous tree with gix's tree editor, writes the commit, moves `refs/baton/<thread>` by compare-and-swap, and hands the new objects to the link.
 
-Worktree discovery of what changed is a file watcher feeding a dirty set, with a full rescan on start, on overflow or any watcher error, and when the store policy changes (see Decisions). The dirty set holds up to 50,000 paths. Past that it stops tracking them and the next turn does a full rescan, which is bounded by the worktree and never overflows again, so a 50,100-file checkout is captured, not retried forever. Only enrolled worktrees are watched, so enrollment is the allowlist.
+Worktree discovery of what changed is a file watcher feeding a dirty set, with a full rescan on start, on overflow or any watcher error, and when the store policy changes (see Decisions). The dirty set holds up to 50,000 paths. Past that it stops tracking them and the next turn does a full rescan, which is bounded by the worktree and never overflows again, so a 50,100-file checkout is captured, not retried forever. Only enrolled worktrees are watched, so enrollment is the allowlist; a repository is the allowlist for every worktree it has (see Enrolling a repository).
 
 The walk and today's policy decide what is in the tree; the stat cache only saves reading a file again. A cached path that the policy now ignores or excludes leaves the tree at the next turn, and a nested `.gitignore` that appears in a later batch applies to files that came before it. Every event path is put to the policy again, with no memory of an earlier "ignored" answer for a directory, so a file that git starts tracking inside an ignored directory, or a directory a config edit stops excluding, is not dropped on the strength of a stale verdict. Events that arrive within 2 ms of each other (at most 25 ms) are classified as one batch, which sets up the ignore rules once: a 30,000-file write into an ignored directory costs the daemon 1.6 to 1.9 s of CPU against 1.5 to 1.65 s with the cache. The cache is trusted only while its policy fingerprint matches: a hash of the built-in rules, the merged settings, and the contents of `.baton/config.toml`, the user config, every value file, `.git/info/exclude`, `.git/config`, the root `.gitignore`, the global excludes file, and every git config file that could name it: the installation, system, XDG and `~/.gitconfig` files (whether or not they exist yet) and any file they include. A change reopens the policy, so a `core.excludesFile` added to the global gitconfig, or edited in the file it names, applies at the next turn without a daemon restart. The fingerprint is read at every turn, because the value files and the user's ignore files sit outside the worktree and no watcher sees them. A change marks every cached file racy and rescans, so a new redaction rule rewrites the stored tip the same turn it is added. Blobs in earlier turns keep their old bytes, as history does.
 
@@ -111,7 +113,23 @@ A path is stored under the spelling the file system lists, and what makes two pa
 
 Routing: the payload's `cwd` is resolved to its real path before it is matched against enrolled worktrees, so a hook that reports a junction or a symlink reaches the worktree it points into. A `cwd` inside a git repo that is nested in an enrolled worktree, but not itself enrolled, is not the project's: the turn is dropped with a log line naming the nested repo, and the worktree is untouched. `baton turn` from there fails with the same reason and says to run `baton enroll`.
 
-Local IPC: a named pipe `\\.\pipe\baton-<user>` on Windows, a unix socket `$XDG_RUNTIME_DIR/baton/daemon.sock` (else `<tmp>/baton-<uid>/daemon.sock`) with mode 0600 in a 0700 directory elsewhere. The hook computes the name without reading config. When `BATON_HOME` is set, data, config, and the endpoint all live under it, which is how the e2e run stays hermetic. The same endpoint carries two frame types: `BTN1` hook frames, which get no reply, and `BTC1` control frames (a JSON request, a `u32` LE length and JSON reply) used by `enroll`, `unenroll`, `turn`, and `status`. One endpoint keeps single-instance and permissions in one place.
+Local IPC: a named pipe `\\.\pipe\baton-<user>` on Windows, a unix socket `$XDG_RUNTIME_DIR/baton/daemon.sock` (else `<tmp>/baton-<uid>/daemon.sock`) with mode 0600 in a 0700 directory elsewhere. The hook computes the name without reading config. When `BATON_HOME` is set, data, config, and the endpoint all live under it, which is how the e2e run stays hermetic. The same endpoint carries two frame types: `BTN1` hook frames, which get no reply, and `BTC1` control frames (a JSON request, a `u32` LE length and JSON reply) used by `enroll`, `enroll --repo`, `unenroll`, `unenroll --repo`, `turn`, and `status`. One endpoint keeps single-instance and permissions in one place.
+
+### Enrolling a repository
+
+Agent tools create a fresh linked worktree per task (`git worktree add`), so enrolling worktrees one by one captures almost nothing. `baton enroll --repo [path]` enrolls the repository the path is in, by its **common git dir** (`gix`'s `common_dir()`, the `.git` of the main worktree or the bare repo that all linked worktrees share), made real and with the Windows verbatim prefix removed. The dir is stored in `enrolled.json` under `repos`, beside the `roots` of worktrees enrolled by themselves. Enrollment is refused when the repository names no project (`ProjectKey`), as for a worktree. It reads the repository and nothing else: no baseline runs and no worktree is touched.
+
+A hook (or `baton turn`) whose cwd no enrolled worktree owns is put to the repository check before it is ignored: `gix::discover(cwd)` gives the worktree root and the common git dir, and a common dir in the enrolled set enrolls that worktree on the spot. The baseline runs first, then the turn, exactly as for `baton enroll` followed by a hook. The check runs for a nested-repo miss too, so a linked worktree that sits inside an enrolled checkout (such as `.claude/worktrees/<id>`) is its own worktree and not a nested repo. A cwd in a repository that is not enrolled is ignored as before, whether it is the main worktree or a linked one, and the check only reads.
+
+Two hooks for one new worktree both land: the second waits for the first's enrollment (a condition variable on the registry, not an error) and then sends its turn. A turn is queued under the registry lock, and so is the `Stop` of an eviction, so a turn is never queued behind a stop and lost.
+
+Worktrees that came in through a repository are not written to `enrolled.json`. After a daemon restart only the repository list returns, and each worktree comes back with its next turn from its saved mirror, which already rescans at start. `baton enroll <worktree>` on one of them makes it permanent (it moves to `roots`), and `baton unenroll --repo` stops the ones the repository brought in and leaves those. `baton unenroll <worktree>` on one brought in by a repository stops it until its next turn, since the repository is still enrolled; `unenroll --repo` is what ends that.
+
+**Bounded watch set.** At most `[watch] max_repo_worktrees` (default 64, read when the daemon starts) worktrees brought in by repositories are watched at once, since each costs a watcher handle (a kernel watch per directory on Linux). The default is twice the 30 active agents of the latency target, so the cap does not thrash in the case the design is sized for. When a new one would pass the cap, the least recently used (by the last turn sent to it) is unwatched: its task stops and its mirror file stays. Its next turn enrolls it again, from the mirror, with a full rescan, so what changed while it was unwatched is in that turn. A worktree enrolled by itself is never counted or evicted.
+
+**Worktrees that disappear.** Agent tools delete their worktrees. A repository worktree is dropped when its root has no `.git` (`git worktree remove` takes it out with the rest). Its task ends by itself when its watcher reports an error or an event on the root or its `.git` and the check says it is gone, which closes the watcher handle promptly. `e2e/local.sh` removes a watched worktree with `git worktree remove --force` and checks that git succeeds and the directory is gone at once. A reaper thread runs the same check every 2 s as a backstop, removes the worktree from the registry, deletes its mirror file and logs `<root> is gone; no longer watched`. Nothing is an error: a turn that arrives later from the same path is an ordinary first turn. A worktree enrolled by itself is kept when its directory vanishes, since an unmounted drive looks the same, and that is the person's call.
+
+`baton status` prints its first line as before, then one line per watched worktree (with `via <repo>` for one a repository brought in), then one `repository <dir>  <n> of at most <cap> worktrees watched` line per enrolled repository.
 
 ## Hook contract
 
@@ -253,7 +271,7 @@ The daemon is a detached process with no console. A plug-in child started with t
 
 ## Verification
 
-`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, real runs of the binaries, measurement tools under `tools/`, and end-to-end scenarios under `e2e/` that drive the real binaries: `e2e/local.sh` for capture and `e2e/sync.sh` for the server, the daemon link, `pull`, `follow` and the latency measurement. No unit tests and no CI workflows.
+`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, real runs of the binaries, measurement tools under `tools/`, and end-to-end scenarios under `e2e/` that drive the real binaries: `e2e/local.sh` for capture (including enrolling a repository, linked worktrees created afterwards, a removed worktree, the watch cap, and the user's `.git` and every worktree's admin dir staying byte-identical) and `e2e/sync.sh` for the server, the daemon link, `pull`, `follow` and the latency measurement. No unit tests and no CI workflows.
 
 `e2e/sync.sh` starts real `baton serve` and `baton daemon` processes under a temp dir, each machine with its own `BATON_HOME` and its own clone, on loopback ports from `BATON_E2E_PORT` (default 47880). It never reads or writes the user's real baton dirs, and a final scenario checks that they are untouched.
 
@@ -343,3 +361,11 @@ A burst of 30 threads, one turn each at 100 ms spacing, takes a median 11.6 ms a
 - `[lens]` may name a command as well as a file, with `baton.lens.v1` in and `{"lens": text}` out.
 - `files_truncated` was added to `baton.turn.v1`, `lines` in verdict evidence is optional, and a command adapter may print `null` for a payload that is not the end of a turn.
 - Plug-in children are started detached on Windows (see Plug-ins, Windows).
+
+### Differences from the sections above, enrollment slice
+
+- A repository can be enrolled (`enroll --repo`), so the allowlist is no longer only a list of worktrees. Its worktrees are enrolled by their first turn, are not persisted, and are bounded and reaped as described in Enrolling a repository.
+- The user config gained `[watch] max_repo_worktrees` (default 64). Only the user config may set it, and the daemon reads it at start.
+- `find_root` and the new `repo_of` in `baton-core` are the only code that asks git where a path sits. `repo_of` returns the worktree root and the common git dir, both real paths. Neither writes.
+- A second caller for a worktree that is being enrolled now waits for the first. It used to get "is already being enrolled", which would have dropped the second hook's turn.
+- `baton turn` and a hook route through one delivery function. It resolves the worktree, enrolls it through its repository when needed, and queues the turn under the registry lock.
