@@ -5,8 +5,8 @@ use crate::control::{Reply, Request, TurnArgs};
 use crate::{endpoint, timefmt};
 use anyhow::{Context, Result, anyhow, bail};
 use baton_core::{
-    ChangeKind, Dirs, RepoConfig, RewindAction, SideRepo, ThreadId, TurnRecord, Worktree,
-    find_root, plan_rewind, project_key,
+    Answer, Ask, ChangeKind, Decision, Dirs, Plugins, RepoConfig, RewindAction, SideRepo, ThreadId,
+    TurnRecord, TurnVerdict, Worktree, find_root, plan_rewind, project_key, run_command,
 };
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -266,7 +266,7 @@ pub fn describe(side: &SideRepo, turn: &TurnRecord) -> Result<()> {
     Ok(())
 }
 
-pub fn log(thread: Option<&str>) -> Result<()> {
+pub fn log(thread: Option<&str>, verdicts: bool) -> Result<()> {
     let here = open_here()?;
     let mut turns = Vec::new();
     match thread {
@@ -286,9 +286,124 @@ pub fn log(thread: Option<&str>) -> Result<()> {
         println!("no turns recorded for this project");
     }
     for turn in &turns {
-        describe(&here.side, turn)?;
+        if verdicts {
+            let verdict = here.side.verdict(turn.id).map_err(|e| anyhow!("{e}"))?;
+            println!("{}", verdict_line(turn, verdict.as_ref()));
+        } else {
+            describe(&here.side, turn)?;
+        }
     }
     Ok(())
+}
+
+/// `thread@seq  id  class  kinds  subject`; the class is `-` for a turn with no verdict.
+fn verdict_line(turn: &TurnRecord, verdict: Option<&TurnVerdict>) -> String {
+    let d = &turn.turn.draft;
+    let (class, kinds) = match verdict {
+        Some(v) => {
+            let mut kinds: Vec<&str> = v.findings.iter().map(|f| f.kind.as_str()).collect();
+            kinds.dedup();
+            (v.class.as_str(), kinds.join(","))
+        }
+        None => ("-", String::new()),
+    };
+    format!(
+        "{}@{}  {}  {class:<5}  {kinds}  {}",
+        d.thread,
+        turn.turn.seq,
+        turn.id.short(),
+        d.subject.as_str()
+    )
+}
+
+pub fn verdict(selector: &str, thread: Option<&str>, json: bool) -> Result<()> {
+    let here = open_here()?;
+    let default_thread = thread
+        .map(ThreadId::parse)
+        .transpose()
+        .map_err(|e| anyhow!("{e}"))?;
+    let turn = here
+        .side
+        .resolve_turn(selector, default_thread.as_ref())
+        .map_err(|e| anyhow!("{e}"))?;
+    let Some(verdict) = here.side.verdict(turn.id).map_err(|e| anyhow!("{e}"))? else {
+        bail!(
+            "no verdict for {} (classification is off, still running, or failed; the daemon log says which)",
+            turn.id.short()
+        );
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&verdict)?);
+        return Ok(());
+    }
+    println!("{}", verdict_line(&turn, Some(&verdict)));
+    for finding in &verdict.findings {
+        let place = finding
+            .evidence
+            .first()
+            .map_or(String::new(), |e| match e.lines {
+                Some([from, to]) if from == to => format!("{}:{from}", e.path),
+                Some([from, to]) => format!("{}:{from}-{to}", e.path),
+                None => e.path.clone(),
+            });
+        println!(
+            "    {}  {:.2}  {place}  {}",
+            finding.kind, finding.score, finding.note
+        );
+    }
+    Ok(())
+}
+
+/// `baton ask`. Returns the exit code: 0 when the decider chose, 2 when a human must answer.
+/// Every way the decider can fail is "ask a human", since the caller is an agent that must not guess.
+pub fn ask(question: &str, options: &[String], context: Option<&str>) -> Result<i32> {
+    if options.len() < 2 {
+        bail!("give at least two --option values to choose between");
+    }
+    let human = |why: &str| {
+        println!("ask a human");
+        eprintln!("baton: {why}");
+        Ok(2)
+    };
+    let dirs = Dirs::resolve().map_err(|e| anyhow!("{e}"))?;
+    let plugins = match Plugins::load(&dirs.user_config()) {
+        Ok(plugins) => plugins,
+        Err(e) => return human(&e.to_string()),
+    };
+    let Some(decider) = plugins.decide else {
+        return human("no [decide] command is configured");
+    };
+    let project = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| find_root(&cwd).ok())
+        .and_then(|root| {
+            let config = RepoConfig::load(&root).ok()?;
+            project_key(&root, &config).ok()
+        })
+        .map(|key| key.to_string());
+    let request = Ask::new(question, options, context, project.as_deref(), None);
+    let decision =
+        run_command::<_, Answer>(&decider, &request).and_then(|answer| answer.decide(options));
+    match decision {
+        Ok(Decision::Chose {
+            choice,
+            confidence,
+            reason,
+        }) => {
+            println!("choice: {choice}");
+            if let Some(confidence) = confidence {
+                println!("confidence: {confidence:.2}");
+            }
+            if !reason.is_empty() {
+                println!("reason: {reason}");
+            }
+            Ok(0)
+        }
+        Ok(Decision::AskHuman { reason }) => {
+            human(&format!("the decider asks for a human: {reason}"))
+        }
+        Err(e) => human(&format!("the decider failed: {e}")),
+    }
 }
 
 pub fn rewind(selector: &str, thread: Option<&str>, apply: bool) -> Result<()> {

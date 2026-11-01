@@ -100,6 +100,13 @@ struct Task {
     status: Arc<std::sync::Mutex<Snapshot>>,
 }
 
+/// What a worktree task talks to besides its own watcher.
+struct Services {
+    writer: Writer,
+    log: Arc<Log>,
+    plugins: Runner,
+}
+
 /// Starts the task and waits until its first sync is done, so an enroll answer means the baseline exists.
 pub fn spawn(
     root: PathBuf,
@@ -117,16 +124,12 @@ pub fn spawn(
     std::thread::Builder::new()
         .name("baton-worktree".into())
         .spawn(move || {
-            let started = start(
-                &thread_root,
-                &dirs,
+            let services = Services {
                 writer,
                 log,
                 plugins,
-                rx,
-                event_tx,
-                thread_status,
-            );
+            };
+            let started = start(&thread_root, &dirs, services, rx, event_tx, thread_status);
             match started {
                 Ok((mut task, watcher, ready)) => {
                     let _ = ready_tx.send(Ok(ready));
@@ -154,13 +157,16 @@ pub fn spawn(
 fn start(
     root: &Path,
     dirs: &Dirs,
-    writer: Writer,
-    log: Arc<Log>,
-    plugins: Runner,
+    services: Services,
     rx: Receiver<Cmd>,
     event_tx: Sender<Cmd>,
     status: Arc<std::sync::Mutex<Snapshot>>,
 ) -> Result<(Task, notify::RecommendedWatcher, Ready)> {
+    let Services {
+        writer,
+        log,
+        plugins,
+    } = services;
     let wt = Worktree::open(root, dirs, &|tree| writer.has_tree(tree))?;
     let mut task = Task {
         label: root.display().to_string(),

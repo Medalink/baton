@@ -48,7 +48,30 @@ enum Command {
         checks: Vec<String>,
     },
     /// Show recorded turns and the paths each one changed.
-    Log { thread: Option<String> },
+    Log {
+        thread: Option<String>,
+        /// One line per turn with its verdict class instead of its paths.
+        #[arg(long)]
+        verdicts: bool,
+    },
+    /// Show the verdict stored for a turn.
+    Verdict {
+        /// `thread@seq`, a number (with --thread), or at least 7 digits of a turn id.
+        turn: String,
+        #[arg(long)]
+        thread: Option<String>,
+        /// Print the stored `baton.verdict.v1` document.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ask the configured decider to choose. Exit 0 when it chose, 2 when a human must answer.
+    Ask {
+        question: String,
+        #[arg(long = "option", required = true)]
+        options: Vec<String>,
+        #[arg(long)]
+        context: Option<String>,
+    },
     /// Put a turn's files back on disk. Without --apply it only shows what would change.
     Rewind {
         /// `thread@seq`, a number (with --thread), or at least 7 digits of a turn id.
@@ -132,7 +155,14 @@ fn main() {
         hook::run(args.next().and_then(|a| a.into_string().ok()));
     }
 
-    let cli = Cli::parse();
+    // `ask` uses exit code 2 for "a human must answer", which is also clap's code for a usage error.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            let _ = e.print();
+            std::process::exit(if e.use_stderr() { 1 } else { 0 });
+        }
+    };
     let result = match cli.command {
         Command::Hook { .. } => Ok(()),
         Command::Daemon => daemon::run(),
@@ -151,7 +181,19 @@ fn main() {
             model,
             checks,
         }),
-        Command::Log { thread } => commands::log(thread.as_deref()),
+        Command::Log { thread, verdicts } => commands::log(thread.as_deref(), verdicts),
+        Command::Verdict { turn, thread, json } => {
+            commands::verdict(&turn, thread.as_deref(), json)
+        }
+        Command::Ask {
+            question,
+            options,
+            context,
+        } => commands::ask(&question, &options, context.as_deref()).map(|code| {
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }),
         Command::Rewind {
             turn,
             thread,
