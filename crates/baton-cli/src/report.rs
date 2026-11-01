@@ -88,6 +88,7 @@ pub fn report(args: ReportArgs) -> Result<()> {
         side_dir,
         repo,
         cache_dir: dirs.data().join("report-cache"),
+        dirs: dirs.clone(),
         window_secs: window,
         now: UnixMillis::now(),
     })

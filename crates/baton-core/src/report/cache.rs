@@ -12,8 +12,10 @@ use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-const HEADER: &[u8; 8] = b"BATONRP\x01";
+const HEADER: &[u8; 8] = b"BATONRP\x02";
 const MAGIC: u32 = 0xBA70_5EC0;
+/// A record's magic, length, kind byte and object id, which precede the payload the index points at.
+const RECORD_HEAD: usize = 8 + 21;
 
 /// What an entry describes. The same object id means different statistics under each.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -35,6 +37,8 @@ pub(super) struct Cache {
     /// Where the parsed records end, or 0 when the file must be written from scratch.
     valid_end: usize,
     rewrite: bool,
+    /// Two records had the same key, so the file holds bytes nothing reads.
+    duplicates: bool,
     fresh: Vec<u8>,
 }
 
@@ -49,6 +53,7 @@ impl Cache {
             index: HashMap::new(),
             valid_end: 0,
             rewrite: existed,
+            duplicates: false,
             fresh: Vec::new(),
         };
         if bytes.starts_with(HEADER) {
@@ -74,7 +79,9 @@ impl Cache {
             let Ok(id) = ObjectId::try_from(&bytes[start + 1..start + 21]) else {
                 break;
             };
-            self.index.insert((kind, id), (start + 21, end));
+            if self.index.insert((kind, id), (start + 21, end)).is_some() {
+                self.duplicates = true;
+            }
             pos = end;
         }
         self.valid_end = pos;
@@ -86,7 +93,12 @@ impl Cache {
         decode(&self.bytes[start..end])
     }
 
+    /// Stores a result for a key this run found missing. A result cut by the diff deadline is not stored:
+    /// it depends on how busy the machine was, and the key never changes.
     pub(super) fn put(&mut self, key: &Key, files: &[FileStat]) {
+        if files.iter().any(|f| f.cut) {
+            return;
+        }
         let payload = encode(key, files);
         self.fresh.extend_from_slice(&MAGIC.to_le_bytes());
         self.fresh.extend_from_slice(
@@ -97,29 +109,40 @@ impl Cache {
         self.fresh.extend_from_slice(&payload);
     }
 
-    /// Best effort: a cache that cannot be written only makes the next run slower.
-    pub(super) fn save(&self) {
-        if self.fresh.is_empty() && !self.rewrite {
+    /// Writes what this run computed and drops every stored entry `live` rejects. The file is appended to
+    /// when nothing is dropped and it holds no damage or duplicates; otherwise it is rewritten whole, from
+    /// the entries that stay. Best effort: a cache that cannot be written only makes the next run slower.
+    pub(super) fn save(&self, live: &dyn Fn(&Key) -> bool) {
+        let dropped = self.index.keys().any(|key| !live(key));
+        if self.fresh.is_empty() && !self.rewrite && !self.duplicates && !dropped {
             return;
         }
-        let _ = self.write();
+        let _ = self.write(live, dropped);
     }
 
-    fn write(&self) -> std::io::Result<()> {
+    fn write(&self, live: &dyn Fn(&Key) -> bool, dropped: bool) -> std::io::Result<()> {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        if self.valid_end >= HEADER.len() && !self.rewrite {
+        if self.valid_end >= HEADER.len() && !self.rewrite && !self.duplicates && !dropped {
             let mut file = std::fs::OpenOptions::new().append(true).open(&self.path)?;
             return file.write_all(&self.fresh);
         }
         let temp = self
             .path
             .with_extension(format!("tmp{}", std::process::id()));
+        let mut kept: Vec<&(usize, usize)> = self
+            .index
+            .iter()
+            .filter(|(key, _)| live(key))
+            .map(|(_, span)| span)
+            .collect();
+        kept.sort_unstable();
         let mut out = Vec::with_capacity(HEADER.len() + self.valid_end + self.fresh.len());
         out.extend_from_slice(HEADER);
-        if self.valid_end > HEADER.len() {
-            out.extend_from_slice(&self.bytes[HEADER.len()..self.valid_end]);
+        for &&(start, end) in &kept {
+            // The index points past the record's magic, length and key.
+            out.extend_from_slice(&self.bytes[start - RECORD_HEAD..end]);
         }
         out.extend_from_slice(&self.fresh);
         std::fs::write(&temp, out)?;
@@ -234,6 +257,7 @@ fn decode(payload: &[u8]) -> Option<Vec<FileStat>> {
             to,
             added,
             removed,
+            cut: false,
         });
     }
     Some(files)

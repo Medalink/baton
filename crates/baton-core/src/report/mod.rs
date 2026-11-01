@@ -12,7 +12,7 @@ mod types;
 
 use crate::error::Result;
 use crate::id::{ProjectKey, UnixMillis};
-use crate::paths::fnv1a;
+use crate::paths::{Dirs, fnv1a};
 use crate::store::{SideRepo, TurnRecord};
 use cache::{Cache, Kind};
 use gix::ObjectId;
@@ -42,6 +42,8 @@ pub struct ReportOptions {
     pub repo: Option<PathBuf>,
     /// Where the statistics cache lives; created when needed.
     pub cache_dir: PathBuf,
+    /// Baton's dirs: the user config feeds the store policy a first turn is compared through.
+    pub dirs: Dirs,
     /// The window, counted back from `now`.
     pub window_secs: i64,
     pub now: UnixMillis,
@@ -63,7 +65,12 @@ fn run_job(readers: &Readers, job: &Job) -> Outcome {
 }
 
 /// Runs every job, on several threads when there are many. Results come back in job order.
-fn run_jobs(side_dir: &Path, repo: Option<&Path>, jobs: &[(Key, Job)]) -> Vec<Outcome> {
+fn run_jobs(
+    side_dir: &Path,
+    repo: Option<&Path>,
+    dirs: &Dirs,
+    jobs: &[(Key, Job)],
+) -> Vec<Outcome> {
     let workers = std::thread::available_parallelism()
         .map_or(1, std::num::NonZero::get)
         .min(WORKERS_MAX);
@@ -75,7 +82,7 @@ fn run_jobs(side_dir: &Path, repo: Option<&Path>, jobs: &[(Key, Job)]) -> Vec<Ou
     let next = AtomicUsize::new(0);
     let done: Mutex<Vec<(usize, Outcome)>> = Mutex::new(Vec::with_capacity(jobs.len()));
     let work = || {
-        let readers = Readers::open(side_dir, repo);
+        let readers = Readers::open(side_dir, repo, dirs);
         let mut local = Vec::new();
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
@@ -143,54 +150,98 @@ struct Chain {
     name: String,
     /// The turns inside the window, oldest first.
     turns: Vec<TurnRecord>,
-    /// The tree of the turn before the first one, when the window cut the thread.
-    before: Option<ObjectId>,
+    /// Aligned with `turns`: the tree of each turn's parent turn, none for a thread's first turn.
+    parents: Vec<Option<ObjectId>>,
 }
 
-fn chains(side: &SideRepo, cutoff: i64, skipped: &mut Skipped) -> Result<Vec<Chain>> {
-    let mut out = Vec::new();
+/// Every thread's turns inside the window, and the cache keys still in use.
+struct Walk {
+    chains: Vec<Chain>,
+    live: HashSet<Key>,
+}
+
+fn salted(id: ObjectId, salt: &[u8]) -> ObjectId {
+    let bytes = [id.as_bytes(), salt].concat();
+    gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, &bytes).unwrap_or(id)
+}
+
+/// The key a turn's statistics are cached under. A first turn is measured against a commit of the user's
+/// repository through the store policy, so its key also names the policy: a changed `exclude` or
+/// redaction rule finds nothing cached.
+fn turn_key(id: ObjectId, first: bool, salt: &[u8]) -> Key {
+    (Kind::Turn, if first { salted(id, salt) } else { id })
+}
+
+fn tip_key(last: ObjectId, salt: &[u8]) -> Key {
+    (Kind::Tip, salted(last, salt))
+}
+
+/// Each thread is walked to its first turn and the window filters by time afterwards. Turns written on
+/// machines whose clocks disagree are out of time order along the parent links, so a turn older than the
+/// window says nothing about the turns before it. A turn whose parent cannot be read has no known basis and
+/// is left out.
+fn chains(side: &SideRepo, cutoff: i64, salt: &[u8], skipped: &mut Skipped) -> Result<Walk> {
+    let mut walk = Walk {
+        chains: Vec::new(),
+        live: HashSet::new(),
+    };
     for (thread, tip) in side.tips()? {
-        let mut turns = Vec::new();
+        walk.live.insert(tip_key(tip.oid(), salt));
+        let mut records = Vec::new();
         let mut next = Some(tip);
         while let Some(id) = next {
             let Ok(record) = side.read_turn(id) else {
                 skipped.unreadable += 1;
                 break;
             };
-            if record.at.secs() < cutoff {
-                break;
-            }
+            walk.live
+                .insert(turn_key(id.oid(), record.parent.is_none(), salt));
             next = record.parent;
-            turns.push(record);
+            records.push(record);
         }
-        let Some(first) = turns.last() else { continue };
-        let before = match first.parent {
-            Some(parent) => match side.read_turn(parent) {
-                Ok(record) => Some(record.tree.oid()),
-                Err(_) => {
-                    skipped.unreadable += 1;
-                    continue;
-                }
-            },
-            None => None,
-        };
+        let trees: Vec<ObjectId> = records.iter().map(|r| r.tree.oid()).collect();
+        let (mut turns, mut parents) = (Vec::new(), Vec::new());
+        for (i, record) in records.into_iter().enumerate() {
+            let parent = match record.parent {
+                None => None,
+                Some(_) => match trees.get(i + 1) {
+                    Some(&tree) => Some(tree),
+                    None => continue,
+                },
+            };
+            if record.at.secs() >= cutoff {
+                turns.push(record);
+                parents.push(parent);
+            }
+        }
+        if turns.is_empty() {
+            continue;
+        }
         turns.reverse();
-        out.push(Chain {
+        parents.reverse();
+        walk.chains.push(Chain {
             name: thread.to_string(),
             turns,
-            before,
+            parents,
         });
     }
-    Ok(out)
+    Ok(walk)
 }
 
 pub fn build_report(o: &ReportOptions) -> Result<Report> {
     let side = SideRepo::open_existing(&o.side_dir)?;
-    let probe = Readers::open(&o.side_dir, o.repo.as_deref())?;
+    let probe = Readers::open(&o.side_dir, o.repo.as_deref(), &o.dirs)?;
     let now = o.now.secs();
     let cutoff = now - o.window_secs;
     let mut skipped = Skipped::default();
-    let chains = chains(&side, cutoff, &mut skipped)?;
+    // What a first turn's statistics also depend on: the store policy of the user's worktree.
+    let policy_print = o
+        .repo
+        .as_deref()
+        .and_then(|root| crate::worktree::open_policy_fingerprinted(root, &o.dirs).ok())
+        .map(|(_, print)| print);
+    let salt = policy_print.clone().unwrap_or_default().into_bytes();
+    let Walk { chains, live } = chains(&side, cutoff, &salt, &mut skipped)?;
 
     let head = probe.user.as_ref().and_then(stats::head_commit);
     let head_info = match (&probe.user, head) {
@@ -204,22 +255,18 @@ pub fn build_report(o: &ReportOptions) -> Result<Report> {
     let mut tips: HashMap<usize, Key> = HashMap::new();
     for (ci, chain) in chains.iter().enumerate() {
         for (ui, turn) in chain.turns.iter().enumerate() {
-            let basis = match (turn.parent, ui) {
-                (None, _) => Basis::Base(turn.turn.draft.base.map(|b| b.oid())),
-                (Some(_), 0) => match chain.before {
-                    Some(before) => Basis::Parent(before),
-                    None => continue,
-                },
-                (Some(_), _) => Basis::Parent(chain.turns[ui - 1].tree.oid()),
+            let basis = match chain.parents[ui] {
+                None => Basis::Base(turn.turn.draft.base.map(|b| b.oid())),
+                Some(parent) => Basis::Parent(parent),
             };
             wanted.push((
-                (Kind::Turn, turn.id.oid()),
+                turn_key(turn.id.oid(), turn.parent.is_none(), &salt),
                 Job::Turn(turn.tree.oid(), basis),
             ));
         }
         let last = chain.turns.last().expect("a chain has a turn");
         if last.at.secs() < now - QUIET_SECS && last.parent.is_some() && head_info.is_some() {
-            let key = (Kind::Tip, last.id.oid());
+            let key = tip_key(last.id.oid(), &salt);
             wanted.push((
                 key,
                 Job::Turn(
@@ -254,7 +301,7 @@ pub fn build_report(o: &ReportOptions) -> Result<Report> {
             None => missing.push((key, job)),
         }
     }
-    let results = run_jobs(&o.side_dir, o.repo.as_deref(), &missing);
+    let results = run_jobs(&o.side_dir, o.repo.as_deref(), &o.dirs, &missing);
     let mut unknown_base: HashSet<Key> = HashSet::new();
     for ((key, job), result) in missing.iter().zip(results) {
         match result {
@@ -274,7 +321,14 @@ pub fn build_report(o: &ReportOptions) -> Result<Report> {
             }
         }
     }
-    cache.save();
+    // Drop what no ref reaches any more. With no policy to name the first-turn keys by, or no repository to
+    // ask about commits, nothing is dropped.
+    let known = policy_print.is_some();
+    let user = probe.user.as_ref();
+    cache.save(&|key: &Key| match key.0 {
+        Kind::Commit => user.is_none_or(|u| u.has_object(key.1)),
+        _ => !known || live.contains(key),
+    });
 
     let mut ship: ShipIndex = HashMap::new();
     for (id, time, merge) in commits {
@@ -300,7 +354,7 @@ pub fn build_report(o: &ReportOptions) -> Result<Report> {
         let mut without_base = false;
         let mut turns = Vec::with_capacity(chain.turns.len());
         for turn in &chain.turns {
-            let key = (Kind::Turn, turn.id.oid());
+            let key = turn_key(turn.id.oid(), turn.parent.is_none(), &salt);
             without_base |= unknown_base.contains(&key);
             let d = &turn.turn.draft;
             turns.push(TurnRun {

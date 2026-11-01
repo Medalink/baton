@@ -5,11 +5,18 @@
 
 use super::lines::{self, Side, TEXT_MAX};
 use crate::error::{Error, Result};
+use crate::id::{GitSha, TreeId};
 use crate::names::MAX_TREE_DEPTH;
+use crate::paths::Dirs;
+use crate::policy::StorePolicy;
+use crate::store::SideRepo;
+use crate::turndoc::{BaseChange, GitBase, changes_against_base};
 use gix::ObjectId;
 use gix::objs::tree::EntryKind;
+use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Status {
@@ -31,21 +38,63 @@ pub(super) struct FileStat {
     pub to: [u8; 20],
     pub added: Vec<u64>,
     pub removed: Vec<u64>,
+    /// The line diff stopped at its deadline, so the lists may be longer than the minimum. Never cached.
+    pub cut: bool,
 }
 
-/// The two object databases a report reads. Both are opened read-only and without the user's git config.
+/// The object databases a report reads, and what it needs to compare a first turn with the user's commit
+/// the way the store sees it. Both repositories are opened read-only and without the user's git config.
 pub(super) struct Readers {
     pub side: gix::Repository,
     pub user: Option<gix::Repository>,
+    store: SideRepo,
+    root: Option<PathBuf>,
+    dirs: Dirs,
+    /// Loaded on the first comparison with a base commit; a failure is kept as its message.
+    policy: OnceCell<std::result::Result<StorePolicy, String>>,
+    /// The last few base commits read, since the threads of a project mostly share them.
+    bases: RefCell<Vec<(ObjectId, Rc<GitBase>)>>,
 }
 
+const BASES_KEPT: usize = 4;
+
 impl Readers {
-    pub(super) fn open(side_dir: &Path, user: Option<&Path>) -> Result<Self> {
+    pub(super) fn open(side_dir: &Path, user: Option<&Path>, dirs: &Dirs) -> Result<Self> {
         let open = |dir: &Path| gix::open_opts(dir, gix::open::Options::isolated());
+        let user_repo = user.and_then(|dir| open(dir).ok());
         Ok(Self {
             side: open(side_dir).map_err(Error::git)?,
-            user: user.and_then(|dir| open(dir).ok()),
+            root: user_repo.as_ref().and(user).map(Path::to_owned),
+            user: user_repo,
+            store: SideRepo::open_existing(side_dir)?,
+            dirs: dirs.clone(),
+            policy: OnceCell::new(),
+            bases: RefCell::default(),
         })
+    }
+
+    fn policy(&self) -> Result<&StorePolicy> {
+        let loaded = self.policy.get_or_init(|| match &self.root {
+            Some(root) => crate::worktree::open_policy(root, &self.dirs).map_err(|e| e.to_string()),
+            None => Err("no worktree to read the store policy from".to_owned()),
+        });
+        loaded.as_ref().map_err(|e| Error::Refused(e.clone()))
+    }
+
+    fn base(&self, sha: ObjectId, user: &gix::Repository) -> Result<Rc<GitBase>> {
+        let mut bases = self.bases.borrow_mut();
+        if let Some((_, base)) = bases.iter().find(|(id, _)| *id == sha) {
+            return Ok(Rc::clone(base));
+        }
+        let base = Rc::new(GitBase::from_repo(
+            user.clone(),
+            Some(GitSha::from_gix(sha)),
+        )?);
+        if bases.len() >= BASES_KEPT {
+            bases.remove(0);
+        }
+        bases.push((sha, Rc::clone(&base)));
+        Ok(base)
     }
 }
 
@@ -159,47 +208,85 @@ fn to_bytes(id: Option<ObjectId>) -> [u8; 20] {
         .unwrap_or([0; 20])
 }
 
-/// `compare_text` drops a file whose two sides differ only in bytes the line comparison ignores (line
-/// endings, indentation): needed across repositories, where equal ids are the only shortcut and a
+/// One file's line statistics. `compare_text` drops a file whose two sides differ only in bytes the line
+/// comparison ignores (line endings, indentation): needed against the user's repository, where a
 /// checkout may differ from git's blob.
+fn measure(
+    path: String,
+    old: &Side,
+    new: &Side,
+    to: [u8; 20],
+    compare_text: bool,
+) -> Option<FileStat> {
+    let status = match (old.is_absent(), new.is_absent()) {
+        (true, _) => Status::Added,
+        (_, true) => Status::Removed,
+        _ => Status::Modified,
+    };
+    let mut stat = FileStat {
+        path,
+        status,
+        lines: false,
+        added_n: 0,
+        removed_n: 0,
+        to,
+        added: Vec::new(),
+        removed: Vec::new(),
+        cut: false,
+    };
+    if let Some(delta) = lines::diff(old, new) {
+        if compare_text && delta.is_empty() && !old.is_absent() && !new.is_absent() {
+            return None;
+        }
+        stat.lines = true;
+        stat.added_n = delta.added_n;
+        stat.removed_n = delta.removed_n;
+        stat.added = delta.added;
+        stat.removed = delta.removed;
+        stat.cut = delta.cut;
+    }
+    Some(stat)
+}
+
 fn file_stats(
     deltas: Vec<Delta>,
     from: &gix::Repository,
     to: &gix::Repository,
-    compare_text: bool,
 ) -> Result<Vec<FileStat>> {
     let mut out = Vec::with_capacity(deltas.len());
     for d in deltas {
         let (old, new) = (side_of(from, d.from)?, side_of(to, d.to)?);
-        let status = match (d.from, d.to) {
-            (None, _) => Status::Added,
-            (_, None) => Status::Removed,
-            _ => Status::Modified,
-        };
-        let mut stat = FileStat {
-            path: d.path,
-            status,
-            lines: false,
-            added_n: 0,
-            removed_n: 0,
-            to: to_bytes(d.to),
-            added: Vec::new(),
-            removed: Vec::new(),
-        };
-        if let Some(delta) = lines::diff(&old, &new) {
-            if compare_text && delta.is_empty() && !old.is_absent() && !new.is_absent() {
-                continue;
-            }
-            stat.lines = true;
-            stat.added_n = delta.added_n;
-            stat.removed_n = delta.removed_n;
-            stat.added = delta.added;
-            stat.removed = delta.removed;
-        }
-        out.push(stat);
+        out.extend(measure(d.path, &old, &new, to_bytes(d.to), false));
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
+}
+
+fn bytes_side(bytes: Option<Vec<u8>>) -> Side {
+    match bytes {
+        None => Side::Absent,
+        Some(b) if b.len() as u64 > TEXT_MAX => Side::Big,
+        Some(b) => Side::Bytes(b),
+    }
+}
+
+/// The statistics of changes the store sees (`changes_against_base`), already sorted by path.
+fn base_stats(changes: Vec<BaseChange>) -> Vec<FileStat> {
+    let blob_id = |bytes: &Option<Vec<u8>>| {
+        bytes.as_ref().map_or([0; 20], |b| {
+            gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, b)
+                .ok()
+                .and_then(|id| <[u8; 20]>::try_from(id.as_bytes()).ok())
+                .unwrap_or([0; 20])
+        })
+    };
+    let mut out = Vec::with_capacity(changes.len());
+    for c in changes {
+        let to = blob_id(&c.new);
+        let (old, new) = (bytes_side(c.old), bytes_side(c.new));
+        out.extend(measure(c.path, &old, &new, to, true));
+    }
+    out
 }
 
 fn commit_tree(repo: &gix::Repository, commit: ObjectId) -> Result<ObjectId> {
@@ -209,42 +296,46 @@ fn commit_tree(repo: &gix::Repository, commit: ObjectId) -> Result<ObjectId> {
 
 /// A turn's changes. `Ok(None)` means they cannot be known here (the base commit is not in this
 /// repository), which must not be cached: a later `git fetch` fixes it.
+///
+/// Against a base commit the comparison is the one the turn document makes (`changes_against_base`): only
+/// paths the store could hold, with the commit's side put through the store's redaction. The raw trees
+/// differ in every excluded file and every file the store redacted, and those are not changes.
 pub(super) fn turn_stats(
     readers: &Readers,
     tree: ObjectId,
     basis: Basis,
 ) -> Result<Option<Vec<FileStat>>> {
     let mut deltas = Vec::new();
-    match basis {
-        Basis::Parent(parent) => {
-            tree_deltas(
-                (&readers.side, Some(parent)),
-                (&readers.side, Some(tree)),
-                &mut String::new(),
-                &mut deltas,
-                0,
-            )?;
-            file_stats(deltas, &readers.side, &readers.side, false).map(Some)
-        }
-        Basis::Base(sha) => {
-            let from_repo = readers.user.as_ref().unwrap_or(&readers.side);
-            let base_tree = match sha {
-                None => None,
-                Some(sha) => match readers.user.as_ref().map(|u| commit_tree(u, sha)) {
-                    Some(Ok(tree)) => Some(tree),
-                    _ => return Ok(None),
-                },
+    let from = match basis {
+        Basis::Parent(parent) => Some(parent),
+        // Nothing to hold back from an empty base: every stored file is an addition.
+        Basis::Base(None) => None,
+        Basis::Base(Some(sha)) => {
+            let (Some(user), Some(root)) = (&readers.user, &readers.root) else {
+                return Ok(None);
             };
-            tree_deltas(
-                (from_repo, base_tree),
-                (&readers.side, Some(tree)),
-                &mut String::new(),
-                &mut deltas,
-                0,
+            if user.find_commit(sha).is_err() {
+                return Ok(None);
+            }
+            let base = readers.base(sha, user)?;
+            let changes = changes_against_base(
+                &readers.store,
+                TreeId::from_gix(tree),
+                &base,
+                readers.policy()?,
+                root,
             )?;
-            file_stats(deltas, from_repo, &readers.side, true).map(Some)
+            return Ok(Some(base_stats(changes)));
         }
-    }
+    };
+    tree_deltas(
+        (&readers.side, from),
+        (&readers.side, Some(tree)),
+        &mut String::new(),
+        &mut deltas,
+        0,
+    )?;
+    file_stats(deltas, &readers.side, &readers.side).map(Some)
 }
 
 /// A user commit against its first parent.
@@ -266,7 +357,7 @@ pub(super) fn commit_stats(readers: &Readers, id: ObjectId) -> Result<Option<Vec
         &mut deltas,
         0,
     )?;
-    file_stats(deltas, user, user, false).map(Some)
+    file_stats(deltas, user, user).map(Some)
 }
 
 /// The blob at `path` in a tree.

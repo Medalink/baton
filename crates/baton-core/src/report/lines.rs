@@ -36,6 +36,8 @@ pub(super) struct LineDelta {
     pub removed: Vec<u64>,
     pub added_n: u32,
     pub removed_n: u32,
+    /// The diff ran out of time and kept a coarser edit script than the minimum.
+    pub cut: bool,
 }
 
 impl LineDelta {
@@ -94,6 +96,7 @@ pub(super) fn diff(old: &Side, new: &Side) -> Option<LineDelta> {
             delta.added.extend(b[to].iter().map(|l| hash(l)));
         }
     }
+    delta.cut = Instant::now() >= deadline;
     delta.added_n = u32::try_from(delta.added.len()).unwrap_or(u32::MAX);
     delta.removed_n = u32::try_from(delta.removed.len()).unwrap_or(u32::MAX);
     delta.added.sort_unstable();

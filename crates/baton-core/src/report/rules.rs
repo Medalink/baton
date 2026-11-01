@@ -153,7 +153,40 @@ pub(super) struct ReworkOut {
     pub per_turn: HashMap<(usize, usize), (u32, u32)>,
 }
 
+/// When the user first shipped a line a turn added: the earliest commit at or after the turn.
+fn shipped_at(ship: &ShipIndex, path: u64, hash: u64, turn_at: i64) -> Option<i64> {
+    let times = ship.get(&(path, hash))?;
+    times.get(times.partition_point(|t| *t < turn_at)).copied()
+}
+
+/// A shipment of a line belongs to the thread that added the line first, by turn time; two threads that
+/// added it in the same second go to the lower thread name. The other threads wrote the same text before
+/// it shipped, but they did not ship it, so they count it neither as shipped nor as reworked.
+fn shipment_owners(runs: &[ThreadRun], ship: &ShipIndex) -> HashMap<(u64, u64, i64), usize> {
+    let mut owners: HashMap<(u64, u64, i64), (i64, usize)> = HashMap::new();
+    for (ti, run) in runs.iter().enumerate() {
+        for turn in &run.turns {
+            for f in turn.files.iter().flatten().filter(|f| f.lines) {
+                let path = fnv1a(f.path.as_bytes());
+                for h in &f.added {
+                    let Some(shipped) = shipped_at(ship, path, *h, turn.at) else {
+                        continue;
+                    };
+                    let slot = owners.entry((path, *h, shipped)).or_insert((turn.at, ti));
+                    let better =
+                        turn.at < slot.0 || (turn.at == slot.0 && run.name < runs[slot.1].name);
+                    if better {
+                        *slot = (turn.at, ti);
+                    }
+                }
+            }
+        }
+    }
+    owners.into_iter().map(|(k, (_, ti))| (k, ti)).collect()
+}
+
 pub(super) fn rework(runs: &[ThreadRun], ship: &ShipIndex) -> ReworkOut {
+    let owners = shipment_owners(runs, ship);
     // Every removal in the window, by (path, line): when, which thread, which turn.
     type Removal = (i64, usize, u32);
     let mut removals: HashMap<(u64, u64), Vec<Removal>> = HashMap::new();
@@ -185,12 +218,12 @@ pub(super) fn rework(runs: &[ThreadRun], ship: &ShipIndex) -> ReworkOut {
                 let (mut reworked, mut first_ship) = (0u32, i64::MAX);
                 let mut by: Option<Removal> = None;
                 for h in &f.added {
-                    let Some(times) = ship.get(&(path, *h)) else {
+                    let Some(shipped) = shipped_at(ship, path, *h, turn.at) else {
                         continue;
                     };
-                    let Some(&shipped) = times.get(times.partition_point(|t| *t < turn.at)) else {
+                    if owners.get(&(path, *h, shipped)) != Some(&ti) {
                         continue;
-                    };
+                    }
                     turn_shipped += 1;
                     let Some(list) = removals.get(&(path, *h)) else {
                         continue;

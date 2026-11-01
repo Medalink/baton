@@ -217,22 +217,23 @@ turn_in "$P" recent-wip "wip" --agent claude-code --model m-alpha >/dev/null
 plant() {
   local name=$1 ago=$2 seq=$3 base=$4 src=$5 patch=$6 dir="$TMP/plant-$1-$3"
   local parent="" index="$TMP/plant.index" when tree commit
+  local repo=${P_REPO:-$R} side=${P_SIDE:-$SIDE}
   mkdir -p "$dir"
-  git -C "$R" archive "$src" | tar -x -C "$dir"
+  git -C "$repo" archive "$src" | tar -x -C "$dir"
   (cd "$dir" && eval "$patch")
   rm -f "$index"
   when="$(iso $((NOW - ago)))"
-  GIT_INDEX_FILE="$index" git --git-dir="$SIDE" --work-tree="$dir" add -A >/dev/null 2>&1
-  tree=$(GIT_INDEX_FILE="$index" git --git-dir="$SIDE" write-tree)
-  parent=$(git --git-dir="$SIDE" rev-parse -q --verify "refs/baton/$name" 2>/dev/null || true)
+  GIT_INDEX_FILE="$index" git --git-dir="$side" --work-tree="$dir" add -A >/dev/null 2>&1
+  tree=$(GIT_INDEX_FILE="$index" git --git-dir="$side" write-tree)
+  parent=$(git --git-dir="$side" rev-parse -q --verify "refs/baton/$name" 2>/dev/null || true)
   {
     printf 'planted turn %s\n\n' "$seq"
     printf 'Baton-Thread: %s\nBaton-Turn: %s\nBaton-Agent: claude-code\nBaton-Model: m-gamma\nBaton-Machine: e2e\nBaton-Base: %s\n' "$name" "$seq" "$base"
   } >"$TMP/plant.msg"
   commit=$(GIT_AUTHOR_NAME=baton GIT_AUTHOR_EMAIL=baton@localhost GIT_COMMITTER_NAME=baton \
     GIT_COMMITTER_EMAIL=baton@localhost GIT_AUTHOR_DATE="$when" GIT_COMMITTER_DATE="$when" \
-    git --git-dir="$SIDE" commit-tree "$tree" ${parent:+-p "$parent"} -F "$TMP/plant.msg")
-  git --git-dir="$SIDE" update-ref "refs/baton/$name" "$commit"
+    git --git-dir="$side" commit-tree "$tree" ${parent:+-p "$parent"} -F "$TMP/plant.msg")
+  git --git-dir="$side" update-ref "refs/baton/$name" "$commit"
   rm -rf "$dir" "$index"
 }
 
@@ -317,6 +318,78 @@ log_before=$(wc -c <"$LOG")
 (cd "$R" && "$BIN" report >/dev/null 2>&1; "$BIN" report --json >/dev/null 2>&1)
 eq "a report starts no daemon" "$log_before" "$(wc -c <"$LOG")"
 
+# ---------------------------------------------------------------------------------------------- the store policy
+section "a first turn is compared with what the store could hold"
+# gen/** is excluded and cfg.toml is stored redacted, so neither is a change the thread made. Both are still
+# in HEAD, and the base commit's raw trees differ from the turn's in all of them.
+X="$TMP/gen"
+XS=$(side_of gen)
+git init -q "$X"
+git -C "$X" remote add origin "https://github.com/E2E/gen.git"
+mkdir -p "$X/gen" "$X/src" "$X/.baton"
+printf '[snapshot]\nexclude = ["gen/**"]\n' >"$X/.baton/config.toml"
+for n in a b c; do seq 1 40 | sed "s/^/generated $n line /" >"$X/gen/$n.rs"; done
+printf 'name = "svc"\ndb_password = "hunter2-hunter2-hunter2"\nport = 8080\n' >"$X/cfg.toml"
+printf 'fn one() {}\nfn two() {}\n' >"$X/src/app.rs"
+git -C "$X" add -A >/dev/null 2>&1
+at $((NOW - 10 * DAY)) git -C "$X" commit -q -m "base"
+"$BIN" enroll --repo "$(wp "$X")" >/dev/null 2>&1
+printf 'fn three() {}\n' >>"$X/src/app.rs"
+turn_in "$X" gen1 "add three" --agent claude-code --model m-alpha >/dev/null
+side_tree=$(git --git-dir="$XS" ls-tree -r --name-only refs/baton/gen1 | tr '\n' ' ')
+lacks "the store left the excluded files out" "$side_tree" "gen/a.rs"
+lacks "the store redacted the password" "$(git --git-dir="$XS" show refs/baton/gen1:cfg.toml)" "hunter2"
+
+# The turn's commit is rewritten three days old, then the user ships the line by hand.
+tree=$(git --git-dir="$XS" rev-parse "refs/baton/gen1^{tree}")
+git --git-dir="$XS" log -1 --format=%B refs/baton/gen1 >"$TMP/gen.msg"
+when="$(iso $((NOW - 3 * DAY)))"
+commit=$(GIT_AUTHOR_NAME=baton GIT_AUTHOR_EMAIL=baton@localhost GIT_COMMITTER_NAME=baton \
+  GIT_COMMITTER_EMAIL=baton@localhost GIT_AUTHOR_DATE="$when" GIT_COMMITTER_DATE="$when" \
+  git --git-dir="$XS" commit-tree "$tree" -F "$TMP/gen.msg")
+git --git-dir="$XS" update-ref refs/baton/gen1 "$commit"
+git -C "$X" add src/app.rs >/dev/null 2>&1
+at $((NOW - 2 * DAY)) git -C "$X" commit -q -m "ship three"
+
+J=$(cd "$X" && json)
+changed=$(sed -n 's/.*"thread":"gen1","turn":1,"last_at":[0-9]*,"changed_lines":\([0-9]*\),"reached_lines":\([0-9]*\).*/\1 changed, \2 reached/p' <<<"$J")
+echo "  gen1: ${changed:-not abandoned}; $(grep -o '"abandoned":[0-9]*,' <<<"$J")"
+contains "the thread's one line reached HEAD, so nothing is abandoned" "$J" '"abandoned":0,'
+lacks "the thread is nowhere in the document" "$J" '"thread":"gen1"'
+
+# ---------------------------------------------------------------------------------------------- shared lines and skew
+section "two threads that wrote the same line, and a turn with a skewed clock"
+D="$TMP/dup"
+DS=$(side_of dup)
+git init -q "$D"
+git -C "$D" remote add origin "https://github.com/E2E/dup.git"
+mkdir -p "$D/src"
+printf 'base d\n' >"$D/src/d.rs"
+git -C "$D" add -A >/dev/null 2>&1
+at $((NOW - 10 * DAY)) git -C "$D" commit -q -m "base"
+DBASE=$(git -C "$D" rev-parse HEAD)
+git init -q --bare "$DS"
+export P_REPO=$D P_SIDE=$DS
+# dupA wrote the lines first and dupB wrote the same text a day later; the user shipped it once, and dupC
+# removed one line the next day.
+plant dupA $((5 * DAY)) 1 "$DBASE" "$DBASE" 'printf "dup one\ndup two\n" >src/dup.rs'
+plant dupB $((4 * DAY)) 1 "$DBASE" "$DBASE" 'printf "dup one\ndup two\n" >src/dup.rs'
+printf 'dup one\ndup two\n' >"$D/src/dup.rs"
+git -C "$D" add -A >/dev/null 2>&1
+at $((NOW - 3 * DAY)) git -C "$D" commit -q -m "ship dup"
+DSHIP=$(git -C "$D" rev-parse HEAD)
+plant dupC $((2 * DAY)) 1 "$DSHIP" "$DSHIP" 'edit "/^dup two$/d" src/dup.rs'
+# skew: turn 2 was written on a machine whose clock is nine days behind, between two turns inside the window.
+plant skew 10800 1 "$DBASE" "$DBASE" 'printf "skew one\n" >src/skew.rs'
+plant skew $((9 * DAY)) 2 "$DBASE" "$DBASE" 'printf "skew one\nskew two\n" >src/skew.rs'
+plant skew 7200 3 "$DBASE" "$DBASE" 'printf "skew one\nskew two\nskew three\n" >src/skew.rs'
+unset P_REPO P_SIDE
+
+J=$(cd "$D" && json)
+contains "the first thread to write the lines is credited with the rework" "$J" '"thread":"dupA","turn":1,"file":"src/dup.rs","lines":1,'
+lacks "the thread that wrote the same text later is not" "$J" '"thread":"dupB"'
+contains "the turns on both sides of a skewed one are counted" "$J" '"counts":{"threads":4,"turns":5,'
+
 # ---------------------------------------------------------------------------------------------- scale
 section "a large project: cold run against a cached run"
 BIG="$TMP/big"
@@ -396,6 +469,18 @@ echo "  $THREADS threads x $TURNS turns, $FILES files, 400 user commits: cold ${
 SCALE="$THREADS threads x $TURNS turns over $FILES files: cold ${cold} ms, cached ${warm} ms"
 eq "the large project's repository is untouched by the report" "clean" \
   "$([[ -z $(git -C "$BIG" status --porcelain) ]] && echo clean || echo dirty)"
+
+# The cache is rewritten rather than grown: a repeated run adds nothing, and a thread whose ref is gone
+# takes its entries with it.
+cache_file=$(find "$CACHE" -name '*.bin' | head -1)
+size_warm=$(wc -c <"$cache_file")
+(cd "$BIG" && "$BIN" report --since 14d --json >/dev/null 2>&1)
+eq "a repeated run leaves the cache file as it was" "$size_warm" "$(wc -c <"$cache_file")"
+git --git-dir="$BIGSIDE" update-ref -d refs/baton/t0000
+(cd "$BIG" && "$BIN" report --since 14d --json >"$TMP/after.json" 2>/dev/null)
+size_after=$(wc -c <"$cache_file")
+if ((size_after < size_warm)); then ok "a deleted thread's entries leave the cache"; else bad "a deleted thread's entries leave the cache" "$size_warm bytes before, $size_after after"; fi
+eq "the report counts one thread fewer" $((THREADS - 1)) "$(sed -n 's/.*"counts":{"threads":\([0-9]*\),.*/\1/p' "$TMP/after.json")"
 
 # ---------------------------------------------------------------------------------------------- summary
 echo
