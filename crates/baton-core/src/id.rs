@@ -201,7 +201,8 @@ impl fmt::Display for TurnSeq {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct UnixMillis(i64);
 
 impl UnixMillis {
@@ -278,6 +279,23 @@ macro_rules! object_id {
 }
 
 object_id!(
+    /// Any object in a side repo. Wire frames and `want` name objects by this.
+    Oid, "object id"
+);
+
+impl Oid {
+    pub fn from_raw(raw: &[u8]) -> Result<Self> {
+        gix::ObjectId::try_from(raw)
+            .map(Self)
+            .map_err(|_| Error::invalid("object id", format!("{} bytes, not 20", raw.len())))
+    }
+
+    pub fn raw(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+object_id!(
     /// A turn is a commit, so its id is the commit id.
     TurnId, "turn id"
 );
@@ -295,6 +313,24 @@ object_id!(
     GitSha, "git sha"
 );
 
+macro_rules! as_oid {
+    ($($name:ident),*) => {$(
+        impl From<$name> for Oid {
+            fn from(id: $name) -> Self {
+                Self(id.0)
+            }
+        }
+
+        impl $name {
+            pub fn from_oid(oid: Oid) -> Self {
+                Self(oid.0)
+            }
+        }
+    )*};
+}
+
+as_oid!(TurnId, TreeId, BlobId);
+
 /// A `/`-separated path inside a worktree that baton can store and later write back safely.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RelPath(Box<str>);
@@ -307,15 +343,18 @@ impl RelPath {
                 format!("{s:?} is empty or has an edge '/'"),
             ));
         }
+        if s.split('/').count() > crate::names::MAX_TREE_DEPTH + 1 {
+            return Err(Error::invalid(
+                "path",
+                format!(
+                    "{s:?} is nested deeper than {} directories",
+                    crate::names::MAX_TREE_DEPTH
+                ),
+            ));
+        }
         for part in s.split('/') {
-            if part.is_empty() || part == "." || part == ".." {
-                return Err(Error::invalid(
-                    "path",
-                    format!("{s:?} has an empty, '.' or '..' part"),
-                ));
-            }
-            if part.eq_ignore_ascii_case(".git") {
-                return Err(Error::invalid("path", format!("{s:?} names .git")));
+            if let Err(why) = crate::names::check_name(part.as_bytes()) {
+                return Err(Error::invalid("path", format!("{s:?}: {why}")));
             }
             if part
                 .chars()

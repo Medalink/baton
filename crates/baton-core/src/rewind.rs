@@ -1,4 +1,5 @@
-//! Putting a turn's files back on disk. The only code in baton that writes into a working tree.
+//! Putting a turn's files back on disk. With `apply`, the only code in baton that writes into a working
+//! tree.
 //!
 //! It never deletes, never overwrites a file that has edits no snapshot has seen, never writes a file whose
 //! stored copy had a secret cut out of it, and never writes through a symlink.
@@ -42,7 +43,7 @@ pub struct RewindPlan {
 }
 
 /// True when no directory between the root and the path's parent is a symlink or a file.
-fn parents_are_plain(root: &Path, path: &RelPath) -> bool {
+pub(crate) fn parents_are_plain(root: &Path, path: &RelPath) -> bool {
     let mut dir = root.to_owned();
     if let Some(parent) = path.parent() {
         for part in parent.split('/') {
@@ -148,19 +149,21 @@ pub fn apply(side: &SideRepo, root: &Path, plan: &RewindPlan) -> Result<usize> {
 }
 
 fn write_one(side: &SideRepo, root: &Path, item: &RewindWrite) -> Result<()> {
-    if !parents_are_plain(root, &item.path) {
-        return Err(Error::Refused(format!(
-            "{} sits below a symlink",
-            item.path
-        )));
+    let bytes = side.read_blob(item.blob)?;
+    write_file(root, &item.path, item.kind, &bytes)
+}
+
+/// Writes one file next to its target and renames it into place.
+pub(crate) fn write_file(root: &Path, path: &RelPath, kind: FileKind, bytes: &[u8]) -> Result<()> {
+    if !parents_are_plain(root, path) {
+        return Err(Error::Refused(format!("{path} sits below a symlink")));
     }
-    let target: PathBuf = root.join(item.path.as_str());
+    let target: PathBuf = root.join(path.as_str());
     if let Some(dir) = target.parent() {
         std::fs::create_dir_all(dir).ctx(|| format!("creating {}", dir.display()))?;
     }
-    let bytes = side.read_blob(item.blob)?;
     let temp = target.with_file_name(format!(".baton-rewind-{}", std::process::id()));
-    let result = write_temp(&temp, item.kind, &bytes).and_then(|()| {
+    let result = write_temp(&temp, kind, bytes).and_then(|()| {
         std::fs::rename(&temp, &target).ctx(|| format!("replacing {}", target.display()))
     });
     if result.is_err() {

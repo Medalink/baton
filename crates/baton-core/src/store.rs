@@ -5,12 +5,16 @@
 //! written loose, one at a time.
 
 use crate::error::{Error, IoContext, Result};
-use crate::id::{BlobId, FileKind, RelPath, ThreadId, TreeId, TurnId, TurnSeq, UnixMillis};
+use crate::id::{BlobId, FileKind, Oid, RelPath, ThreadId, TreeId, TurnId, TurnSeq, UnixMillis};
+use crate::names::MAX_TREE_DEPTH;
 use crate::turn::{Turn, TurnDraft};
-use gix::objs::Write as _;
+use crate::wire::ObjectKind;
+use gix::objs::{Exists as _, Find as _, Write as _};
+use gix::prelude::Header as _;
 use gix::refs::Target;
 use gix::refs::transaction::PreviousValue;
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -63,9 +67,21 @@ pub struct StageTimes {
     pub reference: Duration,
 }
 
+/// Objects read out of a repo, with their kinds.
+pub type Stored = Vec<(ObjectKind, Oid, Vec<u8>)>;
+
+/// The result of a compare-and-swap on a thread's ref.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TipMove {
+    Moved,
+    Stale(Option<TurnId>),
+}
+
 pub struct SideRepo {
     repo: gix::Repository,
     dir: PathBuf,
+    /// How many trees nest below a stored tree. Stored trees never change, so this is kept as long as the repo is open.
+    heights: RefCell<HashMap<Oid, usize>>,
 }
 
 fn signature(at: UnixMillis) -> gix::actor::Signature {
@@ -104,6 +120,7 @@ impl SideRepo {
         Ok(Self {
             repo,
             dir: dir.to_owned(),
+            heights: RefCell::default(),
         })
     }
 
@@ -296,16 +313,21 @@ impl SideRepo {
     }
 
     pub fn threads(&self) -> Result<Vec<ThreadId>> {
+        Ok(self.tips()?.into_iter().map(|(thread, _)| thread).collect())
+    }
+
+    /// Every thread and the turn its ref points at, sorted by thread.
+    pub fn tips(&self) -> Result<Vec<(ThreadId, TurnId)>> {
         let platform = self.repo.references().map_err(Error::git)?;
         let mut out = Vec::new();
         for reference in platform.prefixed(REF_PREFIX).map_err(Error::git)? {
             let reference = reference.map_err(Error::git)?;
             let name = reference.name().as_bstr().to_string();
-            if let Some(thread) = name
+            let thread = name
                 .strip_prefix(REF_PREFIX)
-                .and_then(|t| ThreadId::parse(t).ok())
-            {
-                out.push(thread);
+                .and_then(|t| ThreadId::parse(t).ok());
+            if let (Some(thread), Some(id)) = (thread, reference.target().try_id()) {
+                out.push((thread, TurnId::from_gix(id.to_owned())));
             }
         }
         out.sort();
@@ -367,6 +389,201 @@ impl SideRepo {
             .clone())
     }
 
+    /// Whether the object database holds the object. Unlike `Repository::has_object`, it does not assume
+    /// the empty tree and the empty blob exist.
+    pub fn has_object(&self, id: Oid) -> bool {
+        self.repo.objects.exists(&id.oid())
+    }
+
+    /// The kind of a stored object, read from its header alone. A stored tag reads as absent.
+    pub fn object_kind(&self, id: Oid) -> Result<Option<ObjectKind>> {
+        let found = self
+            .repo
+            .objects
+            .try_header(&id.oid())
+            .map_err(Error::git)?;
+        Ok(found.and_then(|header| ObjectKind::from_gix(header.kind())))
+    }
+
+    pub(crate) fn stored_height(&self, id: Oid) -> Option<usize> {
+        self.heights.borrow().get(&id).copied()
+    }
+
+    pub(crate) fn remember_height(&self, id: Oid, height: usize) {
+        self.heights.borrow_mut().insert(id, height);
+    }
+
+    /// The object's kind and bytes. A stored tag is not a baton object, so it reads as absent.
+    pub fn read_raw(&self, id: Oid) -> Result<Option<(ObjectKind, Vec<u8>)>> {
+        let mut buf = Vec::new();
+        let found = self
+            .repo
+            .objects
+            .try_find(&id.oid(), &mut buf)
+            .map_err(Error::git)?;
+        Ok(found.and_then(|data| ObjectKind::from_gix(data.kind).map(|k| (k, data.data.to_vec()))))
+    }
+
+    /// Stores bytes as a loose object, including the empty blob and the empty tree.
+    pub fn write_raw(&self, kind: ObjectKind, bytes: &[u8]) -> Result<Oid> {
+        self.repo
+            .objects
+            .write_buf(kind.gix(), bytes)
+            .map(Oid::from_gix)
+            .map_err(Error::git)
+    }
+
+    /// Moves `refs/baton/<thread>` from `expected` to `new` by compare-and-swap. The caller has stored
+    /// the closure of `new` first.
+    pub fn move_tip(
+        &self,
+        thread: &ThreadId,
+        expected: Option<TurnId>,
+        new: TurnId,
+    ) -> Result<TipMove> {
+        let previous = match expected {
+            None => PreviousValue::MustNotExist,
+            Some(tip) => PreviousValue::MustExistAndMatch(Target::Object(tip.oid())),
+        };
+        let moved = self.repo.reference(
+            thread.turn_ref().as_str(),
+            new.oid(),
+            previous,
+            "baton sync",
+        );
+        match moved {
+            Ok(_) => Ok(TipMove::Moved),
+            Err(e) => match self.tip(thread)? {
+                current if current != expected => Ok(TipMove::Stale(current)),
+                _ => Err(Error::git(e)),
+            },
+        }
+    }
+
+    /// The objects the turns after `known` up to `tip` created, children before parents, commits last
+    /// and oldest first. Each tree is compared with its parent turn's tree; the thread's first turn is
+    /// compared with `base`, a tree the receiver already holds, or sent whole when there is none.
+    pub fn turn_objects(
+        &self,
+        tip: TurnId,
+        known: Option<TurnId>,
+        base: Option<TreeId>,
+    ) -> Result<Vec<(ObjectKind, Oid)>> {
+        let mut chain = Vec::new();
+        let mut next = Some(tip);
+        while let Some(id) = next.filter(|id| Some(*id) != known) {
+            let record = self.read_turn(id)?;
+            next = record.parent;
+            chain.push(record);
+        }
+        if known.is_some() && next != known {
+            return Err(Error::Refused(format!(
+                "turn {} does not descend from {}",
+                tip.short(),
+                known.map_or_else(String::new, |k| k.short())
+            )));
+        }
+        chain.reverse();
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for (i, record) in chain.iter().enumerate() {
+            let before = match i {
+                0 => match record.parent {
+                    Some(parent) => Some(self.read_turn(parent)?.tree),
+                    None => base,
+                },
+                _ => Some(chain[i - 1].tree),
+            };
+            self.new_in_tree(
+                record.tree.oid(),
+                before.map(|t| t.oid()),
+                &mut seen,
+                &mut out,
+                0,
+            )?;
+        }
+        out.extend(chain.iter().map(|r| (ObjectKind::Commit, Oid::from(r.id))));
+        Ok(out)
+    }
+
+    /// Reads objects in order until `budget` bytes are gathered, and reports how many ids it consumed.
+    /// An id the repo lacks is consumed and skipped.
+    pub fn read_batch(&self, ids: &[Oid], budget: usize) -> Result<(Stored, usize)> {
+        let mut out = Vec::new();
+        let mut bytes = 0;
+        let mut used = 0;
+        for id in ids {
+            if bytes >= budget {
+                break;
+            }
+            used += 1;
+            if let Some((kind, data)) = self.read_raw(*id)? {
+                bytes += data.len();
+                out.push((kind, *id, data));
+            }
+        }
+        Ok((out, used))
+    }
+
+    /// The file at `path` in `tree`, if there is one.
+    pub fn entry_at(&self, tree: TreeId, path: &RelPath) -> Result<Option<(FileKind, BlobId)>> {
+        use gix::objs::tree::EntryKind;
+        let mut current = Some(tree.oid());
+        let mut parts = path.as_str().split('/').peekable();
+        while let Some(part) = parts.next() {
+            let entries = self.entries(current)?;
+            let Some((kind, oid)) = entries.get(part) else {
+                return Ok(None);
+            };
+            if parts.peek().is_none() {
+                return Ok(FileKind::from_entry_kind(*kind).map(|k| (k, BlobId::from_gix(*oid))));
+            }
+            if *kind != EntryKind::Tree {
+                return Ok(None);
+            }
+            current = Some(*oid);
+        }
+        Ok(None)
+    }
+
+    fn new_in_tree(
+        &self,
+        tree: gix::ObjectId,
+        before: Option<gix::ObjectId>,
+        seen: &mut HashSet<gix::ObjectId>,
+        out: &mut Vec<(ObjectKind, Oid)>,
+        depth: usize,
+    ) -> Result<()> {
+        use gix::objs::tree::EntryKind;
+        check_depth(depth)?;
+        if Some(tree) == before || !seen.insert(tree) {
+            return Ok(());
+        }
+        let old = self.entries(before)?;
+        for (name, (kind, oid)) in self.entries(Some(tree))? {
+            let previous = old.get(&name);
+            if previous.map(|(_, id)| *id) == Some(oid) {
+                continue;
+            }
+            match kind {
+                EntryKind::Tree => {
+                    let before = previous
+                        .filter(|(k, _)| *k == EntryKind::Tree)
+                        .map(|(_, id)| *id);
+                    self.new_in_tree(oid, before, seen, out, depth + 1)?;
+                }
+                EntryKind::Commit => {}
+                _ => {
+                    if seen.insert(oid) {
+                        out.push((ObjectKind::Blob, Oid::from_gix(oid)));
+                    }
+                }
+            }
+        }
+        out.push((ObjectKind::Tree, Oid::from_gix(tree)));
+        Ok(())
+    }
+
     pub fn has_tree(&self, id: TreeId) -> bool {
         id == TreeId::empty() || self.repo.find_tree(id.oid()).is_ok()
     }
@@ -377,6 +594,7 @@ impl SideRepo {
         self.walk(
             &mut String::new(),
             Some(tree.oid()),
+            0,
             &mut |path, kind, blob| {
                 if let Ok(path) = RelPath::parse(path) {
                     out.push(FlatEntry { path, kind, blob });
@@ -394,6 +612,7 @@ impl SideRepo {
             from.map(|t| t.oid()),
             Some(to.oid()),
             &mut out,
+            0,
         )?;
         Ok(out)
     }
@@ -422,9 +641,11 @@ impl SideRepo {
         &self,
         prefix: &mut String,
         tree: Option<gix::ObjectId>,
+        depth: usize,
         visit: &mut dyn FnMut(&str, FileKind, BlobId),
     ) -> Result<()> {
         use gix::objs::tree::EntryKind;
+        check_depth(depth)?;
         for (name, (kind, oid)) in self.entries(tree)? {
             let len = prefix.len();
             if !prefix.is_empty() {
@@ -432,7 +653,7 @@ impl SideRepo {
             }
             prefix.push_str(&name);
             match kind {
-                EntryKind::Tree => self.walk(prefix, Some(oid), visit)?,
+                EntryKind::Tree => self.walk(prefix, Some(oid), depth + 1, visit)?,
                 other => {
                     if let Some(kind) = FileKind::from_entry_kind(other) {
                         visit(prefix, kind, BlobId::from_gix(oid));
@@ -450,8 +671,10 @@ impl SideRepo {
         from: Option<gix::ObjectId>,
         to: Option<gix::ObjectId>,
         out: &mut Vec<PathChange>,
+        depth: usize,
     ) -> Result<()> {
         use gix::objs::tree::EntryKind;
+        check_depth(depth)?;
         if from == to {
             return Ok(());
         }
@@ -469,7 +692,7 @@ impl SideRepo {
             }
             let (old_tree, new_tree) = (is_tree(before), is_tree(after));
             if old_tree.is_some() || new_tree.is_some() {
-                self.diff(prefix, old_tree, new_tree, out)?;
+                self.diff(prefix, old_tree, new_tree, out, depth + 1)?;
             }
             fn leaf(e: Option<&(EntryKind, gix::ObjectId)>) -> Option<&(EntryKind, gix::ObjectId)> {
                 e.filter(|(k, _)| *k != EntryKind::Tree && *k != EntryKind::Commit)
@@ -487,6 +710,15 @@ impl SideRepo {
         }
         Ok(())
     }
+}
+
+fn check_depth(depth: usize) -> Result<()> {
+    if depth > MAX_TREE_DEPTH {
+        return Err(Error::Refused(format!(
+            "a tree is nested deeper than {MAX_TREE_DEPTH} directories"
+        )));
+    }
+    Ok(())
 }
 
 /// A crash between taking a ref lock and renaming it leaves `<ref>.lock` behind, which blocks every later

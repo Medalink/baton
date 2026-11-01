@@ -213,13 +213,13 @@ pub fn status() -> Result<()> {
     }
 }
 
-struct Opened {
-    root: PathBuf,
-    side: SideRepo,
+pub struct Opened {
+    pub root: PathBuf,
+    pub side: SideRepo,
 }
 
 /// The current directory's worktree and its side repo, read-only.
-fn open_here() -> Result<Opened> {
+pub fn open_here() -> Result<Opened> {
     let root = find_root(&absolute(None)?).map_err(|e| anyhow!("{e}"))?;
     let config = RepoConfig::load(&root).map_err(|e| anyhow!("{e}"))?;
     let project = project_key(&root, &config).map_err(|e| anyhow!("{e}"))?;
@@ -228,7 +228,7 @@ fn open_here() -> Result<Opened> {
     Ok(Opened { root, side })
 }
 
-fn describe(side: &SideRepo, turn: &TurnRecord) -> Result<()> {
+pub fn describe(side: &SideRepo, turn: &TurnRecord) -> Result<()> {
     let d = &turn.turn.draft;
     println!(
         "{}@{}  {}  {}  {}  {}  {}",

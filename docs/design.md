@@ -5,7 +5,7 @@ baton records every coding-agent turn as a git commit and syncs it live between 
 ## Goals and limits
 
 - An agent is never blocked by baton. The hook always exits 0, prints nothing, and never waits on the network or the daemon.
-- baton never writes a user's index, `HEAD`, refs, object store, or working tree, except when the user runs `rewind --apply`, `pull`, or `follow`.
+- baton never writes a user's index, `HEAD`, refs, object store, or working tree, except when the user runs `rewind --apply`, `pull`, or `follow --into`. `pull` registers one worktree with `git worktree add --detach` and writes only inside it. `follow --into` writes only inside a worktree `pull` made.
 - Git is the record. Every server repo is a plain bare repo that `git fetch` reads completely.
 - Secrets are redacted before an object is written anywhere.
 - Every outside dependency (auth, classifier, decider, notifier, agent adapter) is a command named in config. A repo's own config can never name a command.
@@ -22,12 +22,16 @@ baton unenroll [path]             # stop watching; its history stays
 baton status
 baton log [thread]
 baton rewind <turn> [--thread T] [--apply]
-baton pull <thread> [--into dir]
-baton follow <thread>
+baton pull <thread> [--into dir]  # a new worktree at the thread's latest turn
+baton follow <thread> [--into dir]  # print each new turn; with --into, apply it there too
 baton ask <question> --option a --option b
-baton serve                       # the server
-baton admin device add <name>     # prints a token once
+baton serve [--data dir] [--listen addr] [--tls-cert pem --tls-key pem] [--trace]
+baton admin [--data dir] device add <name>     # prints a token once
+baton admin [--data dir] device list|revoke ...
+baton admin [--data dir] reindex|threads
 ```
+
+`baton admin` works on the server's data dir, with the server up or down.
 
 ## Crates
 
@@ -123,21 +127,57 @@ Local IPC: a named pipe `\\.\pipe\baton-<user>` on Windows, a unix socket `$XDG_
 
 ```text
 server.sqlite
+server.toml                    optional, the auth provider
+server.lock                    one server per data dir
+empty.git                      an empty bare repo, read only, that an advance for a new project is checked against
 projects/<ProjectKey>.git      plain bare repo, refs/baton/<thread>, gc.auto = 0
 ```
+
+A project's directory name is its key with `/` replaced by `+`, plus `.git` (`github.com+acme+app.git`). Each project has one writer thread. It takes the advance requests of every session in arrival order, so a compare-and-swap never races another one in the same process.
+
+A project key costs a map entry while a session holds it and nothing after. The repo and the writer thread are created when the first `advance` for the project is accepted: until then the advance is judged against `empty.git`, so a `need`, a refusal, a `subscribe` or a `want` on a project the server has never stored leaves no directory and no thread. A writer with no work for 30 s ends, its project is forgotten once no session holds it, and the next request starts a writer again from the repo. A session may name 256 distinct projects in all (hello, subscribe, advance and want together), so one session cannot make the server remember more than that.
 
 Invariants:
 
 1. **Present means complete.** An object stored on the server has every object it references stored. Objects are written blobs first, then trees deepest first, then commits, and every received object is re-hashed before it is stored.
 2. **Refs move last.** A ref moves only after the new commit's closure is complete, by compare-and-swap against the expected old value.
-3. **One writer per thread.** `threads.owner` is set by the first authenticated push. A push from another machine, or a tip whose `Baton-Machine` trailer differs from the authenticated machine, is refused.
-4. **Received trees are validated.** Entry names are non-empty, contain no `/` or NUL, are not `.`, `..`, or `.git` in any case, and appear once.
+3. **One writer per thread.** The owner of a thread is the `Baton-Machine` trailer of its current tip, so the repo alone says who owns what and `threads.owner` is only an index of it. An advance is checked in this order. The authenticated machine must equal the current tip's owner (`not_owner`). The ref must be at `expected` (`stale`). Then every new turn must name the authenticated machine (`machine_mismatch`) and continue the thread by sequence number (`invalid`). The ref moves last.
+4. **Received trees are validated as git validates them.** `names.rs` ports git v2.54.0's rules (`fsck_tree`, `verify_path_internal`, `is_ntfs_dotgit`, `is_hfs_dotgit`, `fsck_gitmodules_fn`, the submodule name and url checks, the null id and dotfile symlink checks), so a tree baton accepts passes `git fsck --strict` and cannot name a `.git` directory on NTFS, HFS+ or ext4. `docs/protocol.md` lists the rules. The same functions guard `RelPath::parse`, which every client write path goes through (apply, rewind, capture, diff and flatten), so a path is either safe to write or never written. Capture also asks `check_file` before it stores a file, so a turn never carries a name or a `.gitmodules` the server would refuse.
+5. **Object kinds match, even for stored objects.** A tree entry or a commit field that names an id already stored as another kind is refused, because a stored id proves only that some object has that hash.
+6. **Walks are iterative and capped.** Trees nest at most 512 levels. Every walk of a received tree (intake, closure, flatten, diff, apply) keeps its stack on the heap, because a stack overflow aborts the process and `catch_unwind` cannot stop it. A panic in a project writer is caught: it is logged, the advance is refused with `invalid`, and that project's writer restarts.
 
 SQLite is authoritative only for devices. `projects` and `threads` are an index rebuilt from refs by `baton admin reindex`.
 
 Fan-out: one broadcast channel per project. A session whose queue fills is closed and resyncs on reconnect, so a slow client never costs server memory or other clients' latency.
 
-Auth providers: `token` (built in, per-device token, stored as SHA-256), or `command` (JSON in, `{ok, machine}` out). Tailscale and mTLS ship as example commands under `contrib/`.
+Limits per connection, each driven by a scenario in `e2e/sync.sh`:
+
+| Limit | Value | When it is hit |
+|---|---|---|
+| Handshake (TLS and upgrade, auth included) | 10 s, at most 128 at once | the connection is closed without a reply |
+| `hello` after the upgrade | 5 s | `error`, close |
+| Frame | `max_frame` exactly, enforced by the WebSocket reader | `error`, close |
+| Session pool, finished bytes plus announced `total` of unfinished objects | 512 MiB | `too_large`, close |
+| Projects one session names | 256 | `too_large`, close |
+| Ids in one `want` | 2,048, duplicates read once | `too_large`, close |
+| A send that makes no progress | 30 s, then 5 s for the goodbye | the session is dropped |
+| Silence from the client | 60 s | the session is closed |
+| A revoked device | 2 s, and at the next request or forwarded event | `unauthorized`, close |
+
+A revoked device is cut off by a timer in its own session, not by the operator's command, so `baton admin device revoke` never needs to reach the server process. The delay is the 2 s timer plus the time a database read takes. A `command` auth provider is asked at the upgrade only; revoking in its own system takes effect when the device next connects.
+
+Auth providers: `token` (built in, per-device token, stored as SHA-256), or `command` (`baton.auth.v1` in, `{ok, machine}` out). The provider is named in `<data>/server.toml`:
+
+```toml
+[auth]
+provider = "command"
+command = ["/usr/local/bin/baton-auth"]
+timeout_ms = 2000
+```
+
+Without `server.toml` the built-in token provider runs. A `server.toml` the server cannot read stops it at start. A command that fails or times out, a token that matches no active device, and a missing `Authorization` header all answer the WebSocket upgrade with `401`, so no `welcome` is sent. The machine id that auth returns is the machine for the whole session: it is the `machine` in `welcome`, the only value the server compares against the tip owner, and the client's `me` from then on. The id in the client's config only picks what the `hello` claims. Tailscale and mTLS are meant to ship as example commands under `contrib/`; this slice ships none.
+
+Operators: `baton admin device add <name>` creates a device and prints its token once, `device list` shows every device with its state, and `device revoke <name>` revokes all of a machine's active devices. A revoked device cannot connect again. Its open session gets an `error` with code `unauthorized` and is closed within 2 s. `admin threads` lists what the server holds and `admin reindex` rebuilds `projects` and `threads` from the refs.
 
 ## Wire
 
@@ -145,9 +185,21 @@ See `docs/protocol.md`. In short: one WebSocket per machine, subprotocol `baton.
 
 The set of turns not yet on the server is derived from local refs and the server's last acknowledged heads, so there is no queue file. Turns made while offline go out on reconnect. Turns made while a push is in flight ride the next push.
 
+### Daemon link
+
+The link task holds the one WebSocket. It reads `[machine] id` and `[server] url`, `token` or `token_file`, and optional `ca_file` from the user config once, when the daemon starts, so a change to them needs a daemon restart. With no `[server]` the daemon runs local-only and says so in its log. It reconnects with backoff, sends a heartbeat ping every 15 s and treats 45 s of silence as a dead link.
+
+After `welcome` the link compares each enrolled project's local refs with the server's `heads`, per thread:
+
+- The server has no head and the local tip's `Baton-Machine` is this machine, or the server head's owner is this machine and differs from the local tip: push. The turns the server lacks go oldest first, in batches of at most 4 MiB, as objects and then `advance`. A `need` is answered with the objects it lists and the same `advance`, at most 3 times per advance. A `stale` takes the server's `current` as the new base and is retried at most twice. A `stale` whose `current` is the pushed tip is a success whose answer was lost. Any other refusal is logged with its `detail` and that tip is not sent again until a newer turn exists.
+- The server head's owner is another machine and the local tip differs: follow. The objects of the new tip arrive ahead of `moved` when small, and the rest are asked for with `want`, one round per missing layer. The turns are stored and the local ref moves only to a tip that continues the local one. Anything else is logged as `sync: not following <thread>: <why>` and left alone.
+- A new local turn on a thread whose server head belongs to another machine is not pushed. The daemon logs `sync: <thread> belongs to <owner>; its turns recorded here stay on this machine`, so an honest client is never refused with `not_owner`. The server hands a thread over only when an operator points its ref at another machine's turn.
+
+Pushes and follows share the one connection and the daemon's own writer tasks, so the path from hook to a second machine is local IPC, commit, `advance`, server fan-out, and the follower's store, with no polling between the machines.
+
 ## Plug-ins
 
-Every plug-in is a `CommandSpec { command: Vec<String>, timeout }`, called with one JSON document on stdin and read as one JSON document from stdout. Timeout, non-zero exit, or unreadable output means fail open for classify, decide, and notify, and fail closed for auth.
+Every plug-in is a `CommandSpec { command: Vec<String>, timeout }`, called with one JSON document on stdin and read as one JSON document from stdout. Timeout, non-zero exit, or unreadable output means fail open for classify, decide, and notify, and fail closed for auth. The timeout covers the whole call, from spawn until the output is read, not only until the command exits. The command runs in its own process group (unix) or Job Object (Windows), and the whole tree is killed when the call ends, so a grandchild that keeps stdout open cannot hold the caller past the deadline or outlive the call.
 
 | Slot | Input | Output | Default |
 |---|---|---|---|
@@ -161,7 +213,9 @@ Verdicts never rewrite a turn commit. They are stored on `refs/baton-verdict/<tu
 
 ## Verification
 
-`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, real runs of the binaries, measurement tools under `tools/`, and end-to-end scenarios under `e2e/` that drive the real binaries. No unit tests and no CI workflows.
+`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, real runs of the binaries, measurement tools under `tools/`, and end-to-end scenarios under `e2e/` that drive the real binaries: `e2e/local.sh` for capture and `e2e/sync.sh` for the server, the daemon link, `pull`, `follow` and the latency measurement. No unit tests and no CI workflows.
+
+`e2e/sync.sh` starts real `baton serve` and `baton daemon` processes under a temp dir, each machine with its own `BATON_HOME` and its own clone, on loopback ports from `BATON_E2E_PORT` (default 47880). It never reads or writes the user's real baton dirs, and a final scenario checks that they are untouched.
 
 ## Decisions
 
@@ -188,7 +242,26 @@ Latency from `e2e/local.sh`, 100 turns of three edited files on the 7,384-file I
 | of which the hook process, spawn to exit | 33.2 ms | 47.9 ms |
 | of which hook exit to ref moved | 21.9 ms | 31.2 ms |
 
-Inside the daemon the median turn takes 3.5 ms to sync, 0.3 ms to commit, 0.2 ms to move the ref, and 3.9 ms in all. A target of 50 ms from hook call to the ref visible on a second machine cannot be judged from this run: p50 on one machine is already 58 ms, and about 33 ms of it is the hook process as Git Bash starts it, and the rest is the 5 ms quiescence wait, the daemon's 4 ms, and the script's polling of the ref file. This slice has no network, so the second-machine figure belongs to the sync slice.
+Inside the daemon the median turn takes 3.5 ms to sync, 0.3 ms to commit, 0.2 ms to move the ref, and 3.9 ms in all.
+
+### Sync latency
+
+The target is under 50 ms from hook call on one machine to the ref being stored on a second. `e2e/sync.sh` measures it with a real server and two daemons on one Windows host, the large tree enrolled on both, 100 turns of three edited files, each timed from just before `baton hook claude` is started in Git Bash. Every daemon and the server stamp their log lines with unix microseconds, so one timeline spans the processes and the segments below are read from the logs. The ref in B's side repo is the finish line: B's log says when it was stored, and a poller in bash notices it later.
+
+| Segment | p50 | p95 | max |
+|---|---|---|---|
+| Hook call to B's ref stored | 54.8 ms | 57.7 ms | 173.0 ms |
+| of which the hook process, spawn to exit | 36.3 ms | 49.5 ms | 167.7 ms |
+| of which hook exit to B's ref stored | 15.1 ms | 21.0 ms | 22.4 ms |
+| A's daemon, hook exit to push sent | 10.5 ms | 16.3 ms | 17.7 ms |
+| server, push sent to advance done | 2.4 ms | 3.0 ms | 3.4 ms |
+| B's daemon, advance done to ref stored | 2.4 ms | 3.0 ms | 3.5 ms |
+
+The 50 ms target is not met when the hook is started from Git Bash (measured): p50 is 54.8 ms and p95 is 57.7 ms. A hook run with a payload that names no enrolled worktree, 30 times the same way, takes a median 36.9 ms and 49.6 ms at p95 (measured), so the process start accounts for about two thirds of the total. From hook exit to the ref stored on B the figure is 15.1 ms at p50 and 21.0 ms at p95 (measured). The `tools/bench` spawn-to-frame figure of 5.5 ms puts a hook that an agent starts directly near 21 ms at p50 (inferred). No agent started the hook in either run, so whether the target holds in use is not measured. The A-side 10.5 ms includes the 5 ms quiescence wait that the Decisions table explains.
+
+A poller in bash saw the ref a median 13.5 ms after B stored it, so the table reads B's log and not the poller.
+
+A burst of 30 threads, one turn each at 100 ms spacing, takes a median 11.6 ms and at most 15.5 ms from the turn being recorded on A to being stored on B (measured). That is the 30-agent case at a lower rate than 30 hooks at once. The first upload of the 7,384-file tree took 5.1 s (measured).
 
 ### Behavior fixed by this slice
 
@@ -199,8 +272,36 @@ Inside the daemon the median turn takes 3.5 ms to sync, 0.3 ms to commit, 0.2 ms
 - The writer removes stale ref `.lock` files left in a side repo by a killed daemon when it starts. `e2e/local.sh` kills the daemon during a 60 MB write five times and checks that `fsck` passes, no lock is left, and the restarted daemon captures the file correctly.
 - A non-hook, non-daemon command starts the daemon when it is absent, with its standard handles closed, so `$(baton status)` in a shell returns.
 
+### Behavior fixed by the sync slice
+
+- `pull` makes a worktree with `git worktree add --detach <dir> <Baton-Base of the tip>` and fills it with the tip's tree. It fails and says to run `git fetch` when the base commit is not in the repository, and when the thread began in a repository with no commit. The default directory is next to the repository, named `<repo>-<first 8 characters of the thread>`. Files over the size limit (`Baton-Skipped`) keep the git version. A path that `apply_tree` refuses to overwrite is kept and listed, and the command exits 1.
+- `follow <thread>` prints each new turn of a thread as it arrives. With `--into <worktree>` it also applies the turn there, but only into a worktree `baton pull` created on this machine (recorded in `pulled.json` in the data dir, by resolved path); any other directory, a path under `.git` included, is refused before anything is read or written. A path is changed or removed only when it still equals the previous turn's content, so an edit made in that worktree is kept and reported, never overwritten. A history that was replaced (the new tip does not descend from the last one seen) is announced and applied as one step from what the directory holds.
+- Both read the local side repo. The daemon's link keeps it current, so `pull` and `follow` need no connection of their own. `follow` polls the thread's ref every 50 ms.
+- The server derives a thread's owner from its tip, and a daemon never pushes a thread another machine owns (see Server and Daemon link).
+- A server `refused` carries an optional `detail`, a short sentence that the daemon puts in its log.
+- The daemon and the server stamp each log line with Unix seconds and microseconds, which is what makes the latency table above readable from the logs of several processes.
+
 ### Differences from the sections above
 
 - Control commands share the hook's endpoint through a second frame type, `BTC1`, rather than listening on another.
-- `pull`, `follow`, `ask`, `serve`, and `admin` are not in this slice, nor are the other agent adapters. Only `claude` is.
+- `ask` is not in this slice, nor are the other agent adapters. Only `claude` is.
 - The state of each worktree's stat cache and current tree is saved to `<data>/worktrees/<hash>.json` after each turn and after the baseline. It is a mirror of the side repo, so a lost or unreadable file costs one rescan, not data.
+
+### Differences from the sections above, sync slice
+
+- The owner of a thread is the `Baton-Machine` trailer of its tip. This file and `protocol.md` said `threads.owner` is set by the first authenticated push. That would make SQLite authoritative for something a bare repo already records, against "SQLite is authoritative only for devices". The code follows the repo, and both documents now say so.
+- `apply_tree` in `baton-core` did not exist. `rewind --apply`, `pull` and `follow --into` need one routine that writes a tree into a directory without overwriting a file that differs from what baton last put there, so it was added, with the two guards `Fresh` (a new worktree) and `Holds` (a worktree that already has content).
+- `objects_sent` carries the server's own transfer number, not the client's `want` number. A client pairs replies with `want`s by order. `protocol.md` says so.
+- `refused` has an optional `detail`.
+- The `[server]` section of the user config is read when the daemon starts. A change needs a restart.
+- Tailscale and mTLS auth examples under `contrib/` are not in this slice.
+
+### Known limits
+
+These are chosen limits, not open bugs. Each says what is not covered and what bounds it.
+
+- The 128-connection handshake pool is global. A host that opens 128 silent sockets holds every place for up to 10 s, and a new connection in that window is dropped at accept. There is no per-address limit, so an operator who needs one puts a firewall or a proxy in front.
+- A session authenticated by a command provider is not asked again. Revoking such an identity is the provider's job and takes effect at the identity's next connect. Token auth is checked every 2 s.
+- The send timeout cuts a client that reads nothing for 30 s. A client that reads a few bytes a second keeps its session.
+- The command provider's tree is killed through the process group (unix) or the Job Object (windows). A descendant that leaves the group with `setsid`, or breaks away from the job, outlives the kill. It no longer delays or changes the verdict.
+- A directory named `pwn/` that holds files named `HEAD`, `config` and `hooks` is an ordinary tree to git and to baton. It is stored and written as files. It acts like a repository only if the user enters it and runs git there, as with any repository's contents.

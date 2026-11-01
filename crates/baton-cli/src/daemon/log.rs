@@ -6,7 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_BYTES: u64 = 5 * 1024 * 1024;
 
-/// A line-per-event log file. The daemon has no terminal, so this is how it says anything.
+/// A line-per-event log file. The daemon has no terminal, so this is how it says anything. Lines are
+/// stamped with Unix time in microseconds so a run's logs from several processes share one timeline.
 pub struct Log(Mutex<File>);
 
 impl Log {
@@ -31,9 +32,9 @@ impl Log {
         if let Ok(mut file) = self.0.lock() {
             let _ = writeln!(
                 file,
-                "{}.{:03} {message}",
+                "{}.{:06} {message}",
                 now.as_secs(),
-                now.subsec_millis()
+                now.subsec_micros()
             );
         }
     }

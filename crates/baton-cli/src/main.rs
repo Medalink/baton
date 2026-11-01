@@ -4,9 +4,12 @@ mod control;
 mod daemon;
 mod endpoint;
 mod hook;
+mod pull;
+mod serve;
 mod timefmt;
 
 use clap::{Parser, Subcommand};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -57,6 +60,69 @@ enum Command {
     },
     /// Show the daemon and the enrolled worktrees.
     Status,
+    /// Make a worktree here holding a thread's latest turn, for example one another machine recorded.
+    Pull {
+        thread: String,
+        /// Where to create it. Default: next to this repository, named after it and the thread.
+        #[arg(long)]
+        into: Option<PathBuf>,
+    },
+    /// Print each new turn of a thread as it arrives. With --into, apply it to that worktree too.
+    Follow {
+        thread: String,
+        /// A worktree made by `baton pull`. Paths with local edits are kept as they are.
+        #[arg(long)]
+        into: Option<PathBuf>,
+    },
+    /// Run the sync server.
+    Serve {
+        /// Where projects and the device list live. Default: `server` under baton's data dir.
+        #[arg(long)]
+        data: Option<PathBuf>,
+        #[arg(long, default_value = "127.0.0.1:7878")]
+        listen: SocketAddr,
+        /// Serve `wss://` with this certificate chain (PEM). Needs --tls-key.
+        #[arg(long)]
+        tls_cert: Option<PathBuf>,
+        #[arg(long)]
+        tls_key: Option<PathBuf>,
+        /// Log every advance and fan-out with its timing.
+        #[arg(long)]
+        trace: bool,
+    },
+    /// Manage the sync server's devices and index. Works on the data dir, with the server up or down.
+    Admin {
+        #[arg(long, global = true)]
+        data: Option<PathBuf>,
+        #[command(subcommand)]
+        command: AdminCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdminCommand {
+    /// Add, list or revoke the machines allowed to connect.
+    Device {
+        #[command(subcommand)]
+        command: DeviceCommand,
+    },
+    /// Rebuild the project and thread index from the refs in the repos.
+    Reindex,
+    /// List every thread the server holds.
+    Threads,
+}
+
+#[derive(Subcommand)]
+enum DeviceCommand {
+    /// Create a device for a machine and print its token once.
+    Add {
+        name: String,
+    },
+    List,
+    /// Revoke every active device of a machine.
+    Revoke {
+        name: String,
+    },
 }
 
 fn main() {
@@ -92,6 +158,30 @@ fn main() {
             apply,
         } => commands::rewind(&turn, thread.as_deref(), apply),
         Command::Status => commands::status(),
+        Command::Pull { thread, into } => pull::pull(&thread, into.as_deref()),
+        Command::Follow { thread, into } => pull::follow(&thread, into.as_deref()),
+        Command::Serve {
+            data,
+            listen,
+            tls_cert,
+            tls_key,
+            trace,
+        } => serve::serve(serve::ServeArgs {
+            data,
+            listen,
+            tls_cert,
+            tls_key,
+            trace,
+        }),
+        Command::Admin { data, command } => match command {
+            AdminCommand::Device { command } => match command {
+                DeviceCommand::Add { name } => serve::device_add(data, &name),
+                DeviceCommand::List => serve::device_list(data),
+                DeviceCommand::Revoke { name } => serve::device_revoke(data, &name),
+            },
+            AdminCommand::Reindex => serve::reindex(data),
+            AdminCommand::Threads => serve::threads(data),
+        },
     };
     if let Err(e) = result {
         eprintln!("baton: {e:#}");

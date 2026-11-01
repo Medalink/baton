@@ -7,3 +7,17 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+anyhow = "1"
+baton-core = { path = "../baton-core" }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+getrandom = "0.4"
+rusqlite = { version = "0.41", features = ["bundled"] }
+rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros", "signal"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-tungstenite = "0.30"
+toml = "0.9"
