@@ -140,7 +140,7 @@ Baton-Model: <model, may be absent>
 Baton-Machine: <machine id>
 Baton-Base: <the worktree's HEAD sha when the turn was taken>
 Baton-Check: <name>=<exit code>      zero or more
-Baton-Skipped: <path>                zero or more, files over the size limit
+Baton-Skipped: <path>                zero or more: files over the size limit, and untracked files with a secret-like name
 ```
 
 A thread's first turn has no parent. Each later turn's parent is the thread's previous turn. Author and committer are `baton <baton@localhost>`.

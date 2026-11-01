@@ -13,6 +13,7 @@ mod redact;
 mod rewind;
 mod rules;
 mod schema;
+mod secret_names;
 mod store;
 mod turn;
 mod turndoc;

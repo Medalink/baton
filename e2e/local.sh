@@ -334,9 +334,9 @@ lacks "a *.log file is not stored" "$tree" "debug.log"
 section_end
 
 section "redaction"
-printf 'AWS_KEY=%s\nDB=%s\nshort=abc\n' "$SECRET_KEY" "$SECRET_LITERAL" >"$REPO/notes.env"
+printf 'AWS_KEY=%s\nDB=%s\nshort=abc\n' "$SECRET_KEY" "$SECRET_LITERAL" >"$REPO/notes.cfg"
 (cd "$REPO" && "$BIN" turn --thread sess-1 --message "added key $SECRET_KEY and $SECRET_LITERAL" --model "claude-$SECRET_KEY" >/dev/null 2>&1)
-blob=$(sgit cat-file -p refs/baton/sess-1:notes.env)
+blob=$(sgit cat-file -p refs/baton/sess-1:notes.cfg)
 lacks "the AWS key is not in the blob" "$blob" "$SECRET_KEY"
 lacks "the value-file literal is not in the blob" "$blob" "$SECRET_LITERAL"
 contains "the blob carries a marker for the built-in rule" "$blob" "[baton:redacted:aws-access-key]"
@@ -681,7 +681,7 @@ J="$TMP/redj"
 mkmin "$J" redj
 "$BIN" enroll "$(wp "$J")" >/dev/null 2>&1
 SIDE=$(side_of redj)
-cat >"$J/.env" <<'EOT'
+cat >"$J/app.cfg" <<'EOT'
 DB_PASSWORD="my secret passphrase here"
 API_KEY='abc def ghi jkl mno'
 DATABASE_URL2=postgres://user:sec'ret+pass/word@db.example.com/app
@@ -690,7 +690,7 @@ DATABASE_URL4=postgres://:empty-user-pass/word+x@db.example.com/app
 EOT
 sleep 0.4
 turn_in "$J" j1 "quoted and odd URL secrets" >/dev/null
-env_blob=$(blob_of j1 .env)
+env_blob=$(blob_of j1 app.cfg)
 contains "a double-quoted value with spaces is cut out whole" "$env_blob" 'DB_PASSWORD="[baton:redacted:assigned-secret]"'
 contains "a single-quoted value with spaces is cut out whole" "$env_blob" "API_KEY='[baton:redacted:assigned-secret]'"
 contains "a URL password holding a quote" "$env_blob" 'DATABASE_URL2=postgres://user:[baton:redacted:url-password]@db.example.com/app'
@@ -988,6 +988,80 @@ if turn_lands m2 "$L" lm; then ok "the worktree that was enrolled by itself is s
 out=$("$BIN" unenroll --repo "$L" 2>&1)
 contains "unenrolling again says it was not enrolled" "$out" "was not enrolled"
 "$BIN" unenroll "$(wp "$L")" >/dev/null 2>&1
+section_end
+
+SIDE=$(side_of widgets)
+
+section "L. untracked files named like secrets are left out"
+L="$TMP/secl"
+mkmin "$L" secl
+mkdir -p "$L/sub" "$L/keys"
+printf 'TRACKED=1
+' >"$L/sub/.env"
+printf 'tracked bare value
+' >"$L/keys/tracked-password"
+git -C "$L" add -A >/dev/null 2>&1
+git -C "$L" commit -q -m "tracked secret-named files"
+BARE="Zq7-vK2pN9xLw4sRt8YmB3cHd"
+eq "the bare value is 25 bytes" 25 "${#BARE}"
+mkdir -p "$L/.baton" "$L/opted" "$L/src"
+printf '[snapshot]
+store_secret_named = ["opted"]
+' >"$L/.baton/config.toml"
+user_config '[snapshot]' 'store_secret_named = ["user-opted.pem"]'
+printf '%s' "$BARE" >"$L/keys/console-password"
+printf 'PLAIN=value
+' >"$L/.env"
+printf 'PLAIN=
+' >"$L/.env.example"
+printf 'bare key material
+' >"$L/id_rsa"
+printf 'public half
+' >"$L/id_rsa.pub"
+printf 'repo opted in
+' >"$L/opted/password.txt"
+printf 'user opted in
+' >"$L/user-opted.pem"
+printf 'fn reset() {}
+' >"$L/src/password_reset.rs"
+printf 'mod parse;
+' >"$L/keys/mod.rs"
+"$BIN" enroll "$(wp "$L")" >/dev/null 2>&1
+SIDE=$(side_of secl)
+turn_in "$L" l1 "first" >/dev/null
+tree=$(tree_of l1)
+lacks "an untracked keys/console-password is not stored" "$tree" "keys/console-password"
+lacks "an untracked .env is not stored" "$tree" "
+.env
+"
+lacks "an untracked id_rsa is not stored" "$tree" "
+id_rsa
+"
+contains "a tracked sub/.env is stored" "$tree" "sub/.env"
+contains "a tracked file under keys/ with a password name is stored" "$tree" "keys/tracked-password"
+contains ".env.example is stored" "$tree" ".env.example"
+contains "id_rsa.pub is stored" "$tree" "id_rsa.pub"
+contains "a repo store_secret_named opts a directory back in" "$tree" "opted/password.txt"
+contains "a user store_secret_named opts a file back in" "$tree" "user-opted.pem"
+contains "an untracked password_reset.rs is stored" "$tree" "src/password_reset.rs"
+contains "an untracked source file under keys/ is stored" "$tree" "keys/mod.rs"
+msg=$(sgit cat-file commit refs/baton/l1)
+contains "Baton-Skipped names keys/console-password" "$msg" "Baton-Skipped: keys/console-password"
+contains "Baton-Skipped names .env" "$msg" "Baton-Skipped: .env"
+contains "Baton-Skipped names id_rsa" "$msg" "Baton-Skipped: id_rsa"
+lacks "Baton-Skipped does not name a stored file" "$msg" "Baton-Skipped: sub/.env"
+sgit cat-file --batch-all-objects --batch >"$TMP/objects.dump"
+check "no object in the side repo holds the bare value" bash -c '! grep -aq -e "$0" "$1"' "$BARE" "$TMP/objects.dump"
+rm -f "$TMP/objects.dump"
+printf 'more
+' >>"$L/a.txt"
+turn_in "$L" l2 "second" >/dev/null
+daemon_log=$(cat "$BATON_HOME/data/daemon.log")
+contains "the log names the skipped path and the rule" "$daemon_log" "keys/console-password not stored: untracked, and its name looks like a secret's (matches *password*)"
+eq "the log says it once across two turns" 1 "$(grep -c 'keys/console-password not stored' <<<"$daemon_log" | tr -d ' ')"
+contains "the second turn lists it too" "$(sgit cat-file commit refs/baton/l2)" "Baton-Skipped: keys/console-password"
+"$BIN" unenroll "$(wp "$L")" >/dev/null 2>&1
+user_config
 section_end
 
 SIDE=$(side_of widgets)

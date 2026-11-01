@@ -136,6 +136,9 @@ enum SkipKind {
     Size,
     /// The path itself holds a secret, so it cannot be named in a tree or a trailer. Never saved to disk.
     Name,
+    /// Untracked, and the name looks like a secret's. Holds the built-in rule that matched. Not saved: the
+    /// next scan finds the file again and says the same.
+    Secret(&'static str),
 }
 
 struct Skipped {
@@ -206,7 +209,7 @@ pub struct Worktree {
     /// Keyed by `Case::key`.
     tracked: BTreeMap<String, Tracked>,
     skipped: BTreeMap<String, Skipped>,
-    /// What loading the policy ignored, until `take_notices` hands it to the log.
+    /// What loading the policy ignored and which paths it newly left out, until `take_notices` hands it to the log.
     notices: Vec<String>,
     tree: TreeId,
     state_file: PathBuf,
@@ -230,6 +233,7 @@ fn mtime_ns(meta: &Metadata) -> i64 {
 /// ignore files live outside the worktree, so no watcher sees them change; they are read on every call.
 fn fingerprint(root: &Path, dirs: &Dirs, settings: &Settings, policy: &StorePolicy) -> String {
     let mut bytes = Vec::new();
+    bytes.extend_from_slice(crate::secret_names::describe().as_bytes());
     for (name, pattern) in crate::redact::BUILTIN {
         bytes.extend_from_slice(format!("{name}={pattern}\n").as_bytes());
     }
@@ -420,7 +424,9 @@ impl Worktree {
             .skipped
             .values()
             .filter_map(|Skipped { path, why }| match why {
-                SkipKind::Size => RelPath::parse(path).ok().map(|p| SkippedPath::of(&p)),
+                SkipKind::Size | SkipKind::Secret(_) => {
+                    RelPath::parse(path).ok().map(|p| SkippedPath::of(&p))
+                }
                 SkipKind::Name => {
                     let label = self.policy.redact_text(path);
                     (label != *path)
@@ -880,6 +886,13 @@ impl Worktree {
             plan.updates.push(skip(SkipKind::Name));
             return Ok(0);
         }
+        if !self.head_files.contains(spelling)
+            && let Some(rule) = self.policy.secret_named(spelling)
+        {
+            self.forget(key, plan);
+            plan.updates.push(skip(SkipKind::Secret(rule)));
+            return Ok(0);
+        }
         if self.policy.exceeds_size_limit(meta.len()) {
             self.forget(key, plan);
             plan.updates.push(skip(SkipKind::Size));
@@ -972,6 +985,17 @@ impl Worktree {
                     self.tracked.remove(&key);
                 }
                 Update::Skip(key, skipped) => {
+                    if let SkipKind::Secret(rule) = skipped.why
+                        && self
+                            .skipped
+                            .get(&key)
+                            .is_none_or(|old| old.why != skipped.why)
+                    {
+                        self.notices.push(format!(
+                            "{} not stored: untracked, and its name looks like a secret's (matches {rule});                              to store it, list it in [snapshot] store_secret_named",
+                            skipped.path
+                        ));
+                    }
                     self.skipped.insert(key, skipped);
                 }
                 Update::Unskip(key) => {

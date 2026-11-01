@@ -26,6 +26,8 @@ struct RawSnapshot {
     exclude: Vec<String>,
     #[serde(default)]
     store_whole: Vec<String>,
+    #[serde(default)]
+    store_secret_named: Vec<String>,
     max_file_bytes: Option<u64>,
 }
 
@@ -113,6 +115,7 @@ struct RawRepo {
 pub struct SnapshotConfig {
     pub exclude: Vec<String>,
     pub store_whole: Vec<String>,
+    pub store_secret_named: Vec<String>,
     pub max_file_bytes: Option<u64>,
 }
 
@@ -121,6 +124,7 @@ impl From<RawSnapshot> for SnapshotConfig {
         Self {
             exclude: raw.exclude,
             store_whole: raw.store_whole,
+            store_secret_named: raw.store_secret_named,
             max_file_bytes: raw.max_file_bytes,
         }
     }
@@ -378,12 +382,15 @@ impl RepoConfig {
 
 /// The user and repo configs merged: exclusions add up, the size limit is the smaller, and only the user's
 /// `store_whole` counts. A repo config arrives with `git clone`, so it may add redaction and take files
-/// out of the store, never put a file in unredacted.
+/// out of the store, never put a file in unredacted. `store_secret_named` is the one list both may extend:
+/// a file it brings back still goes through every redaction rule.
 #[derive(Clone, Debug)]
 pub struct Settings {
     pub machine: MachineId,
     pub exclude: Vec<String>,
     pub store_whole: Vec<String>,
+    /// Globs of untracked files to store although their names look like secrets.
+    pub store_secret_named: Vec<String>,
     pub max_file_bytes: u64,
     pub rules: Vec<RuleSpec>,
     pub value_files: Vec<PathBuf>,
@@ -400,6 +407,13 @@ impl Settings {
             .map(|s| (*s).to_owned())
             .collect();
         store_whole.extend(user.snapshot.store_whole.iter().cloned());
+        let store_secret_named = user
+            .snapshot
+            .store_secret_named
+            .iter()
+            .chain(&repo.snapshot.store_secret_named)
+            .cloned()
+            .collect();
         let mut notices = repo.notices.clone();
         if !repo.snapshot.store_whole.is_empty() {
             notices.push(
@@ -413,6 +427,7 @@ impl Settings {
             machine: user.machine.clone().unwrap_or_else(MachineId::from_host),
             exclude,
             store_whole,
+            store_secret_named,
             max_file_bytes: limits
                 .into_iter()
                 .flatten()

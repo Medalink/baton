@@ -238,8 +238,20 @@ pub fn follow(thread: &str, into: Option<&Path>) -> Result<()> {
         for turn in steps {
             describe(&here.side, turn)?;
             if let (Some(dir), Some(from)) = (into, held) {
-                let applied = apply_tree(&here.side, dir, turn.tree, &Guard::Holds(from))
-                    .map_err(|e| anyhow!("{e}"))?;
+                let keep: HashSet<String> = turn
+                    .turn
+                    .draft
+                    .skipped
+                    .iter()
+                    .map(|p| p.as_str().to_owned())
+                    .collect();
+                let applied = apply_tree(
+                    &here.side,
+                    dir,
+                    turn.tree,
+                    &Guard::Holds { from, keep: &keep },
+                )
+                .map_err(|e| anyhow!("{e}"))?;
                 report(&applied);
             }
             held = Some(turn.tree);

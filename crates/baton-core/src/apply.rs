@@ -21,9 +21,14 @@ pub enum Guard<'a> {
         git_paths: &'a [String],
         keep: &'a HashSet<String>,
     },
-    /// The directory holds this tree, as an earlier apply left it. Only paths that differ between it and
-    /// the new tree are touched, and only when they still hold what that tree had.
-    Holds(TreeId),
+    /// The directory holds `from`, as an earlier apply left it. Only paths that differ between it and the
+    /// new tree are touched, and only when they still hold what `from` had. A path that left the tree
+    /// because the sender stopped storing it (`keep`, the new turn's `Baton-Skipped`) is not removed: the
+    /// file still exists over there, it is just no longer stored.
+    Holds {
+        from: TreeId,
+        keep: &'a HashSet<String>,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -82,13 +87,14 @@ pub fn apply_tree(side: &SideRepo, root: &Path, to: TreeId, guard: &Guard<'_>) -
                 }
             }
         }
-        Guard::Holds(from) => {
+        Guard::Holds { from, keep } => {
             for change in side.diff_trees(Some(*from), to)? {
                 let old = side.entry_at(*from, &change.path)?.map(|(_, blob)| blob);
                 match side.entry_at(to, &change.path)? {
                     Some((kind, blob)) => {
                         place(side, root, &change.path, kind, blob, Some(old), &mut out)?;
                     }
+                    None if keep.contains(change.path.as_str()) => {}
                     None => remove(root, &change.path, Some(old), &mut out)?,
                 }
             }
