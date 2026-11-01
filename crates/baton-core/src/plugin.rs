@@ -77,13 +77,21 @@ fn run_raw(spec: &CommandSpec, payload: Vec<u8>) -> Result<Vec<u8>> {
     spec.check()?;
     let program = &spec.command[0];
     let deadline = Instant::now() + Duration::from_millis(spec.timeout_ms);
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(&spec.command[1..])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ctx(|| format!("starting {program}"))?;
+        .stderr(Stdio::null());
+    // The daemon has no console, so a console program would be given a window of its own, and a
+    // program in a console can die from a Ctrl+C aimed at another process there (status 0xc000013a).
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        command.creation_flags(DETACHED_PROCESS);
+    }
+    let mut child = command.spawn().ctx(|| format!("starting {program}"))?;
     let mut stdin = child.stdin.take().expect("stdin is piped");
     std::thread::spawn(move || {
         let _ = stdin.write_all(&payload);
