@@ -15,7 +15,6 @@ use crate::store::{BlobPayload, TreeEdit};
 use crate::turn::SkippedPath;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::ffi::OsString;
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -73,6 +72,8 @@ impl DirtySet {
 
 #[derive(Clone, Debug)]
 struct Tracked {
+    /// The path the tree holds the file under: the disk's spelling when it was last stored.
+    path: RelPath,
     kind: FileKind,
     blob: BlobId,
     size: u64,
@@ -137,11 +138,29 @@ enum SkipKind {
     Name,
 }
 
+struct Skipped {
+    path: String,
+    why: SkipKind,
+}
+
+/// Every update names a file by its key (`Case::key`), so two spellings of one file are one entry.
 enum Update {
     Set(String, Tracked),
     Clear(String),
-    Skip(String, SkipKind),
+    Skip(String, Skipped),
     Unskip(String),
+}
+
+/// A dirty path as `prepare` resolved it against the disk.
+struct Pending {
+    /// What the dirty set held, to put back if the plan is abandoned.
+    taken: String,
+    /// The path spelled as the disk spells it; as given when nothing is there.
+    spelling: String,
+    key: String,
+    on_disk: bool,
+    /// False for a path whose file an earlier one in the batch already named under another spelling.
+    first: bool,
 }
 
 /// What one `prepare` call decided. Apply `blobs` then `edits` to the side repo, then call `accept`;
@@ -184,8 +203,9 @@ pub struct Worktree {
     policy_fingerprint: String,
     /// The files in HEAD as of the last `prepare`, to notice which ones HEAD started or stopped tracking.
     head_files: Arc<TrackedSet>,
+    /// Keyed by `Case::key`.
     tracked: BTreeMap<String, Tracked>,
-    skipped: BTreeMap<String, SkipKind>,
+    skipped: BTreeMap<String, Skipped>,
     /// What loading the policy ignored, until `take_notices` hands it to the log.
     notices: Vec<String>,
     tree: TreeId,
@@ -344,8 +364,8 @@ impl Worktree {
     pub fn skipped(&self) -> Vec<SkippedPath> {
         let labels: BTreeSet<SkippedPath> = self
             .skipped
-            .iter()
-            .filter_map(|(path, why)| match why {
+            .values()
+            .filter_map(|Skipped { path, why }| match why {
                 SkipKind::Size => RelPath::parse(path).ok().map(|p| SkippedPath::of(&p)),
                 SkipKind::Name => {
                     let label = self.policy.redact_text(path);
@@ -384,26 +404,41 @@ impl Worktree {
         {
             return;
         }
+        let case = self.policy.case();
+        let mut tracked = BTreeMap::new();
+        for e in saved.entries {
+            let Ok(path) = RelPath::parse(&e.path) else {
+                continue;
+            };
+            let entry = Tracked {
+                kind: e.kind.into(),
+                blob: e.blob,
+                size: e.size,
+                mtime_ns: e.mtime_ns,
+                racy: e.racy,
+                path,
+            };
+            // Two spellings of one file mean the mirror predates this repo folding case, and the tree
+            // holds both; keeping one would leave the other in it for good.
+            if tracked
+                .insert(case.key(entry.path.as_str()), entry)
+                .is_some()
+            {
+                return;
+            }
+        }
         self.tree = saved.tree;
-        self.tracked = saved
-            .entries
-            .into_iter()
-            .filter(|e| RelPath::parse(&e.path).is_ok())
-            .map(|e| {
-                let tracked = Tracked {
-                    kind: e.kind.into(),
-                    blob: e.blob,
-                    size: e.size,
-                    mtime_ns: e.mtime_ns,
-                    racy: e.racy,
-                };
-                (e.path, tracked)
-            })
-            .collect();
+        self.tracked = tracked;
         self.skipped = saved
             .skipped
             .into_iter()
-            .map(|p| (p, SkipKind::Size))
+            .map(|path| {
+                let skip = Skipped {
+                    path,
+                    why: SkipKind::Size,
+                };
+                (case.key(&skip.path), skip)
+            })
             .collect();
         if saved.policy != self.policy_fingerprint {
             self.invalidate();
@@ -426,9 +461,9 @@ impl Worktree {
             tree: self.tree,
             entries: self
                 .tracked
-                .iter()
-                .map(|(path, t)| SavedEntry {
-                    path: path.clone(),
+                .values()
+                .map(|t| SavedEntry {
+                    path: t.path.as_str().to_owned(),
                     kind: t.kind.into(),
                     blob: t.blob,
                     size: t.size,
@@ -438,9 +473,9 @@ impl Worktree {
                 .collect(),
             skipped: self
                 .skipped
-                .iter()
-                .filter(|(_, why)| **why == SkipKind::Size)
-                .map(|(path, _)| path.clone())
+                .values()
+                .filter(|s| s.why == SkipKind::Size)
+                .map(|s| s.path.clone())
                 .collect(),
             policy: self.policy_fingerprint.clone(),
         };
@@ -462,6 +497,12 @@ impl Worktree {
         }
         let settings = load_settings(&self.root, &self.dirs)?;
         let policy = StorePolicy::open(&self.root, &settings)?;
+        if policy.case() != self.policy.case() {
+            // The mirror's keys mean something else now, so start from an empty tree and read everything.
+            self.tracked.clear();
+            self.skipped.clear();
+            self.tree = TreeId::empty();
+        }
         self.policy_fingerprint = fingerprint(&self.root, &self.dirs, &settings, &policy);
         self.notices.extend(policy.notices().iter().cloned());
         self.settings = settings;
@@ -495,44 +536,58 @@ impl Worktree {
     /// directory walk, plus the files HEAD tracks that the walk skipped because an ignore rule matched.
     fn scan(&self, prefix: Option<&str>) -> Result<Vec<String>> {
         let mut found = self.policy.rules().walk(prefix)?;
-        let walked: HashSet<String> = found.iter().cloned().collect();
-        let below = prefix.map(|p| format!("{p}/"));
-        for (path, _) in self.policy.rules().tracked().iter() {
-            if walked.contains(path) || below.as_ref().is_some_and(|b| !path.starts_with(b)) {
+        let walked: HashSet<String> = found.iter().map(|p| self.key(p)).collect();
+        let below = prefix.map(|p| format!("{}/", self.key(p)));
+        let head = self.policy.rules().tracked();
+        let mut listings = Listings::new();
+        for (path, key) in head.iter() {
+            if below.as_ref().is_some_and(|b| !key.starts_with(b)) || walked.contains(key) {
                 continue;
             }
-            let on_disk = std::fs::symlink_metadata(self.root.join(path))
+            let Some(spelling) = self.resolve(path, &mut listings) else {
+                continue;
+            };
+            let on_disk = std::fs::symlink_metadata(self.root.join(&spelling))
                 .ok()
                 .and_then(|m| file_kind(&m));
             if on_disk.is_some() {
-                found.push(path.to_owned());
+                found.push(spelling);
             }
         }
         found.retain(|p| !self.policy.excluded_by_config(p) && RelPath::parse(p).is_ok());
         Ok(found)
     }
 
-    /// Every path whose state on disk differs from the mirror: new files, vanished files, and files whose
-    /// size or timestamp changed or that were too recent to trust when last hashed.
+    /// Every path whose state on disk differs from the mirror: new files, vanished files, files spelled
+    /// differently from how the tree holds them, and files whose size or timestamp changed or that were
+    /// too recent to trust when last hashed.
     pub fn rescan(&self) -> Result<Vec<String>> {
         let mut dirty = Vec::new();
         let mut found: HashSet<String> = HashSet::new();
         for path in self.scan(None)? {
+            let key = self.key(&path);
             let unchanged = self
                 .tracked
-                .get(&path)
-                .is_some_and(|t| self.fresh(&path, t));
+                .get(&key)
+                .is_some_and(|t| t.path.as_str() == path && self.fresh(&path, t));
             if !unchanged {
-                dirty.push(path.clone());
+                dirty.push(path);
             }
-            found.insert(path);
+            found.insert(key);
         }
-        for path in self.tracked.keys().chain(self.skipped.keys()) {
-            if !found.contains(path) {
-                dirty.push(path.clone());
+        let stored = self.tracked.iter().map(|(k, t)| (k, t.path.as_str()));
+        let skipped = self.skipped.iter().map(|(k, s)| (k, s.path.as_str()));
+        for (key, path) in stored.chain(skipped) {
+            if !found.contains(key) {
+                dirty.push(path.to_owned());
             }
         }
         Ok(dirty)
+    }
+
+    /// What identifies `path`: two spellings of one file have one key.
+    pub(crate) fn key(&self, path: &str) -> String {
+        self.policy.case().key(path)
     }
 
     fn fresh(&self, path: &str, tracked: &Tracked) -> bool {
@@ -564,8 +619,31 @@ impl Worktree {
             dirty.structural.remove(&path);
             batch.push(path);
         }
-        let asked: Vec<(&str, bool)> = batch.iter().map(|p| (p.as_str(), false)).collect();
-        let admitted = self.admits(&asked)?;
+        // Two events for one file can name it in two cases, and a stat accepts either: spell each path as
+        // the disk does and keep one per file.
+        let mut listings = Listings::new();
+        let mut named: HashSet<String> = HashSet::new();
+        let pending: Vec<Pending> = batch
+            .into_iter()
+            .map(|taken| {
+                let found = self.resolve(&taken, &mut listings);
+                let spelling = found.clone().unwrap_or_else(|| taken.clone());
+                let key = self.key(&spelling);
+                Pending {
+                    first: named.insert(key.clone()),
+                    on_disk: found.is_some(),
+                    taken,
+                    spelling,
+                    key,
+                }
+            })
+            .collect();
+        let asked: Vec<(&str, bool)> = pending
+            .iter()
+            .filter(|p| p.first)
+            .map(|p| (p.spelling.as_str(), false))
+            .collect();
+        let mut admitted = self.admits(&asked)?.into_iter();
 
         let mut plan = Plan {
             blobs: Vec::new(),
@@ -576,21 +654,18 @@ impl Worktree {
         let mut queued: HashSet<BlobId> = HashSet::new();
         let mut bytes = 0u64;
         let mut nested: HashMap<String, bool> = HashMap::new();
-        let mut listings: Listings = HashMap::new();
-        let mut rest = batch.into_iter().zip(admitted);
-        for (path, admitted) in rest.by_ref() {
-            plan.taken.push(path.clone());
-            let ctx = Inspect {
-                admitted,
-                nested: &mut nested,
-                listings: &mut listings,
-            };
-            bytes += self.inspect(&path, ctx, &mut queued, &mut plan)?;
+        let mut rest = pending.into_iter();
+        for item in rest.by_ref() {
+            plan.taken.push(item.taken.clone());
+            if item.first {
+                let admitted = admitted.next().unwrap_or(false);
+                bytes += self.inspect(&item, admitted, &mut nested, &mut queued, &mut plan)?;
+            }
             if bytes >= limits.bytes {
                 break;
             }
         }
-        dirty.paths.extend(rest.map(|(path, _)| path));
+        dirty.paths.extend(rest.map(|item| item.taken));
         Ok(plan)
     }
 
@@ -615,36 +690,37 @@ impl Worktree {
             let abs = self.root.join(&dir);
             let is_dir = std::fs::symlink_metadata(&abs).is_ok_and(|m| m.is_dir());
             if !is_dir {
-                for gone in self.tracked_under(&dir) {
-                    dirty.paths.insert(gone);
-                }
+                dirty
+                    .paths
+                    .extend(self.stored_under(&dir).into_iter().map(|(_, path)| path));
                 continue;
             }
-            let found: HashSet<String> = self.scan(Some(&dir))?.into_iter().collect();
-            for gone in self
-                .tracked_under(&dir)
-                .into_iter()
-                .filter(|p| !found.contains(p))
-            {
-                dirty.paths.insert(gone);
-            }
+            let found = self.scan(Some(&dir))?;
+            let found_keys: HashSet<String> = found.iter().map(|p| self.key(p)).collect();
+            dirty.paths.extend(
+                self.stored_under(&dir)
+                    .into_iter()
+                    .filter(|(key, _)| !found_keys.contains(key))
+                    .map(|(_, path)| path),
+            );
             dirty.paths.extend(found);
         }
         Ok(())
     }
 
-    fn tracked_under(&self, dir: &str) -> Vec<String> {
-        let (from, to) = (format!("{dir}/"), format!("{dir}0"));
-        self.tracked
-            .range(from..to)
-            .map(|(p, _)| p.clone())
-            .chain(
-                self.skipped
-                    .keys()
-                    .filter(|p| p.starts_with(&format!("{dir}/")))
-                    .cloned(),
-            )
-            .collect()
+    /// `(key, path as stored)` of every file stored or skipped below `dir`.
+    fn stored_under(&self, dir: &str) -> Vec<(String, String)> {
+        let base = self.key(dir);
+        let range = format!("{base}/")..format!("{base}0");
+        let stored = self
+            .tracked
+            .range(range.clone())
+            .map(|(k, t)| (k.clone(), t.path.as_str().to_owned()));
+        let skipped = self
+            .skipped
+            .range(range)
+            .map(|(k, s)| (k.clone(), s.path.clone()));
+        stored.chain(skipped).collect()
     }
 
     fn inside_nested_repo(&self, path: &str, memo: &mut HashMap<String, bool>) -> bool {
@@ -665,111 +741,140 @@ impl Worktree {
         false
     }
 
-    /// Whether every component of `path` is spelled on disk exactly as given. On a case-insensitive
-    /// filesystem a stat of `Foo.txt` succeeds when the file is now `foo.txt`; only a directory listing
-    /// says which name it really has.
-    fn spelled_exactly(&self, path: &str, listings: &mut Listings) -> bool {
-        if !cfg!(any(windows, target_os = "macos")) {
-            return true;
+    /// The path spelled as the disk spells it, or `None` when nothing is there. A stat cannot tell: on a
+    /// case-insensitive file system it succeeds for any spelling, so the directory listings decide. When
+    /// the repo ignores case a different spelling still names the file; otherwise it names nothing.
+    fn resolve(&self, path: &str, listings: &mut Listings) -> Option<String> {
+        let fold = self.policy.case() == Case::Fold;
+        if !fold && !cfg!(any(windows, target_os = "macos")) {
+            return Some(path.to_owned());
         }
-        let mut dir = String::new();
+        let mut spelled = String::with_capacity(path.len());
         for part in path.split('/') {
-            let names = listings.entry(dir.clone()).or_insert_with(|| {
-                std::fs::read_dir(self.root.join(&dir)).ok().map(|entries| {
-                    entries
-                        .filter_map(|e| e.ok().map(|e| e.file_name()))
-                        .collect()
+            let names = listings
+                .entry(spelled.clone())
+                .or_insert_with(|| {
+                    std::fs::read_dir(self.root.join(&spelled))
+                        .ok()
+                        .map(|entries| {
+                            entries
+                                .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                                .collect()
+                        })
                 })
-            });
-            if !names
-                .as_ref()
-                .is_some_and(|names| names.contains(std::ffi::OsStr::new(part)))
-            {
-                return false;
+                .as_ref()?;
+            let name = if names.contains(part) {
+                part
+            } else if fold {
+                names.iter().find(|n| n.eq_ignore_ascii_case(part))?
+            } else {
+                return None;
+            };
+            if !spelled.is_empty() {
+                spelled.push('/');
             }
-            if !dir.is_empty() {
-                dir.push('/');
-            }
-            dir.push_str(part);
+            spelled.push_str(name);
         }
-        true
+        Some(spelled)
     }
 
     /// Decides one path. Returns the number of bytes it queued.
     fn inspect(
         &self,
-        path: &str,
-        ctx: Inspect<'_>,
+        item: &Pending,
+        admitted: bool,
+        nested: &mut HashMap<String, bool>,
         queued: &mut HashSet<BlobId>,
         plan: &mut Plan,
     ) -> Result<u64> {
-        let Inspect {
-            admitted,
-            nested,
-            listings,
-        } = ctx;
-        let Ok(rel) = RelPath::parse(path) else {
+        let Pending {
+            spelling,
+            key,
+            on_disk,
+            ..
+        } = item;
+        let Ok(rel) = RelPath::parse(spelling) else {
             return Ok(0);
         };
-        if !admitted {
-            self.forget(path, &rel, plan);
+        if !admitted || !on_disk {
+            self.forget(key, plan);
             return Ok(0);
         }
-        let tracked = self.tracked.get(path);
-        let meta = std::fs::symlink_metadata(self.root.join(path)).ok();
+        let tracked = self.tracked.get(key);
+        let meta = std::fs::symlink_metadata(self.root.join(spelling)).ok();
         let kind = meta.as_ref().and_then(file_kind);
 
         let (Some(meta), Some(kind)) = (meta, kind) else {
-            self.forget(path, &rel, plan);
+            self.forget(key, plan);
             return Ok(0);
         };
-        if !self.spelled_exactly(path, listings) || self.inside_nested_repo(path, nested) {
-            self.forget(path, &rel, plan);
+        if self.inside_nested_repo(spelling, nested) {
+            self.forget(key, plan);
             return Ok(0);
         }
-        if self.policy.holds_secret(path) {
-            self.forget(path, &rel, plan);
-            plan.updates
-                .push(Update::Skip(path.to_owned(), SkipKind::Name));
+        let skip = |why| {
+            Update::Skip(
+                key.clone(),
+                Skipped {
+                    path: spelling.clone(),
+                    why,
+                },
+            )
+        };
+        if self.policy.holds_secret(spelling) {
+            self.forget(key, plan);
+            plan.updates.push(skip(SkipKind::Name));
             return Ok(0);
         }
         if self.policy.exceeds_size_limit(meta.len()) {
-            self.forget(path, &rel, plan);
-            plan.updates
-                .push(Update::Skip(path.to_owned(), SkipKind::Size));
+            self.forget(key, plan);
+            plan.updates.push(skip(SkipKind::Size));
             return Ok(0);
         }
         let (size, mtime) = (meta.len(), mtime_ns(&meta));
-        if let Some(t) = tracked
-            && !t.racy
-            && t.size == size
-            && t.mtime_ns == mtime
-            && t.kind == kind
-        {
+        let respelled = tracked.is_some_and(|t| t.path != rel);
+        let same_stat =
+            tracked.filter(|t| !t.racy && t.size == size && t.mtime_ns == mtime && t.kind == kind);
+        if same_stat.is_some() && !respelled {
             return Ok(0);
         }
-        let Some(raw) = read_content(&self.root.join(path), kind) else {
-            // Vanished between the stat and the read, or unreadable: leave what is stored alone.
-            return Ok(0);
+        // A rename of an unchanged file reuses the stored blob instead of reading the file again.
+        let (blob, content, racy) = match same_stat {
+            Some(t) => (t.blob, None, false),
+            None => {
+                let Some(raw) = read_content(&self.root.join(spelling), kind) else {
+                    // Vanished between the stat and the read, or unreadable: leave what is stored alone.
+                    return Ok(0);
+                };
+                let content = self.policy.prepare(&rel, raw);
+                let racy = now_ns().saturating_sub(mtime) < RACY_WINDOW_NS;
+                (hash_blob(&content), Some(content), racy)
+            }
         };
-        let content = self.policy.prepare(&rel, raw);
-        let blob = hash_blob(&content);
-        let racy = now_ns().saturating_sub(mtime) < RACY_WINDOW_NS;
         let entry = Tracked {
+            path: rel.clone(),
             kind,
             blob,
             size,
             mtime_ns: mtime,
             racy,
         };
-        let changed = tracked.is_none_or(|t| t.blob != blob || t.kind != kind);
+        let new_blob = tracked.is_none_or(|t| t.blob != blob);
         let mut queued_bytes = 0;
-        if changed {
+        if respelled || new_blob || tracked.is_some_and(|t| t.kind != kind) {
+            if let Some(old) = tracked.filter(|_| respelled) {
+                plan.edits.push(TreeEdit {
+                    path: old.path.clone(),
+                    to: None,
+                });
+            }
             plan.edits.push(TreeEdit {
                 path: rel,
                 to: Some((kind, blob)),
             });
-            if queued.insert(blob) {
+            if let Some(content) = content.filter(|_| new_blob)
+                && queued.insert(blob)
+            {
                 queued_bytes = content.len() as u64;
                 plan.blobs.push(BlobPayload {
                     id: blob,
@@ -777,21 +882,21 @@ impl Worktree {
                 });
             }
         }
-        plan.updates.push(Update::Set(path.to_owned(), entry));
-        plan.updates.push(Update::Unskip(path.to_owned()));
+        plan.updates.push(Update::Set(key.clone(), entry));
+        plan.updates.push(Update::Unskip(key.clone()));
         Ok(queued_bytes)
     }
 
-    fn forget(&self, path: &str, rel: &RelPath, plan: &mut Plan) {
-        if self.tracked.contains_key(path) {
+    fn forget(&self, key: &str, plan: &mut Plan) {
+        if let Some(t) = self.tracked.get(key) {
             plan.edits.push(TreeEdit {
-                path: rel.clone(),
+                path: t.path.clone(),
                 to: None,
             });
-            plan.updates.push(Update::Clear(path.to_owned()));
+            plan.updates.push(Update::Clear(key.to_owned()));
         }
-        if self.skipped.contains_key(path) {
-            plan.updates.push(Update::Unskip(path.to_owned()));
+        if self.skipped.contains_key(key) {
+            plan.updates.push(Update::Unskip(key.to_owned()));
         }
     }
 
@@ -799,17 +904,17 @@ impl Worktree {
     pub fn accept(&mut self, plan: Plan, tree: TreeId) {
         for update in plan.updates {
             match update {
-                Update::Set(path, tracked) => {
-                    self.tracked.insert(path, tracked);
+                Update::Set(key, tracked) => {
+                    self.tracked.insert(key, tracked);
                 }
-                Update::Clear(path) => {
-                    self.tracked.remove(&path);
+                Update::Clear(key) => {
+                    self.tracked.remove(&key);
                 }
-                Update::Skip(path, why) => {
-                    self.skipped.insert(path, why);
+                Update::Skip(key, skipped) => {
+                    self.skipped.insert(key, skipped);
                 }
-                Update::Unskip(path) => {
-                    self.skipped.remove(&path);
+                Update::Unskip(key) => {
+                    self.skipped.remove(&key);
                 }
             }
         }
@@ -824,13 +929,13 @@ impl Worktree {
     }
 
     pub fn tracked_paths(&self) -> impl Iterator<Item = &str> {
-        self.tracked.keys().map(String::as_str)
+        self.tracked.values().map(|t| t.path.as_str())
     }
 
     /// What the last snapshot stored for `path`. Rewind compares contents against this instead of
     /// timestamps, which cannot tell a file written twice within one tick.
     pub fn stored_blob(&self, path: &RelPath) -> Option<BlobId> {
-        self.tracked.get(path.as_str()).map(|t| t.blob)
+        self.tracked.get(&self.key(path.as_str())).map(|t| t.blob)
     }
 
     pub fn current(&self, path: &RelPath) -> Current {
@@ -855,14 +960,8 @@ pub enum Current {
     Blocked,
 }
 
-type Listings = HashMap<String, Option<HashSet<OsString>>>;
-
-/// What `prepare` learned about a path before `inspect` reads it.
-struct Inspect<'a> {
-    admitted: bool,
-    nested: &'a mut HashMap<String, bool>,
-    listings: &'a mut Listings,
-}
+/// The names in each directory already listed, by the directory's path as spelled on disk.
+type Listings = HashMap<String, Option<HashSet<String>>>;
 
 fn file_kind(meta: &Metadata) -> Option<FileKind> {
     let kind = meta.file_type();

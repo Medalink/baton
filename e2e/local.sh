@@ -718,6 +718,52 @@ else
   sleep 0.4
   turn_in "$KR" k1 "an ignore file spelled .GitIgnore" >/dev/null
   lacks "an ignore file in another case drops the file it names" "$(tree_of k1)" "sub2/f.txt"
+  KA="$TMP/casea"
+  mkmin "$KA" casea
+  mkdir -p "$KA/build"
+  printf 'build/\n' >"$KA/.gitignore"
+  printf 'forced-v1\n' >"$KA/build/Forced.o"
+  git -C "$KA" add -f .gitignore build/Forced.o >/dev/null 2>&1
+  git -C "$KA" commit -q -m "track a file below an ignored directory"
+  "$BIN" enroll "$(wp "$KA")" >/dev/null 2>&1
+  SIDE=$(side_of casea)
+  turn_in "$KA" k2 "baseline" >/dev/null
+  contains "a tracked file below an ignored directory is stored" "$(tree_of k2)" "build/Forced.o"
+  mv "$KA/build/Forced.o" "$KA/build/forced.o"
+  printf 'forced-v2\n' >"$KA/build/forced.o"
+  sleep 0.4
+  turn_in "$KA" k2 "renamed to another case, new content" >/dev/null
+  tree=$(tree_of k2)
+  contains "a case-only rename of it is stored under the new spelling" "$tree" "build/forced.o"
+  lacks "and the old spelling leaves the tree" "$tree" "build/Forced.o"
+  eq "with the new content" "forced-v2" "$(blob_of k2 build/forced.o)"
+  kill_pid "$(daemon_pid)"
+  sleep 0.5
+  mv "$KA/build/forced.o" "$KA/build/FORCED.o"
+  turn_in "$KA" k2 "renamed while the daemon was down" >/dev/null
+  tree=$(tree_of k2)
+  contains "a rename made while the daemon was down is found by the rescan" "$tree" "build/FORCED.o"
+  lacks "and the spelling it replaced leaves the tree" "$tree" "build/forced.o"
+  eq "with the content unchanged" "forced-v2" "$(blob_of k2 build/FORCED.o)"
+  check "the side repo passes fsck" sgit fsck --strict --no-dangling
+  "$BIN" unenroll "$(wp "$KA")" >/dev/null 2>&1
+  KB="$TMP/caseb"
+  mkmin "$KB" caseb
+  printf 'del1\n' >"$KB/Del.txt"
+  git -C "$KB" add -A >/dev/null 2>&1
+  git -C "$KB" commit -q -m "add Del.txt"
+  "$BIN" enroll "$(wp "$KB")" >/dev/null 2>&1
+  SIDE=$(side_of caseb)
+  turn_in "$KB" k3 "Del.txt" >/dev/null
+  mv "$KB/Del.txt" "$KB/del.txt"
+  sleep 0.4
+  turn_in "$KB" k3 "renamed to del.txt" >/dev/null
+  rm "$KB/del.txt"
+  sleep 0.4
+  out=$(cd "$KB" && "$BIN" rewind k3@1 --apply 2>&1)
+  contains "rewind refuses a file deleted under another spelling" "$out" "refuse Del.txt: deleted since the last snapshot; take a turn first"
+  check "and writes nothing" test ! -e "$KB/Del.txt"
+  "$BIN" unenroll "$(wp "$KB")" >/dev/null 2>&1
   "$BIN" unenroll "$(wp "$KR")" >/dev/null 2>&1
 fi
 section_end
