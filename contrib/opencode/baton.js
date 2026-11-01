@@ -12,6 +12,10 @@
 // Environment:
 //   BATON_BIN  the baton binary (default `baton` on PATH)
 //
+// One opencode server loads a plug-in once per directory it serves (`opencode serve --service`, which
+// `opencode run` shares, and editors' servers), and every copy sees every session's events. Each copy
+// therefore sends only the turns of sessions in its own directory, so a turn is recorded once.
+//
 // The hook runs synchronously, as Claude Code's Stop hook does: `opencode run` exits right after the turn,
 // and a child started without waiting could lose its payload. The hook only hands the payload to the
 // daemon (about 20 ms), and a 5 s limit bounds a stuck one. Nothing it does can fail the turn.
@@ -39,10 +43,11 @@ export default {
         if (model?.id) session.model = model.providerID ? `${model.providerID}/${model.id}` : model.id
         if (!ENDED.includes(event.type)) continue
         sessions.delete(id)
+        if (session.directory !== ctx.location.directory) continue
         const payload = {
           type: "session.idle",
           properties: { sessionID: id },
-          directory: session.directory ?? ctx.location.directory,
+          directory: session.directory,
           model: session.model,
           message: typeof session.message === "string" ? session.message : undefined,
         }
