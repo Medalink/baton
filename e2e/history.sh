@@ -274,7 +274,8 @@ touch "$MARK.started"
 sleep 30
 EOF
   rm -f "$MARK.started"
-  (cd "$B" && TMPDIR="$W/scratch" "$BIN" bisect plant --good 1 --bad 6 -- bash "$W/slow.sh" >"$W/int.out" 2>&1) &
+  # exec, so that $! is baton itself and the signal reaches it
+  (cd "$B" && TMPDIR="$W/scratch" exec "$BIN" bisect plant --good 1 --bad 6 -- bash "$W/slow.sh" >"$W/int.out" 2>&1) &
   pid=$!
   for _ in $(seq 1 100); do [[ -e $MARK.started ]] && break; sleep 0.1; done
   kill -INT "$pid"
