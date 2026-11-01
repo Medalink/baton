@@ -265,14 +265,17 @@ impl Walk<'_> {
             id: Oid,
             kids: std::vec::IntoIter<Oid>,
             height: usize,
+            complete: bool,
         }
         if let Some(known) = self.known_height(root) {
             return Ok(known);
         }
+        let (kids, complete) = self.child_trees(root)?;
         let mut stack = vec![Level {
             id: root,
-            kids: self.child_trees(root)?.into_iter(),
+            kids: kids.into_iter(),
             height: 0,
+            complete,
         }];
         loop {
             let top = stack
@@ -286,18 +289,22 @@ impl Walk<'_> {
                 if stack.len() > MAX_TREE_DEPTH {
                     return Err(format!("trees are nested deeper than {MAX_TREE_DEPTH}"));
                 }
-                let kids = self.child_trees(kid)?.into_iter();
+                let (kids, complete) = self.child_trees(kid)?;
                 stack.push(Level {
                     id: kid,
-                    kids,
+                    kids: kids.into_iter(),
                     height: 0,
+                    complete,
                 });
                 continue;
             }
             let level = stack.pop().expect("a level was just read");
-            self.remember_height(level.id, level.height);
+            self.remember_height(level.id, level.height, level.complete);
             match stack.last_mut() {
-                Some(parent) => parent.height = parent.height.max(level.height + 1),
+                Some(parent) => {
+                    parent.height = parent.height.max(level.height + 1);
+                    parent.complete &= level.complete;
+                }
                 None => return Ok(level.height),
             }
         }
@@ -310,14 +317,17 @@ impl Walk<'_> {
             .or_else(|| self.repo.stored_height(id))
     }
 
-    fn remember_height(&mut self, id: Oid, height: usize) {
+    /// The repo-wide cache outlives this push, so it only takes heights measured over trees that
+    /// are all present: a missing subtree counts as empty here and would cap a later push too low.
+    fn remember_height(&mut self, id: Oid, height: usize, complete: bool) {
         self.heights.insert(id, height);
-        if self.pool.get(&id).is_none() {
+        if complete && self.pool.get(&id).is_none() {
             self.repo.remember_height(id, height);
         }
     }
 
-    fn child_trees(&self, id: Oid) -> std::result::Result<Vec<Oid>, String> {
+    /// The child trees of `id`, and whether `id` itself is present in the pool or the repo.
+    fn child_trees(&self, id: Oid) -> std::result::Result<(Vec<Oid>, bool), String> {
         let stored;
         let bytes: &[u8] = match self.pool.get(&id) {
             Some((_, bytes)) => bytes,
@@ -326,10 +336,10 @@ impl Walk<'_> {
                     stored = bytes;
                     &stored
                 }
-                _ => return Ok(Vec::new()),
+                _ => return Ok((Vec::new(), false)),
             },
         };
-        Ok(gix::objs::TreeRef::from_bytes(bytes, gix::hash::Kind::Sha1)
+        let kids = gix::objs::TreeRef::from_bytes(bytes, gix::hash::Kind::Sha1)
             .map(|tree| {
                 tree.entries
                     .iter()
@@ -337,7 +347,8 @@ impl Walk<'_> {
                     .map(|e| Oid::from_gix(e.oid.to_owned()))
                     .collect()
             })
-            .unwrap_or_default())
+            .unwrap_or_default();
+        Ok((kids, true))
     }
 
     fn blob(&mut self, id: Oid, special: Option<Special>) -> std::result::Result<(), String> {
