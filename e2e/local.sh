@@ -711,6 +711,9 @@ log="$BATON_HOME/data/daemon.log"
 first_refs=$(grep -E ' turn [^ ]+@1 ' "$log" | sed -n 's/.*ref=\([0-9.]*\)ms.*/\1/p' | sort -n | tail -1)
 slow=$(sed -n 's/.* turn [^ ]*@[0-9]* .*ref=\([0-9.]*\)ms.*/\1/p' "$log" | awk '$1 > 1000' | wc -l | tr -d ' ')
 echo "  slowest first ref update: ${first_refs:-n/a} ms; ref updates over 1000 ms: $slow"
+if [[ $slow != 0 ]]; then
+  grep -E ' turn [^ ]+@[0-9]+ ' "$log" | awk 'match($0, /ref=[0-9.]+ms/) && substr($0, RSTART + 4, RLENGTH - 6) + 0 > 1000 { print "    " $0 }'
+fi
 eq "no ref update stalled for over a second" 0 "$slow"
 STALL="slowest first ref update ${first_refs:-n/a} ms; $slow ref updates over 1 s"
 section_end
