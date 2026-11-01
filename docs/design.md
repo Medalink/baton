@@ -20,11 +20,12 @@ baton daemon                      # per-user process; other commands start it wh
 baton enroll [path]               # start watching a worktree
 baton unenroll [path]             # stop watching; its history stays
 baton status
-baton log [thread]
+baton log [thread] [--verdicts]
+baton verdict <turn> [--thread T] [--json]   # the verdict stored for a turn
 baton rewind <turn> [--thread T] [--apply]
 baton pull <thread> [--into dir]  # a new worktree at the thread's latest turn
 baton follow <thread> [--into dir]  # print each new turn; with --into, apply it there too
-baton ask <question> --option a --option b
+baton ask <question> --option a --option b [--context text]   # exit 0 chose, 2 ask a human
 baton serve [--data dir] [--listen addr] [--tls-cert pem --tls-key pem] [--trace]
 baton admin [--data dir] device add <name>     # prints a token once
 baton admin [--data dir] device list|revoke ...
