@@ -218,6 +218,14 @@ fn main() {
             std::process::exit(if e.use_stderr() { 1 } else { 0 });
         }
     };
+    // Rust ignores SIGPIPE, so `baton log | head -1` panicked on the first write after `head` exited. A
+    // command that prints ends quietly instead, as other CLIs do; the daemon keeps it ignored, since its
+    // sockets report a closed peer as an error it handles.
+    #[cfg(unix)]
+    if !matches!(cli.command, Command::Daemon | Command::Serve { .. }) {
+        // SAFETY: restores the default action for one signal before any thread is started.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    }
     let result = match cli.command {
         Command::Hook { .. } => Ok(()),
         Command::Daemon => daemon::run(),
