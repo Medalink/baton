@@ -3,6 +3,7 @@
 //! Ownership: a worktree task owns its dirty set, mirror and tree; a writer owns its side repo. The
 //! registry here is only a routing table (cwd to task, project to writer) behind a short lock.
 
+mod link;
 mod log;
 mod server;
 mod task;
@@ -11,7 +12,10 @@ mod writer;
 use crate::adapter::TurnRequest;
 use crate::control::{Reply, Request, WorktreeStatus};
 use anyhow::{Context, Result, anyhow};
-use baton_core::{Dirs, ProjectKey, RepoConfig, find_root, project_key, simplified};
+use baton_core::{
+    Dirs, MachineId, ProjectKey, RepoConfig, UserConfig, find_root, project_key, simplified,
+};
+use link::Link;
 use log::Log;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -37,6 +41,7 @@ pub struct Daemon {
     dirs: Dirs,
     log: Arc<Log>,
     registry: Mutex<Registry>,
+    link: Link,
     /// Enrolled roots that could not be started (a drive that is not mounted). They stay enrolled on disk.
     unrestored: Mutex<BTreeMap<String, String>>,
     started: Instant,
@@ -62,11 +67,12 @@ pub fn path_key(path: &Path) -> String {
 }
 
 impl Daemon {
-    fn new(dirs: Dirs, log: Arc<Log>) -> Self {
+    fn new(dirs: Dirs, log: Arc<Log>, link: Link) -> Self {
         Self {
             dirs,
             log,
             registry: Mutex::new(Registry::default()),
+            link,
             unrestored: Mutex::new(BTreeMap::new()),
             started: Instant::now(),
         }
@@ -110,13 +116,20 @@ impl Daemon {
         if let Some(writer) = self.registry().writers.get(project) {
             return Ok(writer.clone());
         }
-        let writer = Writer::spawn(self.dirs.side_repo(project)).map_err(|e| anyhow!("{e}"))?;
-        Ok(self
+        let writer = Writer::spawn(
+            self.dirs.side_repo(project),
+            project.clone(),
+            self.link.clone(),
+        )
+        .map_err(|e| anyhow!("{e}"))?;
+        let writer = self
             .registry()
             .writers
             .entry(project.clone())
             .or_insert(writer)
-            .clone())
+            .clone();
+        self.link.project(project, &writer);
+        Ok(writer)
     }
 
     /// Starts watching `root` and waits for its first sync. Returns the file count and whether it was already enrolled.
@@ -364,7 +377,10 @@ pub fn run() -> Result<()> {
     }
     let log = Arc::new(Log::open(&dirs.log_file())?);
     log.line(&format!("daemon starting pid={}", std::process::id()));
-    let daemon = Arc::new(Daemon::new(dirs, Arc::clone(&log)));
+    let user = UserConfig::load(&dirs.user_config()).map_err(|e| anyhow!("{e}"))?;
+    let machine = user.machine.clone().unwrap_or_else(MachineId::from_host);
+    let (link, link_rx) = Link::channel();
+    let daemon = Arc::new(Daemon::new(dirs, Arc::clone(&log), link));
 
     let restoring: Vec<_> = daemon
         .enrolled_roots()
@@ -387,6 +403,7 @@ pub fn run() -> Result<()> {
         .worker_threads(2)
         .enable_all()
         .build()?;
+    runtime.spawn(link::run(link_rx, user.server, machine, Arc::clone(&log)));
     let result = runtime.block_on(server::serve(Arc::clone(&daemon)));
     if let Err(e) = &result {
         log.line(&format!("daemon stopped: {e:#}"));
